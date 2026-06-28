@@ -38,6 +38,7 @@
 #include <stdarg.h>
 #include <signal.h>
 #if defined(__gnu_linux__)
+#include <sched.h>
 #include <syscall.h>
 #include <sys/mman.h> // mmap/munmap/madvise for NUMA mirror allocation
 #include <unistd.h>   // sysconf(_SC_PAGESIZE)
@@ -4684,10 +4685,8 @@ inline static void ggml_critical_section_end(void) {
 #if defined(__gnu_linux__)
 static cpu_set_t ggml_get_numa_affinity(void) {
     cpu_set_t cpuset;
-    pthread_t thread;
-    thread = pthread_self();
     CPU_ZERO(&cpuset);
-    pthread_getaffinity_np(thread, sizeof(cpu_set_t), &cpuset);
+    sched_getaffinity(0, sizeof(cpu_set_t), &cpuset);
     return cpuset;
 }
 #else
@@ -26748,9 +26747,9 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
             break;
         case GGML_NUMA_STRATEGY_NUMACTL:
             // use the cpuset that numactl gave us
-            rv = pthread_setaffinity_np(pthread_self(), setsize, &g_state.numa.cpuset);
+            rv = sched_setaffinity(0, setsize, &g_state.numa.cpuset);
             if (rv) {
-                fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n",strerror(rv));
+                fprintf(stderr, "warning: sched_setaffinity() failed: %s\n", strerror(errno));
             }
             return;
         default:
@@ -26765,9 +26764,9 @@ static void set_numa_thread_affinity(int thread_n, int n_threads) {
         CPU_SET_S(node->cpus[i], setsize, cpus);
     }
 
-    rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+    rv = sched_setaffinity(0, setsize, cpus);
     if (rv) {
-            fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+        fprintf(stderr, "warning: sched_setaffinity() failed: %s\n", strerror(errno));
     }
 
     CPU_FREE(cpus);
@@ -26786,9 +26785,9 @@ static void clear_numa_thread_affinity(void) {
         CPU_SET_S(i, setsize, cpus);
     }
 
-    int rv = pthread_setaffinity_np(pthread_self(), setsize, cpus);
+    int rv = sched_setaffinity(0, setsize, cpus);
     if (rv) {
-        fprintf(stderr, "warning: pthread_setaffinity_np() failed: %s\n", strerror(rv));
+        fprintf(stderr, "warning: sched_setaffinity() failed: %s\n", strerror(errno));
     }
 
     CPU_FREE(cpus);

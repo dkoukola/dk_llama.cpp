@@ -51,6 +51,7 @@
 #include <io.h>
 #else
 #include <sys/ioctl.h>
+#include <sched.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -423,7 +424,7 @@ static int pin_cpu(int cpu) {
     cpu_set_t mask;
     CPU_ZERO(&mask);
     CPU_SET(cpu, &mask);
-    return pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask);
+    return sched_setaffinity(0, sizeof(mask), &mask);
 }
 
 static bool is_hybrid_cpu(void) {
@@ -468,9 +469,9 @@ int32_t cpu_get_num_math() {
     }
     if (is_hybrid_cpu()) {
         cpu_set_t affinity;
-        if (!pthread_getaffinity_np(pthread_self(), sizeof(affinity), &affinity)) {
+        if (!sched_getaffinity(0, sizeof(affinity), &affinity)) {
             int result = cpu_count_math_cpus(n_cpu);
-            pthread_setaffinity_np(pthread_self(), sizeof(affinity), &affinity);
+            sched_setaffinity(0, sizeof(affinity), &affinity);
             if (result > 0) {
                 return result;
             }
