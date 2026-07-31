@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <memory>
+#include <vector>
 
 
 
@@ -116,15 +117,16 @@ struct server_slot {
 
     void prompt_save(server_prompt_cache& prompt_cache) const;
 
-    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens);
+    void prompt_load(server_prompt_cache& prompt_cache, const server_tokens& tokens, float min_reusable_fraction);
 
-    size_t checkpoint_pos = 0;
+    llama_pos checkpoint_pos = -1;
     bool do_checkpoint = false;
     bool image_just_processed = false;
 
     // sampling
     llama_token sampled; // in speculative mode, this is the last accepted token
     llama_tokens drafted;
+    bool spec_target_only = false;
 
     json json_schema;
 
@@ -163,6 +165,8 @@ struct server_slot {
     // speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    std::vector<int32_t> n_draft_by_depth;
+    std::vector<int32_t> n_draft_accepted_by_depth;
 
     int32_t n_past_se = 0; // self-extend
 
@@ -389,7 +393,7 @@ struct server_context {
 
     void apply_checkpoint(server_slot & slot);
 
-    void create_checkpoint_at_interval(server_slot & slot, const gpt_params & params_base);
+    void create_checkpoint_at_interval(server_slot & slot);
 
     void release_slot_after_final_response(server_slot & slot);
 };

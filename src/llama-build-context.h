@@ -119,6 +119,8 @@ struct llm_build_context {
 
     void free();
 
+    bool supports_op(const ggml_tensor * op) const;
+
     ggml_cgraph * build_k_shift();
 
     ggml_cgraph * build_s_copy();
@@ -138,6 +140,8 @@ struct llm_build_context {
     ggml_tensor * build_inp_KQ_mask(bool causal = true);
 
     ggml_tensor * build_inp_KQ_mask_swa(bool causal = true);
+
+    ggml_tensor * build_inp_KQ_mask_swa_win(int64_t n_kv_win, bool causal = true);
 
     ggml_tensor * build_inp_mean();
 
@@ -273,6 +277,64 @@ struct llm_build_context {
     ggml_cgraph * build_arctic();
 
     ggml_cgraph * build_deepseek2();
+    ggml_cgraph * build_deepseek4();
+    ggml_cgraph * build_openpangu();
+
+    // openPangu attention sublayer body (shared by base layers and the NextN/MTP head):
+    // input is the already-input-normed hidden; returns the post-o_proj attention output.
+    ggml_tensor * build_openpangu_attention(
+        ggml_cgraph * gf,
+        const struct llama_layer & layer,
+        int il,
+        ggml_tensor * x_normed,
+        ggml_tensor * KQ_mask,
+        ggml_tensor * inp_pos,
+        ggml_tensor * conv_state,
+        ggml_tensor * seq_qnext,
+        float kq_scale,
+        bool KQ_mask_swa_windowed = false);
+
+    // openPangu NextN/MTP head (plain-residual block, no mHC): eh_proj stitching ->
+    // attention -> MoE -> shared head. Returns the draft logits tensor.
+    ggml_tensor * build_openpangu_mtp(
+        const struct llama_layer & mtp_layer,
+        ggml_tensor * prev_embeddings,
+        ggml_cgraph * gf,
+        int il,
+        ggml_tensor * inp_pos,
+        ggml_tensor * KQ_mask,
+        ggml_tensor * inp_out_ids,
+        ggml_tensor * inp_tokens,
+        ggml_tensor * seq_qnext,
+        ggml_tensor ** full_hidden_out = nullptr,
+        bool select_outputs = true,
+        bool build_logits = true,
+        bool cache_writes_only = false,
+        bool KQ_mask_swa_windowed = false);
+
+    ggml_tensor * build_mhc_post(
+        ggml_tensor * x,
+        ggml_tensor * post,
+        ggml_tensor * residual,
+        ggml_tensor * comb,
+        int64_t n_embd,
+        int64_t n_stream,
+        bool comb_output_dim0);
+
+    ggml_tensor * build_mhc_weighted_sum(
+        ggml_tensor * x,
+        ggml_tensor * weights,
+        int64_t n_embd,
+        int64_t n_stream);
+
+    ggml_tensor * build_mhc_pre_projection(
+        ggml_tensor * x,
+        ggml_tensor * fn,
+        ggml_tensor * gamma,
+        int64_t n_embd,
+        int64_t n_stream,
+        float norm_rms_eps,
+        bool force_contiguous);
 
     ggml_tensor * build_deepseek2_tp_attention(
             ggml_cgraph * gf, int il,
@@ -438,7 +500,8 @@ struct llm_build_context {
 llm_expert_gating_func_type   gating_op,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
          ggml_tensor * up_gate_exps = nullptr, ggml_tensor * up_gate_exps_b = nullptr,
-         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr);
+         ggml_tensor * input_logits = nullptr, ggml_tensor * down_exps_s = nullptr,
+         ggml_tensor * selected_experts = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -466,7 +529,7 @@ llm_expert_gating_func_type   gating_op,
                 n_expert, n_expert_used,
                 type_op, norm_w, scale_w, w_scale,
                 gating_op, cb, il, graph, add_input, up_gate_exps, up_gate_exps_b,
-                input_logits, down_exps_s);
+                input_logits, down_exps_s, nullptr);
     }
 
     static ggml_tensor * llm_build_std_moe_ffn(ggml_context * ctx, llama_context & lctx,

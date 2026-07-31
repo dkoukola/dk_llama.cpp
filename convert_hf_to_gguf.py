@@ -592,6 +592,9 @@ class Model:
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
             res = "grok-2"
+        if chkhsh == "65df2fe396b537a53433301848c0a739f56d56f67ad3d35eba27961ac33c12bb":
+            # ref: https://huggingface.co/openpangu/openPangu-2.0-Flash
+            res = "openpangu"
         if chkhsh == "972da7b59cec44d1f0a490a86c96df53859e486e481563e5dddac155013d87ac":
             # ref: https://huggingface.co/poolside/Laguna-XS.2
             res = "laguna"
@@ -2330,6 +2333,9 @@ class DFlashDraftModel(Qwen3Model):
     _saw_token_embd = False
     _saw_output = False
 
+    def _causal_attention(self) -> bool:
+        return False
+
     def _require_target_model_dir(self) -> Path:
         if self.target_model_dir is None:
             raise ValueError("DFlashDraftModel conversion requires --target-model-dir <matching target model directory>")
@@ -2423,7 +2429,7 @@ class DFlashDraftModel(Qwen3Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
 
-        self.gguf_writer.add_causal_attention(False)
+        self.gguf_writer.add_causal_attention(self._causal_attention())
         # MiMo DFlash draft uses partial rotary (partial_rotary_factor=0.5): RoPE is applied to
         # only head_dim*partial_rotary_factor dims, the rest are NoPE. Honoring it is required;
         # otherwise the upper half of every head gets spurious position rotation it was never
@@ -2608,6 +2614,133 @@ class DFlashDraftModel(Qwen3Model):
                 self._saw_output = True
 
         return tensors
+
+
+@Model.register("DFlashLagunaForCausalLM")
+class DFlashLagunaModel(DFlashDraftModel):
+    model_arch = gguf.MODEL_ARCH.DFLASH_DRAFT
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._laguna_qkv_ids: set[int] = set()
+        self._laguna_gate_ids: set[int] = set()
+        self._laguna_aux_norm_ids: set[int] = set()
+
+    def _causal_attention(self) -> bool:
+        return True
+
+    def set_gguf_parameters(self):
+        dflash_cfg = self.hparams.get("dflash_config")
+        if not isinstance(dflash_cfg, dict) or dflash_cfg.get("causal") is not True:
+            raise ValueError("DFlashLagunaForCausalLM requires dflash_config.causal=true")
+        if self.hparams.get("gating") != "per-head":
+            raise ValueError("DFlashLagunaForCausalLM currently requires gating='per-head'")
+        target_hidden_size = self._get_target_hidden_size()
+        draft_hidden_size = int(self.hparams["hidden_size"])
+        if target_hidden_size != draft_hidden_size:
+            raise ValueError(
+                "DFlashLagunaForCausalLM requires matching target and draft hidden sizes, "
+                f"got target={target_hidden_size} and draft={draft_hidden_size}"
+            )
+        layer_types = self.hparams.get("layer_types")
+        if not isinstance(layer_types, list) or len(layer_types) != self.block_count:
+            raise ValueError(
+                "DFlashLagunaForCausalLM requires one layer_types entry per draft layer"
+            )
+        if any(str(layer_type) != "sliding_attention" for layer_type in layer_types):
+            raise ValueError(
+                "DFlashLagunaForCausalLM currently requires every draft layer to use sliding_attention"
+            )
+        if not self.hparams.get("sliding_window"):
+            raise ValueError("DFlashLagunaForCausalLM requires sliding_window metadata")
+
+        self.hparams["use_sliding_window"] = True
+        super().set_gguf_parameters()
+        self.gguf_writer.add_bool(f"{self.gguf_writer.arch}.dflash.laguna", True)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        top_level_name = name[6:] if name.startswith("model.") else name
+        hidden_size = int(self.hparams["hidden_size"])
+
+        if top_level_name.startswith("aux_hidden_norms.") and top_level_name.endswith(".weight"):
+            parts = top_level_name.split(".")
+            if len(parts) != 3 or not parts[1].isdigit():
+                raise ValueError(f"DFlashLagunaForCausalLM: invalid auxiliary norm name {name!r}")
+            aux_id = int(parts[1])
+            if data_torch.ndim != 1 or data_torch.shape[0] != hidden_size:
+                raise ValueError(
+                    f"DFlashLagunaForCausalLM: auxiliary norm {name!r} has shape "
+                    f"{tuple(data_torch.shape)}, expected [{hidden_size}]"
+                )
+            self._laguna_aux_norm_ids.add(aux_id)
+            tensor_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_AUX_HIDDEN_NORM].format(bid=aux_id)
+            return [(f"{tensor_name}.weight", data_torch)]
+
+        if top_level_name.endswith(".self_attn.qkv_proj.weight"):
+            if bid is None:
+                raise ValueError(f"DFlashLagunaForCausalLM: can not infer block id for tensor {name!r}")
+            n_head = int(self.hparams["num_attention_heads"])
+            n_head_kv = int(self.hparams["num_key_value_heads"])
+            head_dim = int(self.hparams.get("head_dim", self.hparams["hidden_size"] // n_head))
+            q_width = n_head * head_dim
+            k_width = n_head_kv * head_dim
+            v_width = n_head_kv * head_dim
+            expected_width = q_width + k_width + v_width
+            if data_torch.ndim != 2 or data_torch.shape != (expected_width, hidden_size):
+                raise ValueError(
+                    f"DFlashLagunaForCausalLM: packed QKV tensor {name!r} has shape "
+                    f"{tuple(data_torch.shape)}, expected [{expected_width}, {hidden_size}]"
+                )
+            q_weight, k_weight, v_weight = data_torch.split([q_width, k_width, v_width], dim=0)
+            self._laguna_qkv_ids.add(bid)
+            result: list[tuple[str, Tensor]] = []
+            for suffix, weight in (("q_proj", q_weight), ("k_proj", k_weight), ("v_proj", v_weight)):
+                split_name = name.replace("qkv_proj", suffix)
+                result.extend(super().modify_tensors(weight, split_name, bid))
+            return result
+
+        if top_level_name.endswith(".self_attn.g_proj.weight"):
+            if bid is None:
+                raise ValueError(f"DFlashLagunaForCausalLM: can not infer block id for tensor {name!r}")
+            gate = data_torch.squeeze().contiguous()
+            n_head = int(self.hparams["num_attention_heads"])
+            if gate.ndim != 2 or gate.shape != (n_head, hidden_size):
+                raise ValueError(
+                    f"DFlashLagunaForCausalLM: attention gate {name!r} has shape "
+                    f"{tuple(gate.shape)}, expected [{n_head}, {hidden_size}]"
+                )
+            self._laguna_gate_ids.add(bid)
+            tensor_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.ATTN_GATE].format(bid=bid)
+            return [(f"{tensor_name}.weight", gate)]
+
+        return super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+
+        expected_layers = set(range(self.block_count))
+        dflash_cfg = self.hparams.get("dflash_config")
+        if not isinstance(dflash_cfg, dict):
+            raise ValueError("DFlashLagunaForCausalLM requires dflash_config metadata")
+        target_layer_ids = dflash_cfg.get("target_layer_ids", [])
+        if not isinstance(target_layer_ids, list) or not target_layer_ids:
+            raise ValueError("DFlashLagunaForCausalLM requires non-empty target_layer_ids metadata")
+        expected_aux = set(range(len(target_layer_ids)))
+        if self._laguna_qkv_ids != expected_layers:
+            raise ValueError(
+                f"DFlashLagunaForCausalLM: packed QKV layers {sorted(self._laguna_qkv_ids)} "
+                f"do not match expected {sorted(expected_layers)}"
+            )
+        if self._laguna_gate_ids != expected_layers:
+            raise ValueError(
+                f"DFlashLagunaForCausalLM: attention gate layers {sorted(self._laguna_gate_ids)} "
+                f"do not match expected {sorted(expected_layers)}"
+            )
+        if self._laguna_aux_norm_ids != expected_aux:
+            raise ValueError(
+                f"DFlashLagunaForCausalLM: auxiliary norm ids {sorted(self._laguna_aux_norm_ids)} "
+                f"do not match expected {sorted(expected_aux)}"
+            )
 
 
 @Model.register("MellumForCausalLM")
@@ -4586,6 +4719,171 @@ class DeepseekV2Model(Model):
             experts = [k for d in self._experts for k in d.keys()]
             if len(experts) > 0:
                 raise ValueError(f"Unprocessed experts: {experts}")
+
+
+@Model.register("DeepseekV4ForCausalLM")
+@Model.register("DeepseekV4FlashForCausalLM")
+@Model.register("DeepseekV4ProForCausalLM")
+class DeepseekV4Model(DeepseekV2Model):
+    model_arch = gguf.MODEL_ARCH.DEEPSEEK4
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_count = self.hparams["num_hidden_layers"] + self.hparams.get("num_nextn_predict_layers", 0)
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        if (indexer_heads := self.hparams.get("num_indexer_heads")) is not None:
+            self.gguf_writer.add_attention_indexer_head_count(indexer_heads)
+        if (indexer_dim := self.hparams.get("indexer_head_dim")) is not None:
+            self.gguf_writer.add_attention_indexer_key_length(indexer_dim)
+        if (indexer_top_k := self.hparams.get("indexer_topk")) is not None:
+            self.gguf_writer.add_attention_indexer_top_k(indexer_top_k)
+        if (nextn_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+            self.gguf_writer.add_nextn_predict_layers(nextn_layers)
+
+@Model.register("OpenPanguV2ForCausalLM")
+class OpenPanguV2Model(DeepseekV2Model):
+    # openPangu-2.0-Flash: MLA + DSA/SWA hybrid + MoE + mHC(Hyper-Connections) + MoME convs.
+    # Emits a complete, self-contained GGUF: weights (incl. pre-split attn_k_b/attn_v_b for
+    # the latent-attention graph) plus the DSA/SWA schedule and mHC/MoME/sink metadata.
+    model_arch = gguf.MODEL_ARCH.OPENPANGU
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # MTP/NextN layers (num_hidden_layers .. +num_nextn_predict_layers-1) are real blocks
+        # in ik_llama's layout (n_layer includes NextN; n_layer_kv_from_start excludes them).
+        self._nextn = int(self.hparams.get("num_nextn_predict_layers", 0) or 0)
+        self.block_count = int(self.hparams["num_hidden_layers"]) + self._nextn
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    def set_vocab(self):
+        # OpenPanguV2Tokenizer is a GPT2/BPE-style tokenizer. The pre-tokenizer hash is
+        # registered in Model.get_vocab_base_pre (see the openpangu entry).
+        self._set_vocab_gpt2()
+        # HF prepends <|pangu_text_start|> via the tokenizer post-processor; tokenizer_config
+        # has no add_bos_token key, so state it explicitly for the GGUF.
+        self.gguf_writer.add_add_bos_token(True)
+
+    def set_gguf_parameters(self):
+        # Base transformer params (block_count now includes NextN layers).
+        Model.set_gguf_parameters(self)
+        hparams = self.hparams
+        arch = gguf.MODEL_ARCH_NAMES[self.model_arch]
+
+        self.gguf_writer.add_leading_dense_block_count(hparams["first_k_dense_replace"])
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
+        self.gguf_writer.add_q_lora_rank(hparams["q_lora_rank"])
+        self.gguf_writer.add_kv_lora_rank(hparams["kv_lora_rank"])
+        self.gguf_writer.add_key_length(hparams["qk_nope_head_dim"] + hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_value_length(hparams["v_head_dim"])
+
+        # MoE
+        self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_count(hparams["n_routed_experts"])
+        self.gguf_writer.add_expert_used_count(hparams["num_experts_per_tok"])
+        self.gguf_writer.add_expert_shared_count(hparams["n_shared_experts"])
+        self.gguf_writer.add_expert_weights_scale(hparams["routed_scaling_factor"])
+        self.gguf_writer.add_expert_weights_norm(hparams["norm_topk_prob"])
+        # router_enable_expert_bias => sigmoid gating with e_score_correction bias
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
+
+        # RoPE
+        self.gguf_writer.add_rope_dimension_count(hparams["qk_rope_head_dim"])
+        self.gguf_writer.add_rope_freq_base(hparams["rope_theta"])
+
+        # NextN / MTP
+        self.gguf_writer.add_uint32(
+            gguf.Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=arch), self._nextn
+        )
+
+        # DSA lightning indexer
+        self.gguf_writer.add_uint32(
+            gguf.Keys.Attention.INDEXER_HEAD_COUNT.format(arch=arch), hparams["index_n_heads"]
+        )
+        self.gguf_writer.add_uint32(
+            gguf.Keys.Attention.INDEXER_KEY_LENGTH.format(arch=arch), hparams["index_head_dim"]
+        )
+        self.gguf_writer.add_uint32(
+            gguf.Keys.Attention.INDEXER_TOP_K.format(arch=arch), hparams["index_topk"]
+        )
+
+        # SWA (window; last few layers widen to 2048 per sliding_window_list)
+        if hparams.get("sliding_window") is not None:
+            self.gguf_writer.add_sliding_window(hparams["sliding_window"])
+
+        # Pangu-specific structural metadata (consumed by the OPENPANGU graph). The runtime
+        # derives everything else from these plus tensor presence: DSA layers are the
+        # windowless base layers (dsa_layers is redundant with swa_layers, so it is not
+        # written), and block_post_norm placement follows the tensors themselves.
+        self.gguf_writer.add_uint32(f"{arch}.mhc_num_stream", hparams["mhc_num_stream"])
+        self.gguf_writer.add_uint32(f"{arch}.mhc_recur_norm", hparams["mhc_recur_norm"])
+        self.gguf_writer.add_uint32(f"{arch}.param_sink_number", hparams["param_sink_number"])
+        self.gguf_writer.add_array(f"{arch}.swa_layers", hparams["swa_layers"])
+        if hparams.get("sliding_window_list") is not None:
+            self.gguf_writer.add_array(f"{arch}.sliding_window_list", hparams["sliding_window_list"])
+
+    _experts: list[dict[str, Tensor]] | None = None
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Sigmoid router bias: rename to the deepseek-style ".bias" the tensor map expects.
+        if name.endswith("e_score_correction_bias"):
+            name = name.replace("e_score_correction_bias", "e_score_correction.bias")
+
+        # NOTE: unlike DeepseekV2, we do NOT skip MTP layers — they are real blocks here.
+
+        # Merge routed experts into stacked 3D tensors (same layout as deepseek/glm4moe).
+        if name.find("mlp.experts") != -1:
+            n_experts = self.hparams["n_routed_experts"]
+            assert bid is not None
+
+            if self._experts is None:
+                self._experts = [{} for _ in range(self.block_count)]
+
+            self._experts[bid][name] = data_torch
+
+            if len(self._experts[bid]) >= n_experts * 3:
+                tensors: list[tuple[str, Tensor]] = []
+                for w_name in ["down_proj", "gate_proj", "up_proj"]:
+                    datas: list[Tensor] = []
+                    for xid in range(n_experts):
+                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
+                        datas.append(self._experts[bid][ename])
+                        del self._experts[bid][ename]
+                    data_torch = torch.stack(datas, dim=0)
+                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                    tensors.append((self.map_tensor_name(merged_name), data_torch))
+                return tensors
+            else:
+                return []
+
+        # Split the fused MLA kv_b into k_b / v_b (deepseek MLA layout). OpenPangu's
+        # graph consumes the pre-split tensors directly, so do not emit the fused copy.
+        if name.endswith("kv_b_proj.weight"):
+            name_kb = name.replace("kv_b_proj", "k_b_proj")
+            name_vb = name.replace("kv_b_proj", "v_b_proj")
+
+            n_head_kv = self.hparams["num_attention_heads"]
+            v_head_dim = self.hparams["v_head_dim"]
+            qk_nope_head_dim = self.hparams["qk_nope_head_dim"]
+
+            assert data_torch.shape[0] == n_head_kv * (v_head_dim + qk_nope_head_dim)
+
+            kv_b = data_torch.view(n_head_kv, v_head_dim + qk_nope_head_dim, data_torch.shape[-1])
+            k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
+            k_b = k_b.transpose(1, 2)
+            k_b = k_b.reshape(n_head_kv * data_torch.shape[-1], qk_nope_head_dim)
+            v_b = v_b.reshape(n_head_kv * v_head_dim, data_torch.shape[-1])
+
+            return [
+                (self.map_tensor_name(name_kb), k_b),
+                (self.map_tensor_name(name_vb), v_b),
+            ]
+
+        # Everything else maps by name.
+        return [(self.map_tensor_name(name), data_torch)]
 
 
 @Model.register("T5WithLMHeadModel")
