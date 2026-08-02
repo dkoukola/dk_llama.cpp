@@ -3767,6 +3767,8 @@ static std::pair<std::vector<double>, double> get_layer_sizes(const llama_model_
             continue;
         }
         if (name == "dflash_fc.weight" || name == "dflash_hidden_norm.weight" ||
+                name == "dflash_markov_w1.weight" || name == "dflash_markov_w2.weight" ||
+                name == "dflash_conf_proj.weight" || name == "dflash_conf_proj.bias" ||
                 name.rfind("dflash_aux_hidden_norm.", 0) == 0) {
             output_misc_size += size;
             continue;
@@ -6332,6 +6334,20 @@ static int llama_decode_internal(
             }
         }
 
+        lctx.dflash.draft_confidence.clear();
+        if (lctx.dflash.draft_confidence_tensor != nullptr) {
+            ggml_backend_t backend_confidence = ggml_backend_sched_get_tensor_backend(
+                    lctx.sched, lctx.dflash.draft_confidence_tensor);
+            if (backend_confidence != nullptr) {
+                const int64_t n_confidence = ggml_nelements(lctx.dflash.draft_confidence_tensor);
+                lctx.dflash.draft_confidence.resize((size_t) n_confidence);
+                ggml_backend_tensor_get_async(backend_confidence,
+                        lctx.dflash.draft_confidence_tensor,
+                        lctx.dflash.draft_confidence.data(), 0,
+                        (size_t) n_confidence * sizeof(float));
+            }
+        }
+
         // extract logits
         {
             const bool dflash_skip_logits = (lctx.model.arch == LLM_ARCH_DFLASH_DRAFT
@@ -8722,6 +8738,11 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_MISTRAL4:
             return LLAMA_ROPE_TYPE_NORM;
 
+        case LLM_ARCH_DFLASH_DRAFT:
+            return model->hparams.dsv4_hc_mult > 0
+                    ? LLAMA_ROPE_TYPE_NORM
+                    : LLAMA_ROPE_TYPE_NEOX;
+
         // the pairs of head values are offset by n_rot/2
         case LLM_ARCH_OPENPANGU: // rope_interleave=false -> rotate_half (Infer: is_neox_style = not rope_interleave)
         case LLM_ARCH_FALCON:
@@ -8762,7 +8783,6 @@ enum llama_rope_type llama_rope_type(const struct llama_model * model) {
         case LLM_ARCH_LAGUNA:
         case LLM_ARCH_GEMMA4:
         case LLM_ARCH_GEMMA4_MTP:
-        case LLM_ARCH_DFLASH_DRAFT:
         case LLM_ARCH_GEMMA4_ASSISTANT:
             return LLAMA_ROPE_TYPE_NEOX;
 
@@ -11324,6 +11344,13 @@ llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t
         return LLAMA_TOKEN_NULL;
     }
     return ctx->dflash.draft_tokens[(size_t) i];
+}
+
+float llama_get_dflash_draft_confidence_ith(struct llama_context * ctx, int32_t i) {
+    if (ctx == nullptr || i < 0 || (size_t) i >= ctx->dflash.draft_confidence.size()) {
+        return -1.0f;
+    }
+    return ctx->dflash.draft_confidence[(size_t) i];
 }
 
 float * llama_get_embeddings(struct llama_context * ctx) {

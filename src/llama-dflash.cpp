@@ -25,9 +25,11 @@ static ggml_backend_buffer_type_t llama_dflash_kv_cache_layer_buft(const llama_c
     }
 
     if (il >= 0 && il < (int32_t) lctx.model.layers.size()) {
-        const ggml_tensor * wk = lctx.model.layers[il].wk;
-        if (wk != nullptr && wk->buffer != nullptr) {
-            return ggml_backend_buffer_get_type(wk->buffer);
+        const ggml_tensor * cache_weight = lctx.model.layers[il].wk != nullptr
+                ? lctx.model.layers[il].wk
+                : lctx.model.layers[il].wkv_latent;
+        if (cache_weight != nullptr && cache_weight->buffer != nullptr) {
+            return ggml_backend_buffer_get_type(cache_weight->buffer);
         }
     }
 
@@ -185,6 +187,7 @@ void llama_context::free_dflash_kv_cache_tensors() {
     dflash.kv.kq_mask_tensor = nullptr;
     dflash.kv.kq_mask_swa_tensor = nullptr;
     dflash.kv.draft_tail_rows_tensor = nullptr;
+    dflash.draft_confidence_tensor = nullptr;
 
     for (ggml_backend_buffer_t buf : dflash.kv.cache_bufs) {
         if (buf != nullptr) {
@@ -324,29 +327,54 @@ static bool validate_dflash_graph_contract(const llama_context & lctx) {
             return false;
         }
 
+        if (hparams.dsv4_hc_mult > 0) {
+            const auto & layer = model.layers[il];
+            if (layer.attn_norm == nullptr || layer.wq_a == nullptr ||
+                    layer.attn_q_a_norm == nullptr || layer.wq_b == nullptr ||
+                    layer.wkv_latent == nullptr || layer.attn_kv_norm == nullptr ||
+                    layer.wo_a == nullptr || layer.wo_b == nullptr ||
+                    layer.hc_attn_fn == nullptr || layer.hc_attn_scale == nullptr ||
+                    layer.hc_attn_base == nullptr || layer.hc_ffn_fn == nullptr ||
+                    layer.hc_ffn_scale == nullptr || layer.hc_ffn_base == nullptr ||
+                    layer.ffn_norm == nullptr || layer.ffn_gate_inp == nullptr ||
+                    layer.ffn_exp_probs_b == nullptr || layer.ffn_up_exps == nullptr ||
+                    layer.ffn_gate_exps == nullptr || layer.ffn_down_exps == nullptr ||
+                    layer.ffn_up_shexp == nullptr || layer.ffn_gate_shexp == nullptr ||
+                    layer.ffn_down_shexp == nullptr) {
+                LLAMA_LOG_ERROR("%s: DeepSeek-V4 DSpark layer %d is missing one or more required attention, hyper-connection, or MoE tensors\n",
+                        __func__, il);
+                return false;
+            }
+            if (layer.attn_norm_b != nullptr) {
+                LLAMA_LOG_ERROR("%s: DeepSeek-V4 DSpark layer %d has an unsupported attention norm bias\n",
+                        __func__, il);
+                return false;
+            }
+        } else {
             if (model.layers[il].attn_norm == nullptr ||
-                model.layers[il].attn_q_norm == nullptr ||
-                model.layers[il].attn_k_norm == nullptr) {
+                    model.layers[il].attn_q_norm == nullptr ||
+                    model.layers[il].attn_k_norm == nullptr) {
                 LLAMA_LOG_ERROR("%s: DFlash graph requires attn_norm, attn_q_norm, and attn_k_norm weights, but layer %d is missing one or more of them\n",
-                    __func__, il);
+                        __func__, il);
                 return false;
             }
 
-        const bool has_q_norm = model.layers[il].attn_q_norm != nullptr;
-        const bool has_k_norm = model.layers[il].attn_k_norm != nullptr;
-        if (has_q_norm != has_k_norm) {
-            LLAMA_LOG_ERROR("%s: DFlash graph requires symmetric Q/K norm presence, but layer %d has q_norm=%d k_norm=%d\n",
-                    __func__, il, (int) has_q_norm, (int) has_k_norm);
-            return false;
-        }
+            const bool has_q_norm = model.layers[il].attn_q_norm != nullptr;
+            const bool has_k_norm = model.layers[il].attn_k_norm != nullptr;
+            if (has_q_norm != has_k_norm) {
+                LLAMA_LOG_ERROR("%s: DFlash graph requires symmetric Q/K norm presence, but layer %d has q_norm=%d k_norm=%d\n",
+                        __func__, il, (int) has_q_norm, (int) has_k_norm);
+                return false;
+            }
 
             if (model.layers[il].attn_norm_b != nullptr ||
-                model.layers[il].attn_q_norm_b != nullptr ||
-                model.layers[il].attn_k_norm_b != nullptr) {
+                    model.layers[il].attn_q_norm_b != nullptr ||
+                    model.layers[il].attn_k_norm_b != nullptr) {
                 LLAMA_LOG_ERROR("%s: DFlash graph does not implement norm-bias tensors, but layer %d requires attn_norm_b/q_norm_b/k_norm_b\n",
-                    __func__, il);
+                        __func__, il);
                 return false;
             }
+        }
 
         if (dflash_layer_has_attention_bias(model.layers[il])) {
             LLAMA_LOG_ERROR("%s: DFlash graph implements only separate q/k/v/o attention bias; layer %d uses an unsupported fused qkv bias\n",
@@ -637,7 +665,8 @@ bool llama_prepare_dflash_graph_inputs(
 
     if (kq_mask_swa != nullptr) {
         const int32_t swa_window = (int32_t) lctx.model.hparams.n_swa;
-        const int32_t draft_pos_base = (int32_t) last_target_pos;
+        const int32_t draft_pos_base = (int32_t) last_target_pos +
+                (lctx.model.dflash_markov_w1 != nullptr ? 1 : 0);
 
         if (kq_mask_swa->type == GGML_TYPE_F16) {
             const ggml_fp16_t h_inf = ggml_fp32_to_fp16(-INFINITY);
@@ -659,10 +688,10 @@ bool llama_prepare_dflash_graph_inputs(
 
                 for (int32_t k = cross_ctx; k < cross_ctx + (int32_t) n_tokens; ++k) {
                     const int32_t block_k = k - cross_ctx;
-                    // intra-block draft tokens are contiguous from draft_pos_base, so the
-                    // SWA distance is (j - block_k); apply the same window bound as the
-                    // cross-context section above (causal AND within n_swa).
-                    if (block_k <= (int32_t) j && ((int32_t) j - block_k) < swa_window) {
+                    // Non-causal DFlash/DSpark blocks expose all future noise tokens;
+                    // causal variants retain the ordinary lower-triangular restriction.
+                    if ((!lctx.model.hparams.causal_attn || block_k <= (int32_t) j) &&
+                            ((int32_t) j - block_k) < swa_window) {
                         row[k] = h_zero;
                     }
                 }
@@ -686,10 +715,8 @@ bool llama_prepare_dflash_graph_inputs(
 
                 for (int32_t k = cross_ctx; k < cross_ctx + (int32_t) n_tokens; ++k) {
                     const int32_t block_k = k - cross_ctx;
-                    // intra-block draft tokens are contiguous from draft_pos_base, so the
-                    // SWA distance is (j - block_k); apply the same window bound as the
-                    // cross-context section above (causal AND within n_swa).
-                    if (block_k <= (int32_t) j && ((int32_t) j - block_k) < swa_window) {
+                    if ((!lctx.model.hparams.causal_attn || block_k <= (int32_t) j) &&
+                            ((int32_t) j - block_k) < swa_window) {
                         row[k] = 0.0f;
                     }
                 }

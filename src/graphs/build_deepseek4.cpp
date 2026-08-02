@@ -54,6 +54,21 @@ static ggml_tensor * dsv4_hc_affine(
     return x;
 }
 
+// Collapse the hyper-connection streams for DFlash/DSpark feature capture:
+// [n_embd, hc, n_tokens] -> [n_embd, n_tokens].
+static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
+    const int64_t hc = x->ne[1];
+
+    GGML_ASSERT(hc > 0);
+    ggml_tensor * acc = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], 0);
+    for (int64_t stream = 1; stream < hc; ++stream) {
+        ggml_tensor * row = ggml_view_2d(ctx, x, x->ne[0], x->ne[2], x->nb[2], stream * x->nb[1]);
+        acc = ggml_add(ctx, acc, row);
+    }
+
+    return ggml_scale(ctx, acc, 1.0f / hc);
+}
+
 static ggml_tensor * dsv4_new_i32_input(ggml_context * ctx, ggml_tensor ** dst, int64_t n, const char * name) {
     *dst = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, std::max<int64_t>(1, n));
     ggml_set_input(*dst);
@@ -1236,6 +1251,166 @@ static ggml_tensor * ds4_attention(ggml_cgraph * gf, ggml_context * ctx0, llm_bu
 
 }
 
+ggml_tensor * llm_build_context::build_dflash_dsv4_layers(
+        ggml_cgraph * gf,
+        ggml_tensor * inpL,
+        ggml_tensor * inp_pos,
+        ggml_tensor * kq_mask) {
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int64_t n_kv_total = kq_mask->ne[0];
+    const float kq_scale = 1.0f / std::sqrt((float) n_embd_head_k);
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(n_head_kv == 1);
+    GGML_ASSERT(n_embd_head_k == n_embd_head_v);
+    GGML_ASSERT(lctx.dflash.kv.draft_tail_rows_tensor != nullptr);
+
+    inpL = ggml_reshape_3d(ctx0, inpL, n_embd, 1, n_tokens);
+    inpL = ggml_repeat_4d(ctx0, inpL, n_embd, hc, n_tokens, 1);
+    cb(inpL, "dflash_hc_init", -1);
+
+    for (int il = 0; il < n_layer; ++il) {
+        const auto & layer = model.layers[il];
+        ggml_tensor * residual = inpL;
+        ggml_tensor * post = nullptr;
+        ggml_tensor * comb = nullptr;
+
+        ggml_tensor * cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps,
+                inpL,
+                layer.hc_attn_fn,
+                layer.hc_attn_scale,
+                layer.hc_attn_base,
+                &post, &comb, cb, il);
+        cb(cur, "dflash_hc_attn_pre", il);
+
+        cur = llm_build_norm(ctx0, cur, hparams, layer.attn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(cur, "dflash_attn_norm", il);
+
+        ggml_tensor * qr = llm_build_lora_mm(lctx, ctx0, layer.wq_a, cur);
+        qr = llm_build_norm(ctx0, qr, hparams, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(qr, "dflash_qr_norm", il);
+
+        auto build_rope = [&](int64_t n_heads, ggml_tensor * input, ggml_tensor * weight,
+                              ggml_tensor * norm, const char * name) {
+            ggml_tensor * out = llm_build_lora_mm(lctx, ctx0, weight, input);
+            out = ggml_reshape_2d(ctx0, out, n_embd_head_k, n_heads * n_tokens);
+            out = llm_build_norm(ctx0, out, hparams, norm, nullptr, LLM_NORM_RMS, cb, il);
+            out = ggml_reshape_3d(ctx0, out, n_embd_head_k, n_heads, n_tokens);
+            out = ggml_rope_ext_inplace(ctx0, out, inp_pos, nullptr, n_rot, rope_type, 0,
+                    freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            out->op_params[15] = 1;
+            cb(out, name, il);
+            return out;
+        };
+
+        ggml_tensor * q = build_rope(n_head, qr, layer.wq_b, nullptr, "dflash_q_rope");
+        ggml_tensor * kv = build_rope(1, cur, layer.wkv_latent, layer.attn_kv_norm, "dflash_kv_rope");
+        ggml_tensor * kv_physical = ggml_permute(ctx0, kv, 0, 2, 1, 3);
+        cb(kv_physical, "dflash_kv_physical", il);
+
+        GGML_ASSERT(il < (int32_t) lctx.dflash.kv.k_ctx_cache.size());
+        GGML_ASSERT(il < (int32_t) lctx.dflash.kv.v_ctx_cache.size());
+        ggml_tensor * k = ggml_set_rows(ctx0, lctx.dflash.kv.k_ctx_cache[il],
+                kv_physical, lctx.dflash.kv.draft_tail_rows_tensor);
+        ggml_tensor * v = ggml_set_rows(ctx0, lctx.dflash.kv.v_ctx_cache[il],
+                kv_physical, lctx.dflash.kv.draft_tail_rows_tensor);
+        cb(k, "dflash_k_set_tail", il);
+        cb(v, "dflash_v_set_tail", il);
+
+        if (k->ne[1] != n_kv_total) {
+            k = ggml_view_3d(ctx0, k, k->ne[0], n_kv_total, k->ne[2], k->nb[1], k->nb[2], 0);
+        }
+        if (v->ne[1] != n_kv_total) {
+            v = ggml_view_3d(ctx0, v, v->ne[0], n_kv_total, v->ne[2], v->nb[1], v->nb[2], 0);
+        }
+        if (k->type == GGML_TYPE_F32) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_F32) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        q = ggml_permute(ctx0, q, 0, 2, 1, 3);
+        ggml_tensor * attn = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale,
+                hparams.f_max_alibi_bias,
+                hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        if (layer.attn_sinks != nullptr) {
+            ggml_flash_attn_ext_add_sinks(attn, layer.attn_sinks);
+        }
+        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        cb(attn, "dflash_attn", il);
+        ggml_build_forward_expand(gf, attn);
+
+        attn = ggml_reshape_3d(ctx0, attn, n_embd_head_k, n_head, n_tokens);
+        attn = ggml_rope_ext_inplace(ctx0, attn, inp_pos, nullptr, n_rot, rope_type, 0,
+                freq_base, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        attn->op = GGML_OP_ROPE_BACK;
+        attn->op_params[15] = 1;
+        cb(attn, "dflash_attn_derope", il);
+
+        const int64_t output_group_dim = layer.wo_a->ne[0];
+        const int64_t n_groups = (n_head * n_embd_head_k) / output_group_dim;
+        const int64_t output_lora_rank = layer.wo_b->ne[0] / n_groups;
+        GGML_ASSERT((n_head * n_embd_head_k) % output_group_dim == 0);
+        GGML_ASSERT(layer.wo_b->ne[0] % n_groups == 0);
+
+        attn = ggml_reshape_3d(ctx0, attn, output_group_dim, n_groups, n_tokens);
+        attn = ggml_permute(ctx0, attn, 0, 2, 1, 3);
+        ggml_tensor * oa = ggml_mul_mat(ctx0,
+                ggml_reshape_3d(ctx0, layer.wo_a, output_group_dim, output_lora_rank, n_groups),
+                attn);
+        oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
+        oa = n_tokens == 1
+                ? ggml_reshape_2d(ctx0, oa, output_lora_rank * n_groups, n_tokens)
+                : ggml_cont_2d(ctx0, oa, output_lora_rank * n_groups, n_tokens);
+        cur = llm_build_lora_mm(lctx, ctx0, layer.wo_b, oa);
+        cb(cur, "dflash_attn_out", il);
+
+        inpL = build_mhc_post(cur, post, residual, comb, n_embd, hc, true);
+        cb(inpL, "dflash_hc_attn_post", il);
+
+        residual = inpL;
+        cur = build_hc_pre(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps,
+                inpL,
+                layer.hc_ffn_fn,
+                layer.hc_ffn_scale,
+                layer.hc_ffn_base,
+                &post, &comb, cb, il);
+        cur = llm_build_norm(ctx0, cur, hparams, layer.ffn_norm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(cur, "dflash_ffn_norm", il);
+
+        ggml_tensor * moe_out = llm_build_moe_ffn(ctx0, lctx, cur,
+                layer.ffn_gate_inp, nullptr,
+                layer.ffn_up_exps, nullptr,
+                layer.ffn_gate_exps, nullptr,
+                layer.ffn_down_exps, nullptr,
+                layer.ffn_exp_probs_b,
+                n_expert, n_expert_used,
+                LLM_FFN_SILU, hparams.expert_weights_norm,
+                true, hparams.expert_weights_scale,
+                (enum llm_expert_gating_func_type) hparams.expert_gating_func,
+                cb, il, gf, false, layer.ffn_up_gate_exps);
+        cb(moe_out, "dflash_ffn_moe_out", il);
+
+        ggml_tensor * shared_out = llm_build_ffn(ctx0, lctx, nullptr, cur,
+                layer.ffn_up_shexp, nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr,
+                LLM_FFN_SILU, LLM_FFN_PAR, cb, il);
+        cb(shared_out, "dflash_ffn_shared_out", il);
+
+        cur = ggml_add(ctx0, moe_out, shared_out);
+        inpL = build_mhc_post(cur, post, residual, comb, n_embd, hc, true);
+        cb(inpL, "dflash_layer_out", il);
+    }
+
+    ggml_tensor * out = build_hc_head(ctx0, *this, hparams, n_embd, hparams.f_norm_rms_eps,
+            inpL, model.hc_head_fn, model.hc_head_scale, model.hc_head_base);
+    cb(out, "dflash_hc_head", -1);
+    return out;
+}
+
 ggml_cgraph * llm_build_context::build_deepseek4() {
     ggml_cgraph * gf = new_graph_custom();
 
@@ -1422,6 +1597,15 @@ ggml_cgraph * llm_build_context::build_deepseek4() {
         inpL = build_mhc_post(cur, post, residual, comb, n_embd, hc, true);
         inpL = lctx.cvec.apply_to(ctx0, inpL, il);
         cb(inpL, "l_out", il);
+
+        if (!is_mtp && lctx.dflash.capture != nullptr) {
+            const auto & capture_layers = lctx.dflash.capture->layer_ids;
+            if (std::find(capture_layers.begin(), capture_layers.end(), il) != capture_layers.end()) {
+                ggml_tensor * capture_mean = dsv4_hc_mean(ctx0, inpL);
+                cb(capture_mean, "dflash_l_out", il);
+                ggml_build_forward_expand(gf, capture_mean);
+            }
+        }
     }
 
     if (is_mtp) {

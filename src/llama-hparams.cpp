@@ -128,6 +128,75 @@ static void validate_dflash_hparams(llama_hparams & hparams, llm_arch arch) {
     }
 }
 
+static void load_dflash_dsv4_hparams(llama_model_loader & ml, llama_hparams & hparams) {
+    if (!ml.get_key(LLM_KV_HYPER_CONNECTION_COUNT, hparams.dsv4_hc_mult, false)) {
+        return;
+    }
+
+    ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,                hparams.n_lora_q);
+    ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW,             hparams.n_swa);
+    ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,           hparams.n_ff_exp);
+    ml.get_key(LLM_KV_EXPERT_SHARED_COUNT,                  hparams.n_expert_shared);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_SCALE,                 hparams.expert_weights_scale);
+    ml.get_key(LLM_KV_EXPERT_WEIGHTS_NORM,                  hparams.expert_weights_norm);
+    ml.get_key(LLM_KV_EXPERT_GATING_FUNC,                   hparams.expert_gating_func);
+    ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_EXP,              hparams.swiglu_limits, hparams.n_layer);
+    if (!ml.get_key_or_arr(LLM_KV_SWIGLU_CLAMP_SHEXP,       hparams.swiglu_limits_shared, hparams.n_layer, false)) {
+        hparams.swiglu_limits_shared = hparams.swiglu_limits;
+    }
+    ml.get_key(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,         hparams.dsv4_o_group_count);
+    ml.get_key(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,           hparams.dsv4_o_lora_rank);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
+    ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
+    ml.get_key_or_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS,      hparams.dsv4_compress_ratios, hparams.n_layer);
+
+    if (hparams.dsv4_hc_mult == 0) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft requires hyper_connection.count > 0");
+    }
+    if (hparams.causal_attn) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft requires attention.causal=false");
+    }
+    if (hparams.n_swa == 0) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft requires attention.sliding_window > 0");
+    }
+    if (hparams.n_lora_q == 0 || hparams.dsv4_o_group_count == 0 || hparams.dsv4_o_lora_rank == 0) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft has incomplete attention projection metadata");
+    }
+    if (hparams.n_head_kv() != 1 || hparams.n_embd_head_k(0) != hparams.n_embd_head_v(0) ||
+            hparams.n_rot == 0 || hparams.n_rot > hparams.n_embd_head_k(0)) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft has an unsupported attention head layout");
+    }
+    if (((uint64_t) hparams.n_head() * hparams.n_embd_head_k(0)) % hparams.dsv4_o_group_count != 0) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft output_group_count does not divide the attention width");
+    }
+    if (hparams.dsv4_hc_sinkhorn_iters == 0 || hparams.dsv4_hc_eps <= 0.0f) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft has incomplete hyper-connection metadata");
+    }
+    if (hparams.n_expert == 0 || hparams.n_expert_used == 0 || hparams.n_ff_exp == 0 || hparams.n_expert_shared == 0) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft has incomplete MoE metadata");
+    }
+    if (hparams.expert_gating_func != LLM_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        throw std::runtime_error("DSpark DeepSeek-V4 draft expects sqrtsoftplus MoE scoring");
+    }
+    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+        if (hparams.dsv4_compress_ratios[il] != 0) {
+            throw std::runtime_error("DSpark DeepSeek-V4 draft expects uncompressed attention on all stages");
+        }
+    }
+
+    const uint64_t expected_target_features = (uint64_t) hparams.dflash_n_target_layers * hparams.n_embd;
+    if (hparams.dflash_n_target_features != expected_target_features) {
+        throw std::runtime_error(format(
+            "DSpark DeepSeek-V4 draft expects one embedding-width feature per target layer: got %u, expected %llu",
+            hparams.dflash_n_target_features,
+            (unsigned long long) expected_target_features));
+    }
+
+    std::fill_n(hparams.swa_layers.begin(), hparams.n_layer, 1);
+    hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
+    hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
+}
+
 
 void llm_load_hparams(
         llama_model_loader & ml,
@@ -912,15 +981,14 @@ void llm_load_hparams(
                 load_dflash_target_layer_ids(ml, LLM_KV(model.arch)(LLM_KV_DFLASH_TARGET_LAYER_IDS), hparams, false);
                 ml.get_key(LLM_KV_ATTENTION_VALUE_SCALE, hparams.f_attn_v_scale, false);
                 ml.get_key(LLM_KV_DFLASH_LAGUNA, hparams.dflash_laguna, false);
-                if (hparams.dflash_laguna) {
-                    ml.get_key(LLM_KV_ATTENTION_CAUSAL, hparams.causal_attn);
-                }
+                ml.get_key(LLM_KV_ATTENTION_CAUSAL, hparams.causal_attn, hparams.dflash_laguna);
                 // DFlash drafts may be trained with sliding-window attention (for long-context).
                 // Read the window + per-layer pattern so the SWA mask path activates; absent keys
                 // leave n_swa=0 / swa_layers all-zero (dense behavior, unchanged).
                 ml.get_key(LLM_KV_ATTENTION_SLIDING_WINDOW, hparams.n_swa, false);
                 ml.get_key_or_arr(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, hparams.swa_layers, hparams.n_layer, false);
                 validate_dflash_hparams(hparams, model.arch);
+                load_dflash_dsv4_hparams(ml, hparams);
 
                 hparams.n_layer_kv_from_start = hparams.n_layer;
                 model.type = e_model::MODEL_UNKNOWN;

@@ -116,7 +116,7 @@ void spec_tuner::write_best(common_params_speculative & params) const {
     for (const auto & coord : coords) {
         float val = coord.arms[coord.best_idx].value;
         if      (coord.name == "n_max") {
-            params.n_max = (spec_type == COMMON_SPECULATIVE_TYPE_DFLASH && (int32_t)val == 0)
+            params.n_max = (common_speculative_type_is_dflash_family(spec_type) && (int32_t)val == 0)
                 ? configured_n_max
                 : (int32_t)val;
         }
@@ -129,12 +129,17 @@ void spec_tuner::write_best(common_params_speculative & params) const {
     }
 }
 
-void spec_tuner::init(common_speculative_type type, const common_params_speculative & user_params, const llama_model * model_tgt) {
+void spec_tuner::init(
+        common_speculative_type           type,
+        const common_params_speculative & user_params,
+        const llama_model               * model_tgt,
+        int32_t                           n_max_cap) {
     enabled    = true;
     spec_type  = type;
     configured_n_max = std::max(1, (int) user_params.n_max);
     dflash_quarantined.clear();
     dflash_probe_cursor = 0;
+    dflash_active_n_min = 0;
     dflash_last_exploratory = false;
     dflash_last_recovery_probe = false;
     n_target_only_selections = 0;
@@ -159,16 +164,19 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
         spec_tuner_coord coord;
         coord.name = "n_max";
         const bool recurrent_target = model_tgt != nullptr && llama_model_has_recurrent(model_tgt);
-        int hi = type == COMMON_SPECULATIVE_TYPE_DFLASH
+        int hi = common_speculative_type_is_dflash_family(type)
             ? configured_n_max
             : (recurrent_target ? std::max(1, (int) user_params.n_max)
                                  : std::max(16, (int) user_params.n_max));
-        const int lo = type == COMMON_SPECULATIVE_TYPE_DFLASH ? 0 : 1;
+        if (common_speculative_type_is_dflash_family(type) && n_max_cap >= 0) {
+            hi = std::min(hi, (int) n_max_cap);
+        }
+        const int lo = common_speculative_type_is_dflash_family(type) ? 0 : 1;
         coord.build_grid_int(lo, hi, 1, user_params.n_max);
         coords.push_back(std::move(coord));
     }
 
-    if (type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+    if (common_speculative_type_is_dflash_family(type)) {
         dflash_quarantined.assign(coords[0].arms.size(), false);
     }
 
@@ -241,6 +249,11 @@ void spec_tuner::init(common_speculative_type type, const common_params_speculat
     }
 }
 
+bool spec_tuner::dflash_arm_is_eligible(const spec_tuner_arm & arm) const {
+    const int32_t n_max = (int32_t) arm.value;
+    return n_max == 0 || n_max >= dflash_active_n_min;
+}
+
 int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
     dflash_last_exploratory = false;
     dflash_last_recovery_probe = false;
@@ -250,7 +263,7 @@ int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
     }
 
     for (int i = 0; i < (int) coord.arms.size(); ++i) {
-        if (coord.arms[i].N < dflash_min_samples_per_arm) {
+        if (dflash_arm_is_eligible(coord.arms[i]) && coord.arms[i].N < dflash_min_samples_per_arm) {
             dflash_last_exploratory = true;
             return i;
         }
@@ -260,7 +273,7 @@ int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
             n_calls % dflash_recovery_probe_interval == 0) {
         for (int offset = 0; offset < (int) coord.arms.size(); ++offset) {
             const int i = (dflash_probe_cursor + offset) % (int) coord.arms.size();
-            if (dflash_quarantined[i]) {
+            if (dflash_arm_is_eligible(coord.arms[i]) && dflash_quarantined[i]) {
                 dflash_probe_cursor = (i + 1) % (int) coord.arms.size();
                 dflash_last_exploratory = true;
                 dflash_last_recovery_probe = true;
@@ -272,7 +285,7 @@ int spec_tuner::select_dflash_arm(spec_tuner_coord & coord) {
 
     int best_idx = -1;
     for (int i = 0; i < (int) coord.arms.size(); ++i) {
-        if (dflash_quarantined[i]) {
+        if (!dflash_arm_is_eligible(coord.arms[i]) || dflash_quarantined[i]) {
             continue;
         }
         if (best_idx < 0 || coord.arms[i].Q > coord.arms[best_idx].Q) {
@@ -296,14 +309,34 @@ void spec_tuner::update_dflash_quarantine() {
         dflash_quarantined.assign(coord.arms.size(), false);
     }
 
+    const auto update_eligible_best = [&]() {
+        int best_idx = -1;
+        for (int i = 0; i < (int) coord.arms.size(); ++i) {
+            if (!dflash_arm_is_eligible(coord.arms[i]) || dflash_quarantined[i]) {
+                continue;
+            }
+            if (best_idx < 0 || coord.arms[i].Q > coord.arms[best_idx].Q) {
+                best_idx = i;
+            }
+        }
+        if (best_idx >= 0) {
+            coord.best_idx = best_idx;
+        }
+    };
+
     const int zero_idx = coord.find_nearest_arm(0.0f);
     const auto & zero = coord.arms[zero_idx];
     if (zero.N < 3 || zero.Q <= 0.0) {
+        update_eligible_best();
         return;
     }
 
     for (int i = 0; i < (int) coord.arms.size(); ++i) {
         if (i == zero_idx) {
+            continue;
+        }
+        if (!dflash_arm_is_eligible(coord.arms[i])) {
+            dflash_quarantined[i] = false;
             continue;
         }
         const bool should_quarantine = coord.arms[i].N >= 3 &&
@@ -314,22 +347,12 @@ void spec_tuner::update_dflash_quarantine() {
         dflash_quarantined[i] = should_quarantine;
     }
 
-    int best_idx = -1;
-    for (int i = 0; i < (int) coord.arms.size(); ++i) {
-        if (dflash_quarantined[i]) {
-            continue;
-        }
-        if (best_idx < 0 || coord.arms[i].Q > coord.arms[best_idx].Q) {
-            best_idx = i;
-        }
-    }
-    if (best_idx >= 0) {
-        coord.best_idx = best_idx;
-    }
+    update_eligible_best();
 }
 
-void spec_tuner::propose(common_params_speculative & params) {
+void spec_tuner::propose(common_params_speculative & params, int32_t dflash_n_min) {
     int64_t t_start = ggml_time_us();
+    dflash_active_n_min = std::max<int32_t>(0, dflash_n_min);
 
     // always select fresh arm for every draft call
     for (auto & coord : coords) {
@@ -365,7 +388,9 @@ void spec_tuner::enforce_constraints(common_params_speculative & params) {
     if (params.n_min < 0)    params.n_min = 0;
     const int min_n_max = has_dflash_target_only_arm() ? 0 : 1;
     if (params.n_max < min_n_max) params.n_max = min_n_max;
-    if (params.n_min > params.n_max) params.n_min = params.n_max;
+    if (params.n_min > params.n_max && !(has_dflash_target_only_arm() && params.n_max == 0)) {
+        params.n_min = params.n_max;
+    }
 
     if (params.p_min < 0.0f)  params.p_min = 0.0f;
     if (params.p_min > 0.95f) params.p_min = 0.95f;
@@ -426,7 +451,7 @@ void spec_tuner::accept_feedback(int n_accepted, int n_drafted, double step_tps)
             oss << " " << coord.name << "=";
             if (is_int) oss << (int)coord.arms[coord.current_idx].value;
             else oss << std::fixed << std::setprecision(2) << coord.arms[coord.current_idx].value;
-            if (coord.name == "n_max" && spec_type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+            if (coord.name == "n_max" && common_speculative_type_is_dflash_family(spec_type)) {
                 oss << "(target_only=" << ((int) coord.arms[coord.current_idx].value == 0 ? "true" : "false") << ")";
             }
             oss << "→best=";
@@ -518,7 +543,7 @@ void spec_tuner::print_best() const {
             first_kv = false;
 
             int reuse_value = is_int ? (int) coord.arms[coord.best_idx].value : 0;
-            if (coord.name == "n_max" && spec_type == COMMON_SPECULATIVE_TYPE_DFLASH && reuse_value == 0) {
+            if (coord.name == "n_max" && common_speculative_type_is_dflash_family(spec_type) && reuse_value == 0) {
                 reuse_value = configured_n_max;
             }
             if (is_int) oss << reuse_value;

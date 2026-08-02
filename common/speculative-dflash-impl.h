@@ -1,8 +1,10 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <iterator>
 #include <vector>
 
 static bool common_speculative_are_dflash_compatible(
@@ -82,6 +84,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int32_t mask_token_id = -1;
     int32_t n_target_features = 0;
     int32_t cross_ctx = 0;
+    bool is_dspark = false;
     bool ready = false;
 
     std::vector<int32_t> target_layer_ids;
@@ -110,6 +113,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         , ctx_tgt(ctx_tgt)
         , ctx_dft(ctx_dft)
         , cross_ctx(std::max(1, cross_ctx))
+        , is_dspark(type == COMMON_SPECULATIVE_TYPE_DSPARK)
     {
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
         const llama_model * model_dft = llama_get_model(ctx_dft);
@@ -123,6 +127,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
         mask_token_id = llama_model_dflash_mask_token_id(model_dft);
         n_target_features = llama_model_dflash_n_target_features(model_dft);
         const int32_t n_target_layers = llama_model_dflash_n_target_layers(model_dft);
+
+        if (is_dspark != llama_model_dflash_has_markov_head(model_dft)) {
+            LOG_ERR("%s: %s stage does not match the draft model head (Markov head %s)\n",
+                    __func__,
+                    common_speculative_type_to_str(type).c_str(),
+                    llama_model_dflash_has_markov_head(model_dft) ? "present" : "absent");
+            return;
+        }
 
         if (block_size <= 0 || mask_token_id < 0 || n_target_features <= 0 || n_target_layers <= 0) {
             LOG_ERR("%s: invalid DFlash metadata (block_size=%d, mask_token_id=%d, n_target_features=%d, n_target_layers=%d)\n",
@@ -214,8 +226,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
         ready = true;
 
         llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
-        LOG_INF("%s: DFlash context ready (n_ctx=%d, block_size=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
-                __func__, llama_n_ctx(ctx_dft), block_size, this->cross_ctx, n_target_features, n_target_layers);
+        LOG_INF("%s: %s context ready (n_ctx=%d, block_size=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
+                __func__, common_speculative_type_to_str(type).c_str(), llama_n_ctx(ctx_dft), block_size,
+                this->cross_ctx, n_target_features, n_target_layers);
     }
 
     ~common_speculative_state_dflash() override {
@@ -246,7 +259,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        const int32_t n_keep = std::min<int32_t>(params.n_max, block_size - 1);
+        const int32_t n_draft_max = is_dspark ? block_size : block_size - 1;
+        const int32_t n_keep = std::min<int32_t>(params.n_max, n_draft_max);
         if (n_keep <= 0) {
             return;
         }
@@ -280,12 +294,19 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
         llama_kv_cache_clear(ctx_dft);
         batch.n_tokens = 0;
-        const int32_t batch_len = n_keep + 1;
+        const int32_t batch_len = n_keep + (is_dspark ? 0 : 1);
         const llama_pos draft_pos_base = last_target_pos >= 0 ? last_target_pos + 1 : (llama_pos) target_window_rows;
         const llama_pos seed_pos = last_target_pos >= 0 ? last_target_pos : draft_pos_base - 1;
-        common_batch_add(batch, id_last, seed_pos, { 0 }, false);
-        for (int32_t i = 1; i < batch_len; ++i) {
-            common_batch_add(batch, mask_token_id, draft_pos_base + (i - 1), { 0 }, i <= n_keep);
+        if (is_dspark) {
+            common_batch_add(batch, id_last, draft_pos_base, { 0 }, true);
+            for (int32_t i = 1; i < batch_len; ++i) {
+                common_batch_add(batch, mask_token_id, draft_pos_base + i, { 0 }, true);
+            }
+        } else {
+            common_batch_add(batch, id_last, seed_pos, { 0 }, false);
+            for (int32_t i = 1; i < batch_len; ++i) {
+                common_batch_add(batch, mask_token_id, draft_pos_base + (i - 1), { 0 }, i <= n_keep);
+            }
         }
 
         if (llama_decode(ctx_dft, batch) != 0) {
@@ -293,12 +314,29 @@ struct common_speculative_state_dflash : public common_speculative_state {
             batch.n_tokens = 0;
             return;
         }
+        // The compact argmax and confidence buffers are copied to host asynchronously.
+        // Complete both transfers once before consuming either buffer.
+        llama_synchronize(ctx_dft);
 
         result.reserve((size_t) n_keep);
         for (int32_t i = 0; i < n_keep; ++i) {
+            if (is_dspark && params.p_min > 0.0f) {
+                const float confidence = llama_get_dflash_draft_confidence_ith(ctx_dft, i);
+                if (!std::isfinite(confidence) || confidence < 0.0f || confidence > 1.0f) {
+                    LOG_ERR("%s: DSpark confidence output is unavailable or invalid at position %d (value=%g)\n",
+                            __func__, i, (double) confidence);
+                    result.clear();
+                    break;
+                }
+                if (confidence < params.p_min) {
+                    break;
+                }
+            }
+
             llama_token id = llama_get_dflash_draft_token_ith(ctx_dft, i);
             if (id == LLAMA_TOKEN_NULL) {
-                id = common_sampler_sample_speculative(nullptr, ctx_dft, i + 1, nullptr);
+                const int32_t output_index = is_dspark ? i : i + 1;
+                id = common_sampler_sample_speculative(nullptr, ctx_dft, output_index, nullptr);
             }
             result.push_back(id);
         }
@@ -482,6 +520,41 @@ static void dflash_clear_target_features(common_speculative_state_dflash & state
     state.target_window_replace = false;
     state.target_window_materialized = false;
     state.last_target_pos = -1;
+    llama_reset_dflash_kv_cache_state(state.ctx_dft);
+}
+
+static void dflash_trim_target_features(
+        common_speculative_state_dflash & state,
+        llama_pos                         pos_begin) {
+    if (state.target_window_rows <= 0 || state.target_window_pos.empty()) {
+        return;
+    }
+
+    const auto keep_end = std::lower_bound(
+        state.target_window_pos.begin(),
+        state.target_window_pos.end(),
+        pos_begin);
+    const int32_t keep_rows = (int32_t) std::distance(state.target_window_pos.begin(), keep_end);
+    if (keep_rows == state.target_window_rows) {
+        return;
+    }
+    if (keep_rows <= 0) {
+        dflash_clear_target_features(state);
+        return;
+    }
+
+    dflash_materialize_target_window_features(state);
+    const size_t row_width = (size_t) state.n_target_features;
+    state.target_window.resize((size_t) keep_rows * row_width);
+    state.target_window_pos.resize((size_t) keep_rows);
+    state.target_window_stage.clear();
+    state.target_window_pos_stage.clear();
+    state.target_window_append_features.clear();
+    state.target_window_rows = keep_rows;
+    dflash_ring_reset_rows(state, state.target_window.data(), keep_rows);
+    state.target_window_ring_filled = keep_rows;
+    state.last_target_pos = state.target_window_pos.back();
+    dflash_record_window_update(state, 0, keep_rows, true);
     llama_reset_dflash_kv_cache_state(state.ctx_dft);
 }
 

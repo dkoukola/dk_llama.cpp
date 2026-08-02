@@ -403,6 +403,9 @@ class MODEL_TENSOR(IntEnum):
     DFLASH_FC            = auto()
     DFLASH_HIDDEN_NORM   = auto()
     DFLASH_AUX_HIDDEN_NORM = auto()
+    DFLASH_MARKOV_W1     = auto()
+    DFLASH_MARKOV_W2     = auto()
+    DFLASH_CONF_PROJ     = auto()
     ATTN_KV              = auto()
     ATTN_KV_NORM         = auto()
     ATTN_OUT_A           = auto()
@@ -632,6 +635,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.DFLASH_FC:                 "dflash_fc",
     MODEL_TENSOR.DFLASH_HIDDEN_NORM:        "dflash_hidden_norm",
     MODEL_TENSOR.DFLASH_AUX_HIDDEN_NORM:    "dflash_aux_hidden_norm.{bid}",
+    MODEL_TENSOR.DFLASH_MARKOV_W1:          "dflash_markov_w1",
+    MODEL_TENSOR.DFLASH_MARKOV_W2:          "dflash_markov_w2",
+    MODEL_TENSOR.DFLASH_CONF_PROJ:          "dflash_conf_proj",
     # openPangu-2.0
     MODEL_TENSOR.INDEXER_K_NORM:            "blk.{bid}.attn_indexer_k_norm",
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.attn_indexer_weights_proj",
@@ -1544,22 +1550,50 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.OUTPUT_NORM,
         MODEL_TENSOR.OUTPUT,
+        MODEL_TENSOR.HC_HEAD_FN,
+        MODEL_TENSOR.HC_HEAD_BASE,
+        MODEL_TENSOR.HC_HEAD_SCALE,
         MODEL_TENSOR.ATTN_NORM,
         MODEL_TENSOR.ATTN_Q,
         MODEL_TENSOR.ATTN_Q_NORM,
         MODEL_TENSOR.ATTN_K,
         MODEL_TENSOR.ATTN_K_NORM,
         MODEL_TENSOR.ATTN_V,
+        MODEL_TENSOR.ATTN_Q_A,
+        MODEL_TENSOR.ATTN_Q_B,
+        MODEL_TENSOR.ATTN_Q_A_NORM,
+        MODEL_TENSOR.ATTN_KV,
+        MODEL_TENSOR.ATTN_KV_NORM,
+        MODEL_TENSOR.ATTN_OUT_A,
+        MODEL_TENSOR.ATTN_OUT_B,
         MODEL_TENSOR.ATTN_GATE,
         MODEL_TENSOR.ATTN_SINKS,
         MODEL_TENSOR.ATTN_OUT,
         MODEL_TENSOR.ATTN_POST_NORM,
+        MODEL_TENSOR.HC_ATTN_FN,
+        MODEL_TENSOR.HC_ATTN_BASE,
+        MODEL_TENSOR.HC_ATTN_SCALE,
+        MODEL_TENSOR.HC_FFN_FN,
+        MODEL_TENSOR.HC_FFN_BASE,
+        MODEL_TENSOR.HC_FFN_SCALE,
+        MODEL_TENSOR.FFN_NORM,
         MODEL_TENSOR.FFN_GATE,
         MODEL_TENSOR.FFN_DOWN,
         MODEL_TENSOR.FFN_UP,
+        MODEL_TENSOR.FFN_GATE_INP,
+        MODEL_TENSOR.FFN_EXP_PROBS_B,
+        MODEL_TENSOR.FFN_GATE_EXP,
+        MODEL_TENSOR.FFN_DOWN_EXP,
+        MODEL_TENSOR.FFN_UP_EXP,
+        MODEL_TENSOR.FFN_GATE_SHEXP,
+        MODEL_TENSOR.FFN_DOWN_SHEXP,
+        MODEL_TENSOR.FFN_UP_SHEXP,
         MODEL_TENSOR.DFLASH_FC,
         MODEL_TENSOR.DFLASH_HIDDEN_NORM,
         MODEL_TENSOR.DFLASH_AUX_HIDDEN_NORM,
+        MODEL_TENSOR.DFLASH_MARKOV_W1,
+        MODEL_TENSOR.DFLASH_MARKOV_W2,
+        MODEL_TENSOR.DFLASH_CONF_PROJ,
     ],
     MODEL_ARCH.BITNET: [
         MODEL_TENSOR.ATTN_Q,

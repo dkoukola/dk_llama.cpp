@@ -150,6 +150,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NONE,          // no speculative decoding
     COMMON_SPECULATIVE_TYPE_DRAFT,         // draft model
     COMMON_SPECULATIVE_TYPE_DFLASH,        // DFlash draft model
+    COMMON_SPECULATIVE_TYPE_DSPARK,        // DSpark draft model (DFlash + Markov head)
     COMMON_SPECULATIVE_TYPE_MTP,           // MTP model
     COMMON_SPECULATIVE_TYPE_EAGLE3,        // eagle draft model
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,  // simple self-speculative decoding
@@ -165,6 +166,7 @@ std::string common_speculative_type_name_str();
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 std::string common_speculative_type_to_str(enum common_speculative_type type);
 bool common_speculative_type_is_self_spec(enum common_speculative_type type);
+bool common_speculative_type_is_dflash_family(enum common_speculative_type type);
 
 struct common_speculative_stage_params {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;

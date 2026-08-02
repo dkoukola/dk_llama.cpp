@@ -846,7 +846,10 @@ int main(int argc, char ** argv) {
                     embd_is_prompt &&
                     spec != nullptr &&
                     (params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-                     params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH));
+                     ((params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+                       params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK)) &&
+                      (common_speculative_get_runtime_n_max(spec, params.speculative) > 0 ||
+                       common_speculative_get_configured_n_max(spec) > 0)));
 
                 llama_batch batch = {};
                 if (need_prompt_target_features) {
@@ -982,9 +985,13 @@ int main(int argc, char ** argv) {
                     draft.resize(max_usable_draft);
                 }
 
-                const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
-                if ((int) draft.size() >= min_usable_draft && (!draft.empty() || n_predict_budget > 1)) {
-                    if (common_speculative_needs_checkpoint(model)) {
+                const int min_usable_draft = common_speculative_get_runtime_n_min(
+                    spec,
+                    params.speculative);
+                if ((int) draft.size() >= min_usable_draft &&
+                        (!draft.empty() || draft_result.target_only) &&
+                        n_predict_budget > 1) {
+                    if (!draft_result.target_only && common_speculative_needs_checkpoint(model)) {
                         if (!common_speculative_before_draft(
                             spec,
                             model,

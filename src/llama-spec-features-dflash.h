@@ -49,6 +49,13 @@ static inline llama_dflash_kv_cache_transition llama_plan_dflash_kv_cache_transi
 
         plan.cache_up_to_date = cache_valid && applied_window_version == target_window_version;
         plan.rebuild_cache = !cache_valid || replace || bounded_append_rows <= 0 || bounded_append_rows > n_rows;
+        const bool version_is_next = target_window_version > applied_window_version &&
+                target_window_version - applied_window_version == 1;
+        if (!plan.cache_up_to_date && cache_valid && !version_is_next) {
+                // The update view carries only the most recent append. If one or more
+                // logical-window updates were skipped, rebuild from the materialized window.
+                plan.rebuild_cache = true;
+        }
         if (!plan.rebuild_cache && bounded_keep_rows != expected_keep_rows) {
                 plan.rebuild_cache = true;
         }
@@ -85,6 +92,7 @@ int32_t llama_model_dflash_n_target_layers(const struct llama_model * model);
 int32_t llama_model_dflash_n_target_features(const struct llama_model * model);
 int32_t llama_model_dflash_target_layer_ids(const struct llama_model * model, int32_t * layer_ids, int32_t capacity);
 int32_t llama_model_dflash_target_mask_token_id(const struct llama_model * model);
+bool llama_model_dflash_has_markov_head(const struct llama_model * model);
 
 enum llama_dflash_io_mode {
     LLAMA_DFLASH_IO_MODE_INVALID = 0,

@@ -39,6 +39,7 @@ struct spec_tuner {
     double   dflash_quarantine_ratio = 0.90;
     std::vector<bool> dflash_quarantined;
     int      dflash_probe_cursor = 0;
+    int      dflash_active_n_min = 0;
     bool     dflash_last_exploratory = false;
     bool     dflash_last_recovery_probe = false;
     uint64_t n_target_only_selections = 0;
@@ -71,8 +72,12 @@ struct spec_tuner {
     common_speculative_type spec_type = COMMON_SPECULATIVE_TYPE_NONE;
     std::vector<spec_tuner_coord> coords;
 
-    void init(common_speculative_type type, const common_params_speculative & user_params, const llama_model * model_tgt);
-    void propose(common_params_speculative & params);
+    void init(
+            common_speculative_type           type,
+            const common_params_speculative & user_params,
+            const llama_model               * model_tgt,
+            int32_t                           n_max_cap = -1);
+    void propose(common_params_speculative & params, int32_t dflash_n_min = 0);
     void accept_feedback(int n_accepted, int n_drafted, double step_tps);
     void end_of_request(double slot_tps, int n_past, common_params_speculative & active_params);
     void enforce_constraints(common_params_speculative & params);
@@ -82,10 +87,11 @@ struct spec_tuner {
     void write_best(common_params_speculative & params) const;
 
     bool has_dflash_target_only_arm() const {
-        return enabled && spec_type == COMMON_SPECULATIVE_TYPE_DFLASH && configured_n_max > 0;
+        return enabled && common_speculative_type_is_dflash_family(spec_type) && configured_n_max > 0;
     }
 
 private:
+    bool dflash_arm_is_eligible(const spec_tuner_arm & arm) const;
     int select_dflash_arm(spec_tuner_coord & coord);
     void update_dflash_quarantine();
 };

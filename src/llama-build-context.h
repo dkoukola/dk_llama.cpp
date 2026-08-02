@@ -262,6 +262,12 @@ struct llm_build_context {
 
     ggml_cgraph * build_dflash_kv_cache();
 
+    ggml_tensor * build_dflash_dsv4_layers(
+            ggml_cgraph * gf,
+            ggml_tensor * inpL,
+            ggml_tensor * inp_pos,
+            ggml_tensor * kq_mask);
+
     ggml_cgraph * build_starcoder2();
 
     ggml_cgraph * build_mamba();

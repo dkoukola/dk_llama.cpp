@@ -115,6 +115,12 @@ int32_t llama_model_dflash_target_mask_token_id(const struct llama_model * model
     return (int32_t) model->vocab.token_mask();
 }
 
+bool llama_model_dflash_has_markov_head(const struct llama_model * model) {
+    return model != nullptr &&
+            model->dflash_markov_w1 != nullptr &&
+            model->dflash_markov_w2 != nullptr;
+}
+
 static const ggml_tensor * llama_dflash_output_tensor(
         const struct llama_model * model) {
     if (model == nullptr) {
@@ -339,8 +345,14 @@ static bool llama_dflash_parse_layer_id(const struct ggml_tensor * tensor, int32
         return false;
     }
 
-    static constexpr const char * prefix = "l_out-";
-    if (std::strncmp(tensor->name, prefix, std::strlen(prefix)) != 0) {
+    static constexpr const char * dflash_prefix = "dflash_l_out-";
+    static constexpr const char * legacy_prefix = "l_out-";
+    const char * prefix = nullptr;
+    if (std::strncmp(tensor->name, dflash_prefix, std::strlen(dflash_prefix)) == 0) {
+        prefix = dflash_prefix;
+    } else if (std::strncmp(tensor->name, legacy_prefix, std::strlen(legacy_prefix)) == 0) {
+        prefix = legacy_prefix;
+    } else {
         return false;
     }
 
@@ -372,6 +384,14 @@ static int llama_dflash_capture_eval_callback(struct ggml_tensor * tensor, bool 
     auto * ctx = static_cast<llama_context *>(user_data);
     if (ctx == nullptr || !ctx->dflash.capture) {
         return false;
+    }
+
+    // DeepSeek-V4's ordinary l_out tensor still contains all hyper-connection
+    // streams. Capture only the explicit stream mean emitted for DSpark.
+    static constexpr const char * dflash_prefix = "dflash_l_out-";
+    if (ctx->model.hparams.dsv4_hc_mult > 0 &&
+            std::strncmp(tensor->name, dflash_prefix, std::strlen(dflash_prefix)) != 0) {
+        return 0;
     }
 
     int32_t layer_id = -1;

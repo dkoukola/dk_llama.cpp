@@ -111,6 +111,10 @@ bool common_speculative_type_is_self_spec(enum common_speculative_type type) {
     }
 }
 
+bool common_speculative_type_is_dflash_family(enum common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK;
+}
+
 static int32_t common_speculative_stage_effective_n_max(
         const common_params_speculative & params,
         const common_speculative_stage_params & stage) {
@@ -157,6 +161,9 @@ common_params_speculative common_params_speculative::with_stage_overrides(const 
     }
     if (stage.has_p_min_override()) {
         result.p_min = stage.p_min;
+    } else if (stage.type == COMMON_SPECULATIVE_TYPE_DSPARK) {
+        // DSpark confidence filtering is opt-in; do not inherit the generic 0.75.
+        result.p_min = 0.0f;
     }
     if (stage.has_mtp_heads_override()) {
         result.mtp_heads = stage.mtp_heads;
@@ -221,6 +228,7 @@ bool common_params_speculative::has_composite_stage_chain() const {
 bool common_params_speculative::needs_dft_model() const {
     return has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) ||
         has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK) ||
         (has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) && has_dft());
 }
 
@@ -296,12 +304,12 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
             return fail("speculative stage has n_min greater than n_max");
         }
 
-        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || stage.type == COMMON_SPECULATIVE_TYPE_DFLASH) && !params.has_dft()) {
+        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || common_speculative_type_is_dflash_family(stage.type)) && !params.has_dft()) {
             return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
         }
 
-        if (stage.type == COMMON_SPECULATIVE_TYPE_DFLASH && stage_params.dflash_cross_ctx < 1) {
-            return fail("dflash speculative stage requires cross_ctx >= 1");
+        if (common_speculative_type_is_dflash_family(stage.type) && stage_params.dflash_cross_ctx < 1) {
+            return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires cross_ctx >= 1");
         }
     }
 
@@ -3373,13 +3381,14 @@ void gpt_params_print_usage(int /*argc*/, char ** argv, const gpt_params & param
                                                               "  cpu          serialise architecture state via host storage; re-decode on rejection\n"
                                                               "  --recurrent-ckpt-mode remains as a deprecated alias" });
     options.push_back({ "*", "--spec-type SPEC[:k=v,...]",      "canonical speculative stage entry; repeat for a supported two-stage chain.\n"
-                                                              "types: none, draft, dflash, mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
+                                                              "types: none, draft, dflash, draft-dspark (alias: dspark), mtp, ngram-cache, ngram-simple, ngram-map-k, ngram-map-k4v, ngram-mod, suffix\n"
                                                               "canonical keys: n_max,n_min,p_min,heads,cross_ctx,ngram_size_n,ngram_size_m,ngram_min_hits,suffix_min_match_len,suffix_max_depth,suffix_corpus\n"
                                                               "MTP heads: heads=1 is the default; heads>1 and heads=0 (all model heads) are experimental\n"
                                                               "for comma-bearing string values, quote the value inside the stage payload for normal shell use\n"
                                                               "if argv is passed directly without shell unescaping, the parser also accepts escaped commas as \\,\n"
                                                               "examples: --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --model-draft draft.gguf --spec-type dflash:n_max=4,cross_ctx=512\n"
+                                                              "          --model-draft dspark.gguf --spec-type draft-dspark:n_max=5,cross_ctx=512\n"
                                                               "          --spec-type ngram-mod:n_max=64,n_min=2,ngram_size_n=8 --spec-type mtp:n_max=1,p_min=0.0\n"
                                                               "          --spec-type \"suffix:n_max=16,n_min=2,suffix_min_match_len=5,suffix_max_depth=64,suffix_corpus='/tmp/spec,type-corpus.json'\"\n"
                                                               "legacy --spec-stage, --draft-*, --spec-ngram-*, --suffix-* and -mtp flags are rejected" });

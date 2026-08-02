@@ -137,6 +137,12 @@ common_speculative_draft_result common_speculative_draft_ex(
                             llama_seq_id  draft_seq_id = 0);
 
 int common_speculative_get_configured_n_max(const common_speculative * spec);
+int common_speculative_get_runtime_n_max(
+        const common_speculative        * spec,
+        const common_params_speculative & params);
+int common_speculative_get_runtime_n_min(
+        const common_speculative        * spec,
+        const common_params_speculative & params);
 
 // informs the speculative decoder that n_accepted tokens were accepted by the target model
 void common_speculative_accept(common_speculative * spec, uint16_t n_accepted);
@@ -260,6 +266,10 @@ int32_t common_speculative_on_target_batch(
 void common_speculative_print_stats(const common_speculative * spec, double slot_tps = 0.0, int n_decoded = 0, int n_past = 0, common_params_speculative * active_params = nullptr);
 
 common_speculative_type common_speculative_current_type(const common_speculative * spec);
+
+// Number of target prompt rows that must be re-evaluated after restoring a
+// prompt cache because DFlash target features are not part of the cache state.
+int32_t common_speculative_dflash_rewarm_tokens(const common_speculative * spec);
 
 common_speculative_metrics_snapshot common_speculative_get_metrics_snapshot(const common_speculative * spec);
 

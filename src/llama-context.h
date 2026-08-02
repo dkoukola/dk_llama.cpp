@@ -461,6 +461,8 @@ struct llama_context {
         // Populated in llama_decode_internal after graph compute.
         std::vector<llama_token> draft_tokens;
         struct ggml_tensor * draft_tokens_tensor = nullptr;
+        std::vector<float> draft_confidence;
+        struct ggml_tensor * draft_confidence_tensor = nullptr;
     };
     dflash_runtime dflash;
     using dflash_capture_state = dflash_runtime::capture_state;

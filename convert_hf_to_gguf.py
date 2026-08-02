@@ -47,6 +47,7 @@ AnyModel = TypeVar("AnyModel", bound="type[Model]")
 class Model:
     _model_classes: dict[str, type[Model]] = {}
     mtp_only = False
+    preserve_tensor_dimensions = False
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -292,7 +293,12 @@ class Model:
 
             for new_name, data in ((
                 n,
-                (d if self.mtp_only and self.model_arch == gguf.MODEL_ARCH.DEEPSEEK4 and n == "output_hc_scale.weight" else d.squeeze()).numpy(),
+                (
+                    d
+                    if self.preserve_tensor_dimensions
+                    or self.mtp_only and n == "output_hc_scale.weight"
+                    else d.squeeze()
+                ).numpy(),
             ) for n, d in self.modify_tensors(data_torch, name, bid)):
                 data: np.ndarray  # type hint
                 n_dims = len(data.shape)
@@ -5113,7 +5119,7 @@ class DeepseekV4Model(DeepseekV2Model):
         if (hash_layers := hparams.get("num_hash_layers")) is not None:
             self.gguf_writer.add_uint32(f"{arch}.hash_layer_count", int(hash_layers))
 
-        if self.mtp_only:
+        if self.mtp_only and not getattr(self, "dspark_only", False):
             self.gguf_writer.add_embedding_length_out(int(hparams["hidden_size"]) * int(hparams["hc_mult"]))
 
         if (indexer_heads := self.hparams.get("num_indexer_heads", self.hparams.get("index_n_heads"))) is not None:
@@ -5122,8 +5128,271 @@ class DeepseekV4Model(DeepseekV2Model):
             self.gguf_writer.add_attention_indexer_key_length(indexer_dim)
         if (indexer_top_k := self.hparams.get("indexer_topk", self.hparams.get("index_topk"))) is not None:
             self.gguf_writer.add_attention_indexer_top_k(indexer_top_k)
-        if (nextn_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
+        if not getattr(self, "dspark_only", False) and (nextn_layers := self.hparams.get("num_nextn_predict_layers")) is not None:
             self.gguf_writer.add_nextn_predict_layers(nextn_layers)
+
+
+class DeepseekV4DSparkModel(DeepseekV4Model):
+    model_arch = gguf.MODEL_ARCH.DFLASH_DRAFT
+    mtp_only = True
+    dspark_only = True
+    preserve_tensor_dimensions = True
+
+    _DSPARK_ROOT_MAP: dict[str, tuple[gguf.MODEL_TENSOR, str]] = {
+        "main_proj.weight": (gguf.MODEL_TENSOR.DFLASH_FC, ".weight"),
+        "main_norm.weight": (gguf.MODEL_TENSOR.DFLASH_HIDDEN_NORM, ".weight"),
+        "markov_head.markov_w1.weight": (gguf.MODEL_TENSOR.DFLASH_MARKOV_W1, ".weight"),
+        "markov_head.markov_w2.weight": (gguf.MODEL_TENSOR.DFLASH_MARKOV_W2, ".weight"),
+        "confidence_head.proj.weight": (gguf.MODEL_TENSOR.DFLASH_CONF_PROJ, ".weight"),
+        "confidence_head.proj.bias": (gguf.MODEL_TENSOR.DFLASH_CONF_PROJ, ".bias"),
+    }
+
+    _DSPARK_FIRST_STAGE_ROOTS = {
+        "main_proj.weight",
+        "main_proj.scale",
+        "main_norm.weight",
+    }
+    _DSPARK_FINAL_STAGE_ROOTS = {
+        "norm.weight",
+        "hc_head_fn",
+        "hc_head_base",
+        "hc_head_scale",
+        "markov_head.markov_w1.weight",
+        "markov_head.markov_w2.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
+    }
+
+    def __init__(self, *args, **kwargs):
+        if not hasattr(torch, "float8_e8m0fnu"):
+            raise RuntimeError(
+                "DeepSeek-V4 DSpark conversion requires PyTorch >= 2.7 "
+                "for MXFP4 E8M0 scale tensors"
+            )
+        super().__init__(*args, **kwargs)
+
+        self.block_count = self._dspark_stage_count()
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+        # DSpark's three predictor stages use ordinary sliding-window attention.
+        # They do not contain the target model's compressed-attention or hash-routing blocks.
+        self.hparams["compress_ratios"] = [0] * self.block_count
+        self.hparams["num_hash_layers"] = 0
+
+    def _dspark_target_layer_ids(self) -> list[int]:
+        target_layer_ids = self.hparams.get("dspark_target_layer_ids")
+        if not isinstance(target_layer_ids, list) or not target_layer_ids:
+            raise ValueError("DeepSeek-V4 DSpark conversion requires non-empty dspark_target_layer_ids metadata")
+        return [int(layer_id) for layer_id in target_layer_ids]
+
+    def _dspark_stage_count(self) -> int:
+        return len(self._dspark_target_layer_ids())
+
+    def _mtp_source_selection(self) -> tuple[set[str], list[str]]:
+        index_name = "model.safetensors.index.json" if self.is_safetensors else "pytorch_model.bin.index.json"
+        index_path = self.dir_model / index_name
+
+        if index_path.is_file():
+            with open(index_path, "r", encoding="utf-8") as f:
+                index: dict[str, Any] = json.load(f)
+            weight_map = index.get("weight_map")
+            if not isinstance(weight_map, dict):
+                raise ValueError(f"Can't load 'weight_map' from {index_name!r}")
+
+            selected = {name for name in weight_map if name.startswith("mtp.")}
+            parts = sorted({str(weight_map[name]) for name in selected})
+            missing_parts = [name for name in parts if not (self.dir_model / name).is_file()]
+            if missing_parts:
+                raise FileNotFoundError(
+                    "DeepSeek-V4 DSpark conversion requires missing index-derived shard(s): "
+                    + ", ".join(missing_parts)
+                )
+        else:
+            selected = set()
+            parts = []
+            for part_name in self.part_names:
+                if self.is_safetensors:
+                    from safetensors import safe_open
+                    with safe_open(self.dir_model / part_name, framework="pt", device="cpu") as model_part:
+                        part_selected = {name for name in model_part.keys() if name.startswith("mtp.")}
+                else:
+                    model_part = torch.load(
+                        str(self.dir_model / part_name),
+                        map_location="cpu",
+                        mmap=True,
+                        weights_only=True,
+                    )
+                    part_selected = {name for name in model_part if name.startswith("mtp.")}
+
+                if part_selected:
+                    selected.update(part_selected)
+                    parts.append(part_name)
+
+        if not selected:
+            raise ValueError("DeepSeek-V4 DSpark conversion found no mtp.* tensors in the model shards")
+
+        n_stage = self._dspark_stage_count()
+        final_stage = n_stage - 1
+        required_roots = {
+            "mtp.0.main_proj.weight",
+            "mtp.0.main_proj.scale",
+            "mtp.0.main_norm.weight",
+            f"mtp.{final_stage}.norm.weight",
+            f"mtp.{final_stage}.hc_head_fn",
+            f"mtp.{final_stage}.hc_head_base",
+            f"mtp.{final_stage}.hc_head_scale",
+            f"mtp.{final_stage}.markov_head.markov_w1.weight",
+            f"mtp.{final_stage}.markov_head.markov_w2.weight",
+            f"mtp.{final_stage}.confidence_head.proj.weight",
+        }
+        if missing_roots := required_roots - selected:
+            source = index_name if index_path.is_file() else "model shards"
+            raise ValueError(
+                f"DeepSeek-V4 DSpark conversion is missing root tensor(s) in {source}: {sorted(missing_roots)}"
+            )
+
+        stage_ids = {
+            int(match.group(1))
+            for name in selected
+            if (match := re.match(r"mtp\.(\d+)\.", name)) is not None
+        }
+        expected_stage_ids = set(range(n_stage))
+        if stage_ids != expected_stage_ids:
+            raise ValueError(
+                f"DeepSeek-V4 DSpark stages {sorted(stage_ids)} do not match target features "
+                f"{sorted(expected_stage_ids)}"
+            )
+
+        unpaired_scales = {
+            name
+            for name in selected
+            if name.endswith(".scale") and name.removesuffix(".scale") + ".weight" not in selected
+        }
+        if unpaired_scales:
+            raise ValueError(
+                "DeepSeek-V4 DSpark quantization scale(s) have no matching weight: "
+                f"{sorted(unpaired_scales)}"
+            )
+
+        self._mtp_expected_scales = {
+            self._map_mtp_source_name(name).removesuffix(".scale") + ".weight"
+            for name in selected if name.endswith(".scale")
+        }
+        return selected, parts
+
+    def _map_mtp_source_name(self, name: str) -> str:
+        match = re.match(r"mtp\.(\d+)\.(.+)$", name)
+        if match is None:
+            raise ValueError(f"Unexpected DeepSeek-V4 DSpark tensor {name!r}")
+
+        stage = int(match.group(1))
+        rest = match.group(2)
+        n_stage = self._dspark_stage_count()
+        if stage >= n_stage:
+            raise ValueError(f"Unexpected DeepSeek-V4 DSpark stage {stage}; expected 0..{n_stage - 1}")
+
+        if rest in self._DSPARK_FIRST_STAGE_ROOTS:
+            if stage != 0:
+                raise ValueError(f"DeepSeek-V4 DSpark root tensor {name!r} must be in stage 0")
+            return rest
+
+        if rest in self._DSPARK_FINAL_STAGE_ROOTS:
+            if stage != n_stage - 1:
+                raise ValueError(f"DeepSeek-V4 DSpark root tensor {name!r} must be in the final stage")
+            return rest
+
+        return f"layers.{stage}.{rest}"
+
+    def _map_dsv4_tensor_name(self, name: str, bid: int | None) -> tuple[gguf.MODEL_TENSOR, str]:
+        if name in self._DSPARK_ROOT_MAP:
+            return self._DSPARK_ROOT_MAP[name]
+        return super()._map_dsv4_tensor_name(name, bid)
+
+    def set_vocab(self):
+        if self.target_model_dir is None:
+            raise ValueError("DeepSeek-V4 DSpark conversion requires --target-model-dir with the target tokenizer")
+
+        target_hparams = Model.load_text_hparams(self.target_model_dir)
+        self._set_vocab_gpt2(
+            dir_model=self.target_model_dir,
+            vocab_size=target_hparams.get("vocab_size"),
+        )
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+
+        hparams = self.hparams
+        arch = self.gguf_writer.arch
+        target_layer_ids = self._dspark_target_layer_ids()
+        n_target_features = int(hparams["hidden_size"]) * len(target_layer_ids)
+
+        self.gguf_writer.add_causal_attention(False)
+        self.gguf_writer.add_uint32(f"{arch}.dflash.block_size", int(hparams["dspark_block_size"]))
+        self.gguf_writer.add_uint32(f"{arch}.dflash.mask_token_id", int(hparams["dspark_noise_token_id"]))
+        self.gguf_writer.add_array(f"{arch}.dflash.target_layer_ids", target_layer_ids)
+        self.gguf_writer.add_uint32(f"{arch}.dflash.n_target_features", n_target_features)
+
+        rope_scaling = hparams.get("rope_scaling")
+        if isinstance(rope_scaling, dict) and rope_scaling.get("type") == "yarn" and "mscale_all_dim" not in rope_scaling:
+            self.gguf_writer.add_rope_scaling_type(gguf.RopeScalingType.YARN)
+            if (factor := rope_scaling.get("factor")) is not None:
+                self.gguf_writer.add_rope_scaling_factor(factor)
+            if (orig_ctx_len := rope_scaling.get("original_max_position_embeddings")) is not None:
+                self.gguf_writer.add_rope_scaling_orig_ctx_len(orig_ctx_len)
+            if (beta_fast := rope_scaling.get("beta_fast")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_beta_fast(beta_fast)
+            if (beta_slow := rope_scaling.get("beta_slow")) is not None:
+                self.gguf_writer.add_rope_scaling_yarn_beta_slow(beta_slow)
+
+        logger.info(
+            "DeepSeek-V4 DSpark metadata: block_size=%s mask_token_id=%s target_layer_ids=%s n_target_features=%s",
+            hparams["dspark_block_size"],
+            hparams["dspark_noise_token_id"],
+            target_layer_ids,
+            n_target_features,
+        )
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        expert_weight = re.match(r"layers\.\d+\.ffn\.experts\.\d+\.w[123]\.weight$", name) is not None
+        quantized_without_scale = (
+            name.endswith(".weight")
+            and name not in self._mtp_expected_scales
+            and (
+                str(data_torch.dtype).startswith("torch.float8_")
+                or (expert_weight and data_torch.dtype == torch.int8)
+            )
+        )
+        if quantized_without_scale:
+            raise ValueError(f"DeepSeek-V4 DSpark quantized weight {name!r} has no matching scale tensor")
+
+        tensors = list(super().modify_tensors(data_torch, name, bid))
+
+        hidden_size = int(self.hparams["hidden_size"])
+        vocab_size = int(self.hparams["vocab_size"])
+        markov_rank = int(self.hparams["dspark_markov_rank"])
+        n_target_features = hidden_size * self._dspark_stage_count()
+        expected_shapes = {
+            f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_FC]}.weight": (hidden_size, n_target_features),
+            f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_HIDDEN_NORM]}.weight": (hidden_size,),
+            f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_MARKOV_W1]}.weight": (vocab_size, markov_rank),
+            f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_MARKOV_W2]}.weight": (vocab_size, markov_rank),
+            f"{gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.DFLASH_CONF_PROJ]}.weight": (1, hidden_size + markov_rank),
+        }
+        for tensor_name, tensor in tensors:
+            if (expected_shape := expected_shapes.get(tensor_name)) is not None and tuple(tensor.shape) != expected_shape:
+                raise ValueError(
+                    f"DeepSeek-V4 DSpark tensor {tensor_name!r} has shape {tuple(tensor.shape)}, "
+                    f"expected {expected_shape}"
+                )
+
+        return tensors
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        if self._mtp_scales:
+            raise ValueError(f"Unpaired DeepSeek-V4 DSpark quantization scales: {sorted(self._mtp_scales)}")
+        self.ftype = gguf.LlamaFileType.MOSTLY_MXFP4
+
 
 @Model.register("OpenPanguV2ForCausalLM")
 class OpenPanguV2Model(DeepseekV2Model):
@@ -6437,6 +6706,10 @@ def parse_args() -> argparse.Namespace:
         "--mtp", action="store_true",
         help="export a standalone DeepSeek-V4 MTP predictor companion",
     )
+    parser.add_argument(
+        "--dspark", action="store_true",
+        help="export the DeepSeek-V4 DSpark predictor as an ik-native dflash-draft GGUF",
+    )
 
     return parser.parse_args()
 
@@ -6510,7 +6783,14 @@ def main() -> None:
             logger.error(f"Model {model_architecture} is not supported")
             sys.exit(1)
 
-        if args.mtp:
+        if args.mtp and args.dspark:
+            raise ValueError("--mtp and --dspark are mutually exclusive")
+
+        if args.dspark:
+            if not issubclass(model_class, DeepseekV4Model):
+                raise ValueError(f"Architecture {model_architecture!r} does not support standalone DSpark export")
+            model_class = DeepseekV4DSparkModel
+        elif args.mtp:
             if not getattr(model_class, "supports_mtp_export", False):
                 raise ValueError(f"Architecture {model_architecture!r} does not support standalone MTP export")
             model_class.mtp_only = True

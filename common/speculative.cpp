@@ -30,6 +30,7 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NONE,
     COMMON_SPECULATIVE_TYPE_DRAFT,
     COMMON_SPECULATIVE_TYPE_DFLASH,
+    COMMON_SPECULATIVE_TYPE_DSPARK,
     COMMON_SPECULATIVE_TYPE_MTP,
     COMMON_SPECULATIVE_TYPE_EAGLE3,
     COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE,
@@ -44,6 +45,9 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"none",          COMMON_SPECULATIVE_TYPE_NONE},
     {"draft",         COMMON_SPECULATIVE_TYPE_DRAFT},
     {"dflash",        COMMON_SPECULATIVE_TYPE_DFLASH},
+    {"draft_dflash",  COMMON_SPECULATIVE_TYPE_DFLASH},
+    {"dspark",        COMMON_SPECULATIVE_TYPE_DSPARK},
+    {"draft_dspark",  COMMON_SPECULATIVE_TYPE_DSPARK},
     {"mtp",           COMMON_SPECULATIVE_TYPE_MTP},
     {"eagle3",        COMMON_SPECULATIVE_TYPE_EAGLE3},
     {"ngram_simple",  COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE},
@@ -83,6 +87,26 @@ struct common_speculative_config {
             const common_params_speculative & p = common_params_speculative{})
         : stage(s), type(s.type), params(p) {}
 };
+
+static int32_t common_speculative_effective_n_max(
+        common_speculative_type type,
+        const llama_model     * model_dft,
+        int32_t                 requested_n_max) {
+    requested_n_max = std::max<int32_t>(0, requested_n_max);
+    if (!common_speculative_type_is_dflash_family(type)) {
+        return requested_n_max;
+    }
+
+    if (model_dft == nullptr) {
+        return 0;
+    }
+
+    const int32_t block_size = llama_model_dflash_block_size(model_dft);
+    const int32_t n_max_cap = type == COMMON_SPECULATIVE_TYPE_DSPARK
+        ? block_size
+        : block_size - 1;
+    return std::min(requested_n_max, std::max<int32_t>(0, n_max_cap));
+}
 
 static bool common_speculative_are_compatible(
     const llama_model * model_tgt,
@@ -1105,7 +1129,9 @@ static common_params_speculative common_speculative_get_runtime_params(
     result.type = config.type;
     result.n_max = stage.has_n_max_override() ? stage.n_max : params.n_max;
     result.n_min = stage.has_n_min_override() ? stage.n_min : params.n_min;
-    result.p_min = stage.has_p_min_override() ? stage.p_min : params.p_min;
+    result.p_min = stage.has_p_min_override()
+        ? stage.p_min
+        : (config.type == COMMON_SPECULATIVE_TYPE_DSPARK ? 0.0f : params.p_min);
     result.mtp_heads = stage.has_mtp_heads_override() ? stage.mtp_heads : params.mtp_heads;
 
     if (config.type == COMMON_SPECULATIVE_TYPE_SUFFIX) {
@@ -1116,10 +1142,87 @@ static common_params_speculative common_speculative_get_runtime_params(
 
     result.n_max = std::max(result.n_max, 0);
     result.n_min = std::max(0, std::min(result.n_min, result.n_max));
+    result.n_max = common_speculative_effective_n_max(config.type, result.model_dft, result.n_max);
+    result.n_min = std::min(result.n_min, result.n_max);
     result.mtp_heads = std::max(result.mtp_heads, 0);
     result.stages.clear();
 
     return result;
+}
+
+int common_speculative_get_runtime_n_max(
+        const common_speculative        * spec,
+        const common_params_speculative & params) {
+    if (spec == nullptr) {
+        return params.get_max_stage_n_max();
+    }
+
+    const auto runtime_stages = params.get_resolved_stages();
+    const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
+    int32_t max_n_max = 0;
+
+    for (size_t i = 0; i < spec->configs.size(); ++i) {
+        const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
+        const auto impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
+        max_n_max = std::max(max_n_max, impl_params.n_max);
+    }
+
+    return max_n_max;
+}
+
+int common_speculative_get_runtime_n_min(
+        const common_speculative        * spec,
+        const common_params_speculative & params) {
+    if (spec == nullptr) {
+        return params.get_min_usable_stage_n_min();
+    }
+
+    const auto runtime_stages = params.get_resolved_stages();
+    const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
+    int32_t min_n_min = std::numeric_limits<int32_t>::max();
+
+    for (size_t i = 0; i < spec->configs.size(); ++i) {
+        const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
+        const auto impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
+        min_n_min = std::min(min_n_min, impl_params.n_min);
+    }
+
+    return min_n_min == std::numeric_limits<int32_t>::max() ? 0 : min_n_min;
+}
+
+static int32_t common_speculative_get_dflash_tuner_n_min(
+        const common_speculative        * spec,
+        const common_params_speculative & params) {
+    const auto runtime_stages = params.get_resolved_stages();
+    const bool use_runtime_stage_overrides = common_speculative_stage_chain_matches(runtime_stages, spec->configs);
+
+    for (size_t i = 0; i < spec->configs.size(); ++i) {
+        const auto & config = spec->configs[i];
+        if (!common_speculative_type_is_dflash_family(config.type)) {
+            continue;
+        }
+
+        const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : config.stage;
+        const int32_t requested_n_min = runtime_stage.has_n_min_override()
+            ? runtime_stage.n_min
+            : params.n_min;
+        int32_t requested_n_max = runtime_stage.has_n_max_override()
+            ? runtime_stage.n_max
+            : params.n_max;
+        if (!runtime_stage.has_n_max_override()) {
+            const int32_t configured_n_max = common_speculative_get_configured_n_max(spec);
+            if (configured_n_max > 0) {
+                requested_n_max = configured_n_max;
+            }
+        }
+        const int32_t effective_n_max = common_speculative_effective_n_max(
+            config.type,
+            config.params.model_dft,
+            requested_n_max);
+        return std::min(std::max<int32_t>(0, requested_n_min), effective_n_max);
+    }
+
+    return 0;
 }
 
 bool common_speculative_mtp_requires_fresh_warmup(const common_speculative * spec) {
@@ -1192,6 +1295,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NONE:          return "none";
         case COMMON_SPECULATIVE_TYPE_DRAFT:         return "draft";
         case COMMON_SPECULATIVE_TYPE_DFLASH:        return "dflash";
+        case COMMON_SPECULATIVE_TYPE_DSPARK:        return "draft-dspark";
         case COMMON_SPECULATIVE_TYPE_MTP:           return "mtp";
         case COMMON_SPECULATIVE_TYPE_EAGLE3:        return "eagle3";
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return "ngram_simple";
@@ -1270,12 +1374,12 @@ common_speculative * common_speculative_init(
     }
 
     const bool has_dflash_stage = std::any_of(stages.begin(), stages.end(), [](const common_speculative_stage_params & stage) {
-        return stage.type == COMMON_SPECULATIVE_TYPE_DFLASH;
+        return common_speculative_type_is_dflash_family(stage.type);
     });
 
     const bool needs_draft_ctx = std::any_of(stages.begin(), stages.end(), [&params](const common_speculative_stage_params & stage) {
         return stage.type == COMMON_SPECULATIVE_TYPE_DRAFT ||
-               stage.type == COMMON_SPECULATIVE_TYPE_DFLASH ||
+               common_speculative_type_is_dflash_family(stage.type) ||
                (stage.type == COMMON_SPECULATIVE_TYPE_MTP && params.model_dft != nullptr);
     });
 
@@ -1296,7 +1400,7 @@ common_speculative * common_speculative_init(
 
             int32_t max_cross_ctx = 0;
             for (const auto & stage : stages) {
-                if (stage.type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+                if (!common_speculative_type_is_dflash_family(stage.type)) {
                     continue;
                 }
 
@@ -1308,6 +1412,9 @@ common_speculative * common_speculative_init(
                 LOG_ERR("%s: invalid DFlash draft block size\n", __func__);
                 return nullptr;
             }
+
+            cparams_dft.n_batch = (uint32_t) block_size;
+            cparams_dft.n_ubatch = (uint32_t) block_size;
 
             const int64_t required_n_ctx = (int64_t) max_cross_ctx + (int64_t) block_size;
             if (required_n_ctx > std::numeric_limits<int32_t>::max()) {
@@ -1350,7 +1457,18 @@ common_speculative * common_speculative_init(
 
     const llama_model * target_model = llama_get_model(ctx_tgt);
     if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
-        const int ckpt_tokens = std::max(1, params.get_max_stage_n_max() + 1);
+        int32_t max_n_max = 0;
+        for (const auto & config : configs) {
+            int32_t requested_n_max = config.params.n_max;
+            if (params.autotune && common_speculative_type_is_dflash_family(config.type)) {
+                requested_n_max = std::max<int32_t>(1, requested_n_max);
+            }
+            max_n_max = std::max(max_n_max, common_speculative_effective_n_max(
+                config.type,
+                config.params.model_dft,
+                requested_n_max));
+        }
+        const int ckpt_tokens = std::max(1, max_n_max + 1);
         const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.spec_ckpt_mode, ckpt_tokens);
         if (actual_mode == LLAMA_SPEC_CKPT_NONE) {
             LOG_ERR("%s: failed to prepare speculative checkpoint mode '%s' during speculative init (max_tokens=%d)\n",
@@ -1383,14 +1501,16 @@ common_speculative * common_speculative_init(
                 ));
                 break;
             }
-            case COMMON_SPECULATIVE_TYPE_DFLASH: {
+            case COMMON_SPECULATIVE_TYPE_DFLASH:
+            case COMMON_SPECULATIVE_TYPE_DSPARK: {
                 auto state = std::make_unique<common_speculative_state_dflash>(
                     config.type,
                     ctx_tgt,
                     ctx_dft,
                     config.params.dflash_cross_ctx);
                 if (!state->ready) {
-                    LOG_ERR("%s: failed to initialize DFlash speculative state\n", __func__);
+                    LOG_ERR("%s: failed to initialize %s speculative state\n",
+                            __func__, common_speculative_type_to_str(config.type).c_str());
                     return nullptr;
                 }
                 impls.push_back(std::move(state));
@@ -1484,8 +1604,15 @@ common_speculative * common_speculative_init(
         auto actual_type = result->impls[0]->type;
         if (actual_type != COMMON_SPECULATIVE_TYPE_NONE &&
             actual_type != COMMON_SPECULATIVE_TYPE_EAGLE3) {
+            int32_t n_max_cap = -1;
+            if (common_speculative_type_is_dflash_family(actual_type)) {
+                n_max_cap = common_speculative_effective_n_max(
+                    actual_type,
+                    params.model_dft,
+                    std::numeric_limits<int32_t>::max());
+            }
             result->tuner = std::make_unique<spec_tuner>();
-            result->tuner->init(actual_type, result->configs[0].params, llama_get_model(ctx_tgt));
+            result->tuner->init(actual_type, result->configs[0].params, llama_get_model(ctx_tgt), n_max_cap);
             LOG_DBG("Autotune initialized for %s, tuning %zu parameters\n",
                     common_speculative_type_to_str(actual_type).c_str(),
                     result->tuner->coords.size());
@@ -1533,7 +1660,8 @@ llama_tokens common_speculative_draft(
 
     // apply autotune proposal if enabled
     if (spec->tuner && spec->tuner->enabled) {
-        spec->tuner->propose(params);
+        const int32_t dflash_n_min = common_speculative_get_dflash_tuner_n_min(spec, params);
+        spec->tuner->propose(params, dflash_n_min);
     }
 
     const auto runtime_stages = params.get_resolved_stages();
@@ -1545,16 +1673,17 @@ llama_tokens common_speculative_draft(
         auto & impl = spec->impls[i];
         const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
-        if (spec->tuner && spec->tuner->enabled && impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (spec->tuner && spec->tuner->enabled && common_speculative_type_is_dflash_family(impl->type)) {
             impl_params.n_max = params.n_max;
         }
         result.clear();
 
         if (spec->tuner && spec->tuner->has_dflash_target_only_arm() &&
-                impl->type == COMMON_SPECULATIVE_TYPE_DFLASH && impl_params.n_max == 0) {
+                common_speculative_type_is_dflash_family(impl->type) && impl_params.n_max == 0) {
             spec->curr_impl = impl.get();
             spec->last_step_target_only = true;
-            LOG_DBG("%s: selected DFlash target-only arm\n", __func__);
+            LOG_DBG("%s: selected %s target-only arm\n",
+                    __func__, common_speculative_type_to_str(impl->type).c_str());
             break;
         }
 
@@ -1645,6 +1774,16 @@ static bool common_speculative_has_type(const common_speculative * spec, common_
 
     return std::any_of(spec->configs.begin(), spec->configs.end(), [type](const common_speculative_config & config) {
         return config.type == type;
+    });
+}
+
+static bool common_speculative_has_dflash_family(const common_speculative * spec) {
+    if (spec == nullptr) {
+        return false;
+    }
+
+    return std::any_of(spec->configs.begin(), spec->configs.end(), [](const common_speculative_config & config) {
+        return common_speculative_type_is_dflash_family(config.type);
     });
 }
 
@@ -1786,7 +1925,7 @@ static bool common_speculative_collect_target_batch_features(
         const llama_batch & batch,
         common_speculative_feature_view & features) {
     features = {};
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (common_speculative_has_dflash_family(spec)) {
         return llama_spec_get_dflash_feature_view(ctx, batch, features);
     }
 
@@ -1808,7 +1947,7 @@ static bool common_speculative_collect_target_seq_batch_features(
         llama_seq_id seq_id,
         common_speculative_feature_view & features) {
     features = {};
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (common_speculative_has_dflash_family(spec)) {
         return llama_spec_get_dflash_feature_view_for_seq(ctx, batch, seq_id, features);
     }
 
@@ -1890,12 +2029,22 @@ int common_speculative_get_configured_n_max(const common_speculative * spec) {
     if (spec == nullptr || spec->tuner == nullptr || !spec->tuner->has_dflash_target_only_arm()) {
         return 0;
     }
-    return spec->tuner->configured_n_max;
+    int32_t configured_n_max = spec->tuner->configured_n_max;
+    for (const auto & config : spec->configs) {
+        if (common_speculative_type_is_dflash_family(config.type)) {
+            configured_n_max = common_speculative_effective_n_max(
+                config.type,
+                config.params.model_dft,
+                configured_n_max);
+            break;
+        }
+    }
+    return configured_n_max;
 }
 
 static bool common_speculative_has_target_features(const common_speculative * spec) {
     return common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP) ||
-        common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH);
+        common_speculative_has_dflash_family(spec);
 }
 
 bool common_speculative_load_draft_model(
@@ -1912,6 +2061,12 @@ bool common_speculative_load_draft_model(
     params_dft.cache_type_k     = params.cache_type_k.empty() ? params_base.cache_type_k : params.cache_type_k;
     params_dft.cache_type_v     = params.cache_type_v.empty() ? params_base.cache_type_v : params.cache_type_v;
 
+    if (params.n_threads > 0) {
+        params_dft.n_threads = params.n_threads;
+    }
+    if (params.n_threads_batch > 0) {
+        params_dft.n_threads_batch = params.n_threads_batch;
+    }
 
     if (!params.params.empty()) {
         auto [argc, argv] = parse_command_line("llama-server " + params.params);
@@ -1937,7 +2092,9 @@ bool common_speculative_load_draft_model(
     if (params_dft.n_ctx == 0) {
         params_dft.n_ctx = params.n_ctx;
     }
-    if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) && params_dft.n_gpu_layers < 0) {
+    const bool has_dflash_family = params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        params.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
+    if (has_dflash_family && params_dft.n_gpu_layers < 0) {
         params_dft.n_gpu_layers = params_base.n_gpu_layers;
     }
     params_dft.n_ctx = params_dft.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_dft.n_ctx;
@@ -2188,7 +2345,7 @@ bool common_speculative_copy_output_hidden_rows(
         const std::vector<int32_t> & output_indices,
         std::vector<float> & hidden_rows) {
     hidden_rows.clear();
-    if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_DFLASH)) {
+    if (common_speculative_has_dflash_family(spec)) {
         return llama_spec_copy_dflash_rows_from_output_indices(ctx, output_indices, hidden_rows);
     }
 
@@ -2272,7 +2429,16 @@ bool common_speculative_commit_accepted_hidden_rows(
         return false;
     }
 
-    return common_speculative_apply_hidden_rows(spec, seq_id, pos_base, commit_tokens, hidden_rows);
+    // pos_base names the position of ids.front(). Non-MTP rows instead begin with
+    // sampled_before, whose target decode position is one token earlier.
+    const llama_pos hidden_pos_base = spec_type_used == COMMON_SPECULATIVE_TYPE_MTP
+        ? pos_base
+        : pos_base - 1;
+    if (hidden_pos_base < 0) {
+        return false;
+    }
+
+    return common_speculative_apply_hidden_rows(spec, seq_id, hidden_pos_base, commit_tokens, hidden_rows);
 }
 
 bool common_speculative_commit_accepted_output(
@@ -2448,7 +2614,7 @@ bool common_speculative_checkpoint_restore(
                         ctx,
                         spec_type_used,
                         seq_id,
-                        ckpt.n_past,
+                        ckpt.n_past + 1,
                         sampled_before,
                         ids,
                         redecoded_indices)) {
@@ -2614,7 +2780,7 @@ static common_speculative_state_dflash * common_speculative_get_dflash_state(com
     }
 
     for (auto & impl : spec->impls) {
-        if (impl->type != COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (!common_speculative_type_is_dflash_family(impl->type)) {
             continue;
         }
 
@@ -2628,6 +2794,11 @@ static common_speculative_state_dflash * common_speculative_get_dflash_state(com
 
 static const common_speculative_state_dflash * common_speculative_get_dflash_state(const common_speculative * spec) {
     return common_speculative_get_dflash_state(const_cast<common_speculative *>(spec));
+}
+
+int32_t common_speculative_dflash_rewarm_tokens(const common_speculative * spec) {
+    const auto * state = common_speculative_get_dflash_state(spec);
+    return state != nullptr ? state->cross_ctx : 0;
 }
 
 static int32_t common_speculative_feature_width(const common_speculative * spec) {
@@ -2768,6 +2939,9 @@ bool common_speculative_trim_sequence(
         llama_seq_id seq_id,
         llama_pos pos_begin) {
     const bool target_trimmed = llama_kv_cache_seq_rm(ctx, seq_id, pos_begin, -1);
+    if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
+        dflash_trim_target_features(*dflash_state, pos_begin);
+    }
     if (auto * ctx_mtp = common_speculative_get_companion_ctx(spec); ctx_mtp != nullptr) {
         return target_trimmed && llama_kv_cache_seq_rm(ctx_mtp, seq_id, pos_begin, -1);
     }
@@ -3215,7 +3389,9 @@ common_speculative_round_result common_speculative_run_round(
     }
     const int configured_n_max = common_speculative_get_configured_n_max(spec);
     if (configured_n_max > 0) {
-        max_usable_draft = std::min(max_usable_draft, configured_n_max);
+        // DFlash autotuning includes a target-only arm that persists n_max=0 in
+        // params. Keep entering the tuner using its model-capped configured reach.
+        max_usable_draft = configured_n_max;
     }
     if (n_predict_budget >= 0) {
         max_usable_draft = std::min(max_usable_draft, n_predict_budget - 2);
@@ -3261,12 +3437,12 @@ common_speculative_round_result common_speculative_run_round(
         seq_id);
     auto & draft = draft_result.tokens;
 
-    const int min_usable_draft = params.get_min_usable_stage_n_min();
+    const int min_usable_draft = common_speculative_get_runtime_n_min(spec, params);
     if ((int) draft.size() < min_usable_draft || (draft.empty() && !draft_result.target_only)) {
         return result;
     }
 
-    if (common_speculative_needs_checkpoint(model)) {
+    if (!draft_result.target_only && common_speculative_needs_checkpoint(model)) {
         if (!common_speculative_before_draft(
                 spec,
                 model,

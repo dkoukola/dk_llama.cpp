@@ -74,7 +74,21 @@ static bool server_response_needs_chat_parse(oaicompat_type oaicompat) {
 
 static bool server_speculative_uses_target_features(const common_params_speculative & spec) {
     return spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH);
+           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
+}
+
+static bool server_speculative_needs_target_feature_state(
+        const common_speculative        * spec,
+        const common_params_speculative & params) {
+    if (params.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP)) {
+        return true;
+    }
+
+    const bool has_dflash = params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+        params.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
+    return has_dflash && (common_speculative_get_runtime_n_max(spec, params) > 0 ||
+                          common_speculative_get_configured_n_max(spec) > 0);
 }
 
 static bool server_speculative_requires_single_slot(const common_params_speculative & spec) {
@@ -589,7 +603,7 @@ int server_slot::get_n_draft_max() const {
     }
 
     // determine the max draft that fits the current slot state
-    int n_draft_max = params.speculative.get_max_stage_n_max();
+    int n_draft_max = common_speculative_get_runtime_n_max(spec, params.speculative);
     const int configured_dflash_n_max = common_speculative_get_configured_n_max(spec);
     if (configured_dflash_n_max > 0) {
         n_draft_max = configured_dflash_n_max;
@@ -605,7 +619,7 @@ int server_slot::get_n_draft_max() const {
 
     SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
-    const int min_usable_draft = params.speculative.get_min_usable_stage_n_min();
+    const int min_usable_draft = common_speculative_get_runtime_n_min(spec, params.speculative);
     if (n_draft_max < min_usable_draft) {
         SLT_DBG(*this, "the max possible draft is too small: %d < %d - skipping speculative decoding\n", n_draft_max, min_usable_draft);
         n_draft_max = 0;
@@ -1168,7 +1182,11 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
                     stage.n_min = -1;
                 }
                 if (has_flat_p_min) {
-                    stage.p_min = -1.0f;
+                    // Preserve an explicit request threshold for DSpark, whose
+                    // type-specific default is zero rather than the generic p_min.
+                    stage.p_min = stage.type == COMMON_SPECULATIVE_TYPE_DSPARK
+                        ? slot.params.speculative.p_min
+                        : -1.0f;
                 }
             }
         }
@@ -1198,6 +1216,10 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
                 }
                 if (stage_override.has_p_min_override()) {
                     slot.params.speculative.stages[i].p_min = stage_override.p_min;
+                } else if (has_flat_p_min && stage_override.type == COMMON_SPECULATIVE_TYPE_DSPARK) {
+                    // DSpark does not inherit the generic p_min because its default is
+                    // zero. Materialize an explicit flat request threshold on the stage.
+                    slot.params.speculative.stages[i].p_min = slot.params.speculative.p_min;
                 }
                 if (stage_override.has_mtp_heads_override()) {
                     slot.params.speculative.stages[i].mtp_heads = stage_override.mtp_heads;
@@ -1212,12 +1234,16 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
         slot.params.speculative.n_min = std::max(slot.params.speculative.n_min, 0);
         slot.params.speculative.n_max = std::max(slot.params.speculative.n_max, 0);
 
+        const int32_t request_n_max = common_speculative_get_runtime_n_max(slot.spec, slot.params.speculative);
+        const int32_t startup_n_max = std::max(
+            common_speculative_get_runtime_n_max(slot.spec, params_base.speculative),
+            common_speculative_get_configured_n_max(slot.spec));
         if (slot.can_speculate() &&
-            llama_model_has_recurrent(model) &&
-            slot.params.speculative.get_max_stage_n_max() > params_base.speculative.get_max_stage_n_max()) {
+            common_speculative_needs_checkpoint(model) &&
+            request_n_max > startup_n_max) {
             send_error(task,
-                "Error: speculative n_max=" + std::to_string(slot.params.speculative.get_max_stage_n_max()) +
-                " exceeds the recurrent speculative startup limit of " + std::to_string(params_base.speculative.get_max_stage_n_max()) +
+                "Error: speculative n_max=" + std::to_string(request_n_max) +
+                " exceeds the checkpointed speculative startup limit of " + std::to_string(startup_n_max) +
                 "; restart the server with a higher n_max inside the configured --spec-type stages to reserve checkpoint capacity",
                     ERROR_TYPE_INVALID_REQUEST);
             return false;
@@ -1231,7 +1257,10 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
             throw std::runtime_error("Error: MTP speculative stage requested, but the server was not started with MTP support");
         }
 
-        if (slot.params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) && !params_base.speculative.has_dft()) {
+        if ((slot.params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) ||
+             slot.params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
+             slot.params.speculative.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK)) &&
+            !params_base.speculative.has_dft()) {
             throw std::runtime_error("Error: draft speculative stage requested, but no draft model is loaded");
         }
 
@@ -3539,7 +3568,9 @@ void server_context::add_sampled_tokens() {
             common_batch_add(batch, slot.sampled, slot.cache_tokens.pos_next(), { slot.id }, true);
             slot.cache_tokens.push_back(slot.sampled);
 
-            const int min_usable_draft = slot.params.speculative.get_min_usable_stage_n_min();
+            const int min_usable_draft = common_speculative_get_runtime_n_min(
+                slot.spec,
+                slot.params.speculative);
             if (!slot.spec_target_only && min_usable_draft > (int)draft.size()) {
                 SLT_DBG(slot, "ignoring small draft: %d < %d\n", (int)draft.size(), min_usable_draft);
                 // fallback to normal decoding
@@ -3632,7 +3663,21 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 slot.server_cached_prompt.checkpoints.rbegin(),
                 slot.server_cached_prompt.checkpoints.rend(),
                 [&](const auto & cur) {
-                    return cur.pos_max < (is_dsv4 ? pos_next : pos_min_thold);
+                    if (cur.pos_max >= (is_dsv4 ? pos_next : pos_min_thold)) {
+                        return false;
+                    }
+                    if (!is_dsv4) {
+                        return true;
+                    }
+
+                    const size_t candidate_n_past = slot.cache_tokens.size_up_to_pos(cur.pos_max + 1);
+                    const common_prefix mapped_prefix = slot.cache_tokens.get_common_prefix_first_n(
+                        ctx,
+                        slot.prompt_tokens,
+                        candidate_n_past,
+                        false);
+                    return mapped_prefix.first == candidate_n_past &&
+                        mapped_prefix.second <= (size_t) slot.n_past_prompt;
                 }
             );
 
@@ -3655,21 +3700,37 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 if (!do_reset) {
                     if (is_dsv4) {
                         pos_next = std::min(pos_next, it->pos_max + 1);
+                        slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
+                        const common_prefix mapped_prefix = slot.cache_tokens.get_common_prefix_first_n(
+                            ctx,
+                            slot.prompt_tokens,
+                            (size_t) slot.n_past,
+                            false);
+                        if (mapped_prefix.first != (size_t) slot.n_past ||
+                                mapped_prefix.second > (size_t) slot.n_past_prompt) {
+                            SLT_ERR(slot, "%s", "DSV4 checkpoint no longer maps to a common current-prompt boundary\n");
+                            do_reset = true;
+                        } else {
+                            slot.n_past_prompt = (int32_t) mapped_prefix.second;
+                            slot.n_past_offset = slot.n_past_prompt - slot.n_past;
+                        }
                     } else {
                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                        slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
                     }
-                    slot.n_past = slot.cache_tokens.size_up_to_pos(pos_next);
 
-                    {
+                    if (!is_dsv4) {
                         const llama_pos pos_next_prompt = std::min(
                             slot.prompt_tokens.pos_next(slot.n_past_prompt),
                             it->pos_max_prompt + 1);
                         slot.n_past_prompt = slot.prompt_tokens.size_up_to_pos(pos_next_prompt);
                     }
 
-                    slot.checkpoint_pos = it->pos_max;
+                    if (!do_reset) {
+                        slot.checkpoint_pos = it->pos_max;
 
-                    SLT_WRN(slot, "restored context checkpoint took  %.2f ms (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, it->pos_min, it->pos_max, it->n_tokens, slot.n_past, (float)checkpoint_size / 1024 / 1024);
+                        SLT_WRN(slot, "restored context checkpoint took  %.2f ms (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", (ggml_time_us() - t_start) / 1000.0, it->pos_min, it->pos_max, it->n_tokens, slot.n_past, (float)checkpoint_size / 1024 / 1024);
+                    }
                 }
             }
 
@@ -3682,8 +3743,10 @@ void server_context::apply_checkpoint(server_slot & slot) {
                 }
                 slot.n_past = 0;
                 slot.n_past_prompt = 0;
+                slot.n_past_offset = 0;
                 slot.n_past_se = 0;
                 slot.ga_i = 0;
+                slot.checkpoint_pos = -1;
                 slot.cache_tokens.keep_first(0);
                 pos_next = 0;
                 common_sampler_reset(slot.ctx_sampling);
@@ -3957,6 +4020,32 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                                 slot.n_past_offset = 0;
                             }
 
+                            const int32_t dflash_rewarm = server_speculative_needs_target_feature_state(
+                                slot.spec,
+                                slot.params.speculative)
+                                    ? common_speculative_dflash_rewarm_tokens(slot.spec)
+                                    : 0;
+                            if (slot.n_past > 0 && dflash_rewarm > 0) {
+                                // Prompt-cache state does not include DFlash's captured target
+                                // feature window. Select a common text boundary that leaves at
+                                // least cross_ctx new-prompt rows to re-evaluate; checkpoint policy
+                                // may move the boundary earlier still.
+                                const int32_t old_n_past_prompt = slot.n_past_prompt;
+                                const size_t prompt_keep_cap = (size_t) std::max(0, slot.n_past_prompt - dflash_rewarm);
+                                const common_prefix rewarm_prefix = prompt_tokens.get_common_prefix_first_n(
+                                    ctx,
+                                    slot.cache_tokens,
+                                    prompt_keep_cap,
+                                    false);
+                                slot.n_past_prompt = (int32_t) rewarm_prefix.first;
+                                slot.n_past = (int32_t) rewarm_prefix.second;
+                                slot.n_past_offset = slot.n_past_prompt - slot.n_past;
+                                prefix.first = rewarm_prefix.second;
+                                prefix.second = rewarm_prefix.first;
+                                LLAMA_LOG_INFO("%s: reprocessing %d cached prompt tokens to rebuild DFlash target features\n",
+                                        __func__, old_n_past_prompt - slot.n_past_prompt);
+                            }
+
                             if ((slot.n_past + size_threshold < slot.cache_tokens.size()))
                             {
                                 int32_t back = 4;
@@ -4054,7 +4143,9 @@ void server_context::batch_pending_prompt(const int32_t n_ubatch, const int32_t 
                     llama_pos p1 = slot.cache_tokens.pos_next() + slot.n_past_prompt - slot.n_past; // add offset to prompt
                     server_mtp_warmup mtp_media_warmup {
                         ctx,
-                        slot.uses_mtp() && slot.spec ? &slot : nullptr,
+                        slot.uses_mtp() && slot.spec && server_speculative_needs_target_feature_state(
+                            slot.spec,
+                            slot.params.speculative) ? &slot : nullptr,
                     };
                     mtmd_helper_eval_batch_callback mtp_media_callback =
                         mtp_media_warmup.slot ? server_mtp_media_warmup_callback : nullptr;
@@ -4512,7 +4603,11 @@ inline void rewind_context(server_slot& slot, int32_t ban_pos) {
     slot.n_past = slot.cache_tokens.n_tokens();
 
     // Remove from KV cache
-    llama_kv_cache_seq_rm(slot.ctx, slot.id, slot.cache_tokens.pos_next(slot.n_past), -1);
+    common_speculative_trim_sequence(
+        slot.spec,
+        slot.ctx,
+        slot.id,
+        slot.cache_tokens.pos_next(slot.n_past));
 
     // Truncate buffer
     slot.token_buffer.resize(n_keep_buffer);
@@ -4671,7 +4766,9 @@ void server_context::process_batch_tokens(int32_t & n_batch) {
 
     if (server_speculative_uses_target_features(params_base.speculative)) {
         for (auto & slot : slots) {
-            if (!slot.spec || !server_speculative_uses_target_features(slot.params.speculative)) {
+            if (!slot.spec || !server_speculative_needs_target_feature_state(
+                    slot.spec,
+                    slot.params.speculative)) {
                 continue;
             }
 
@@ -4927,6 +5024,9 @@ void server_context::update_slots() {
 
         for (auto & slot : slots) {
             if (slot.state != SLOT_STATE_PROCESSING || slot.i_batch_dft.empty()) {
+                continue;
+            }
+            if (slot.spec_target_only) {
                 continue;
             }
             const int32_t n_pre_spec_tokens = slot.cache_tokens.n_tokens() - (int32_t) (slot.drafted.size() + 1);
