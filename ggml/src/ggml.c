@@ -5055,7 +5055,7 @@ void ggml_numa_tensor_resync(struct ggml_tensor * tensor) {
     }
 }
 
-// NUMA mirror (KV cache): after a cpy/dup has written node 0's copy of a mirrored KV tensor view,
+// NUMA mirror (KV cache): after a cpy/dup/set_rows has written node 0's copy of a mirrored KV tensor view,
 // replicate the freshly written rows to every other node's copy, so each node's attention reads
 // valid node-local K/V. No-op for any tensor that isn't a mirrored KV destination.
 static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * params, struct ggml_tensor * dst) {
@@ -5073,15 +5073,48 @@ static void ggml_numa_replicate_kv_write(const struct ggml_compute_params * para
     if (nodes < 2) {
         return;
     }
-    // make sure node 0's copy is fully written before we read it to replicate
-    ggml_barrier(params->shared);
-
     const int     ith   = params->ith;
     const int     nth   = params->nth;
     const size_t  run   = ggml_row_size(dst->type, dst->ne[0]); // contiguous bytes per dim-0 row
+    const char *  base0 = (const char *) m->data[0]; // node 0 aliases the root tensor's data
+
+    // SET_ROWS returns a view of the entire destination, but only the indexed rows have changed.
+    // Replicate the same source-row partition each thread just wrote, avoiding both a full-cache
+    // copy and an extra barrier. Like SET_ROWS itself, destination indices must not race.
+    if (dst->op == GGML_OP_SET_ROWS) {
+        const struct ggml_tensor * rows = dst->src[0];
+        const struct ggml_tensor * idxs = dst->src[1];
+        const int64_t dr  = (rows->ne[1] + nth - 1)/nth;
+        const int64_t ir0 = dr*ith;
+        const int64_t ir1 = MIN(ir0 + dr, rows->ne[1]);
+
+        GGML_ASSERT(idxs->type == GGML_TYPE_I32 || idxs->type == GGML_TYPE_I64);
+        for (int64_t i3 = 0; i3 < rows->ne[3]; ++i3) {
+            for (int64_t i2 = 0; i2 < rows->ne[2]; ++i2) {
+                for (int64_t i = ir0; i < ir1; ++i) {
+                    const int64_t i12 = i3 % idxs->ne[2];
+                    const int64_t i11 = i2 % idxs->ne[1];
+                    const char * idx = (const char *) idxs->data +
+                            i*idxs->nb[0] + i11*idxs->nb[1] + i12*idxs->nb[2];
+                    const int64_t i1 = idxs->type == GGML_TYPE_I32 ? *(const int32_t *) idx : *(const int64_t *) idx;
+                    GGML_ASSERT(i1 >= 0 && i1 < dst->ne[1]);
+                    char * row0 = (char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
+                    const size_t off = (size_t) (row0 - base0);
+                    for (int n = 1; n < nodes; ++n) {
+                        memcpy((char *) m->data[n] + off, row0, run);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // DUP's write partition may differ from the replication partition, so make sure node 0's
+    // copy is fully written before we read it here.
+    ggml_barrier(params->shared);
+
     const int64_t n1    = dst->ne[1], n2 = dst->ne[2], n3 = dst->ne[3];
     const int64_t nrows = n1*n2*n3;
-    const char *  base0 = (const char *) m->data[0]; // node 0 aliases the root tensor's data
     for (int64_t r = ith; r < nrows; r += nth) {
         const int64_t i1 = r % n1;
         const int64_t i2 = (r / n1) % n2;
@@ -18607,7 +18640,7 @@ static void ggml_compute_forward_mul_mat_id(
                 acc += chunks_per_expert;
             }
 
-            const char * src0_cur = (const char *) src0->data + cur_a*nb02;
+            const char * src0_cur = src0_data + cur_a*nb02;
 
             if (!iqk_mul_mat_moe(ne01, matrix_row_counts[cur_a], ne00, ne11,
                         src0->type, src0_cur, nb01,
@@ -18953,16 +18986,16 @@ static void ggml_compute_forward_mul_mat_id_up_gate(
 
         const char *src0_1_cur, *src0_2_cur, *up_b_cur = NULL, *gate_b_cur = NULL;
         if (src0_2) {
-            src0_1_cur = (const char *) src0_1->data + cur_a*nb02;
-            src0_2_cur = (const char *) src0_2->data + cur_a*nb02;
-            up_b_cur   = up_b   ? (const char *)up_b->data + cur_a*nb41 : NULL;
-            gate_b_cur = gate_b ? (const char *)gate_b->data + cur_a*nb51 : NULL;
+            src0_1_cur = src0_1_data + cur_a*nb02;
+            src0_2_cur = src0_2_data + cur_a*nb02;
+            up_b_cur   = up_b   ? up_b_data   + cur_a*nb41 : NULL;
+            gate_b_cur = gate_b ? gate_b_data + cur_a*nb51 : NULL;
         } else {
-            src0_2_cur = (const char *) src0_1->data + cur_a*nb02;
+            src0_2_cur = src0_1_data + cur_a*nb02;
             src0_1_cur = src0_2_cur + nb02/2;
             if (up_b) {
                 GGML_ASSERT(!gate_b);
-                gate_b_cur = (const char *)up_b->data + cur_a*nb41;
+                gate_b_cur = up_b_data + cur_a*nb41;
                 up_b_cur   = gate_b_cur + nb41/2;
             }
         }
@@ -20527,6 +20560,9 @@ static void ggml_compute_forward_set_rows(
                 GGML_ABORT("src0->type = %d (%s) not supported", src0->type, ggml_type_name(src0->type));
             }
     }
+
+    // NUMA mirror: SET_ROWS can scatter new keys into a mirrored KV-cache tensor.
+    ggml_numa_replicate_kv_write(params, dst);
 }
 
 // ggml_compute_forward_diag
@@ -24646,11 +24682,12 @@ static void ggml_compute_forward_hc_post_f32(
         const float * post_r = (const float *)((const char *)post->data);
         const float * comb_r = (const float *)((const char *)comb->data);
 
-        int nchunk = (ne0 + nth - 1)/nth;
+        const int chunk_size = 64;
+        const int nchunk = (ne0 + chunk_size - 1)/chunk_size;
 
         for (int ic = ith; ic < nchunk; ic += nth) {
-            int first = 64*ic;
-            for (int i0 = first; i0 < first + 64 && i0 < ne0; ++i0) {
+            const int first = chunk_size*ic;
+            for (int i0 = first; i0 < first + chunk_size && i0 < ne0; ++i0) {
                 for (int j = 0; j < S; ++j) {
                     const float * res_r  = (const float *)((const char *)res->data + j*res->nb[1]);
                     r[j] = res_r[i0];
