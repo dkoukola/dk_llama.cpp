@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 //#include <thread>
 
 #ifdef __ARM_NEON
@@ -440,14 +441,32 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
     GGML_ASSERT(src0->ne[3] == src1->ne[3]);
     GGML_ASSERT(src0->ne[3] == 1);
     GGML_ASSERT(src1->ne[0] == 1);
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT( dst->nb[0] == sizeof(float));
+    GGML_ASSERT(nth > 0);
+    GGML_ASSERT(ith >= 0 && ith < nth);
 
-    int nrows = dst->ne[1];
-    int npt   = (nrows + nth - 1)/nth;
-    int first = ith*npt;
-    int last  = std::min(nrows, first + npt);
+    int     ne01 = src0->ne[1];
+    int64_t ne00 = src0->ne[0];
+    if (ne00 == 0 || dst->ne[1] == 0) return;
+    GGML_ASSERT(dst->ne[1] <= std::numeric_limits<int64_t>::max()/ne00);
+    int64_t nwork = dst->ne[1]*ne00;
+    int64_t npt   = (nwork - 1)/nth + 1;
+    if (ith > (nwork - 1)/npt) return;
+    int64_t first = (int64_t) ith*npt;
+    int64_t last  = first + std::min(npt, nwork - first);
 
-    int ne01 = src0->ne[1];
-    int ne00 = src0->ne[0];
+    if (ne01 == 0) {
+        for (int64_t i = first; i < last; ) {
+            int64_t ir = i/ne00;
+            int64_t k0 = i - ir*ne00;
+            int64_t k1 = std::min(ne00, k0 + last - i);
+            auto y = (float *)((char *)dst->data + ir*dst->nb[1]);
+            std::fill(y + k0, y + k1, 0.0f);
+            i += k1 - k0;
+        }
+        return;
+    }
 
     auto src2 = dst->src[2];
     auto src3 = dst->src[3];
@@ -455,10 +474,15 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
         GGML_ASSERT(src2->type == GGML_TYPE_F32);
         GGML_ASSERT(src3->type == GGML_TYPE_I32);
         GGML_ASSERT(src3->ne[0] == src0->ne[1]);
+        GGML_ASSERT(src2->nb[0] == sizeof(float));
+        GGML_ASSERT(src3->nb[0] == sizeof(int32_t));
 
         auto cids = (const char *)src3->data;
         auto scales = (const float *)src2->data;
-        for (int ir = first; ir < last; ++ir) {
+        for (int64_t i = first; i < last; ) {
+            int64_t ir = i/ne00;
+            int64_t k0 = i - ir*ne00;
+            int64_t k1 = std::min(ne00, k0 + last - i);
             auto c0 = (const char *)src0->data + ir*src0->nb[2];
             auto c1 = (const char *)src1->data + ir*src1->nb[2];
             auto cy = (      char *)dst->data + ir* dst->nb[1];
@@ -467,36 +491,41 @@ void iqk_mul_multi_add(struct ggml_tensor * dst, int ith, int nth) {
             auto x1 = (const float *)c1;
             auto ids = (const int *)(cids + ir*src3->nb[1]);
             float s = scales[ids[0]] * x1[0];
-            for (int k = 0; k < ne00; ++k) y[k] = x0[k] * s;
+            for (int64_t k = k0; k < k1; ++k) y[k] = x0[k] * s;
             for (int j = 1; j < ne01; ++j) {
                 c0 += src0->nb[1];
                 c1 += src1->nb[1];
                 x0 = (const float *)c0;
                 x1 = (const float *)c1;
                 s  = x1[0] * scales[ids[j]];
-                for (int k = 0; k < ne00; ++k) y[k] += x0[k] * s;
+                for (int64_t k = k0; k < k1; ++k) y[k] += x0[k] * s;
             }
+            i += k1 - k0;
         }
 
         return;
 
     }
 
-    for (int ir = first; ir < last; ++ir) {
+    for (int64_t i = first; i < last; ) {
+        int64_t ir = i/ne00;
+        int64_t k0 = i - ir*ne00;
+        int64_t k1 = std::min(ne00, k0 + last - i);
         auto c0 = (const char *)src0->data + ir*src0->nb[2];
         auto c1 = (const char *)src1->data + ir*src1->nb[2];
         auto cy = (      char *)dst->data + ir* dst->nb[1];
         auto  y = (     float *)cy;
         auto x0 = (const float *)c0;
         auto x1 = (const float *)c1;
-        for (int k = 0; k < ne00; ++k) y[k] = x0[k] * x1[0];
+        for (int64_t k = k0; k < k1; ++k) y[k] = x0[k] * x1[0];
         for (int j = 1; j < ne01; ++j) {
             c0 += src0->nb[1];
             c1 += src1->nb[1];
             x0 = (const float *)c0;
             x1 = (const float *)c1;
-            for (int k = 0; k < ne00; ++k) y[k] += x0[k] * x1[0];
+            for (int64_t k = k0; k < k1; ++k) y[k] += x0[k] * x1[0];
         }
+        i += k1 - k0;
     }
 }
 

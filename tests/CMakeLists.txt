@@ -202,6 +202,9 @@ llama_build_and_test(
 )
 llama_build_and_test(test-regex-partial.cpp)
 
+llama_build_and_test(test-iqk-mul-multi-add.cpp)
+target_include_directories(test-iqk-mul-multi-add PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+
 # llama_target_and_test(test-opt.cpp) # SLOW
 
 llama_target_and_test(test-model-load-cancel.cpp  LABEL "model")

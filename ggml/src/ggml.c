@@ -24642,40 +24642,7 @@ static void ggml_compute_forward_hc_post_f32(
 
     float r[8];
 
-    int T = x->ne[1];
-    //const int i0_chunk = 64;
-    //if (T < nth && ne0 > i0_chunk && ne0 % i0_chunk == 0) {
-    //    int ne0_64 = ne0/i0_chunk;
-    //    int nchunk = T*ne0_64;
-    //    int npt = (nchunk + nth - 1)/nth;
-    //    int first = ith * npt;
-    //    int last  = MIN(first + npt, nchunk);
-
-    //    for (int ic = first; ic < last; ++ic) {
-    //        int t = ic / ne0_64;
-    //        int i0_first = ic - t * ne0_64;
-
-    //        const float * x_r    = (const float *)((const char *)x->data + t*x->nb[1]) + i0_first;
-    //        const float * post_r = (const float *)((const char *)post->data + t*post->nb[1]);
-    //        const float * comb_r = (const float *)((const char *)comb->data + t*comb->nb[2]);
-
-    //        for (int i0 = 0; i0 < i0_chunk; ++i0) {
-    //            for (int j = 0; j < S; ++j) {
-    //                const float * res_r  = (const float *)((const char *)res->data + t*res->nb[2] + j*res->nb[1]);
-    //                r[j] = res_r[i0_first + i0];
-    //            }
-    //            for (int i = 0; i < S; ++i) {
-    //                float sum = x_r[i0] * post_r[i];
-    //                for (int j = 0; j < S; ++j) {
-    //                    sum += comb_r[j*S + i] * r[j];
-    //                }
-    //                float * dst_r = (float *)((char *)dst->data + t*dst->nb[2] + i*dst->nb[1]) + i0_first;
-    //                dst_r[i0] = sum;
-    //            }
-    //        }
-    //    }
-    //    return;
-    //}
+    const int64_t T = x->ne[1];
 
     if (T == 1) {
         const float * x_r    = (const float *)((const char *)x->data);
@@ -24705,11 +24672,42 @@ static void ggml_compute_forward_hc_post_f32(
         return;
     }
 
-    int64_t npt = (T + nth - 1)/nth;
+    const int chunk_size = 64;
+    // Small batches need hidden-dimension chunks to keep the worker team busy.
+    if (T < nth && ne0 > chunk_size) {
+        const int64_t chunks_per_token = (ne0 - 1)/chunk_size + 1;
+        const int64_t nchunk = T*chunks_per_token;
 
-    // one token is S*S floats (16 at S=4): parallelize over tokens only
-    const int t0 = ith * npt;
-    const int t1 = MIN(t0 + npt, T);
+        for (int64_t ic = ith; ic < nchunk; ic += nth) {
+            const int64_t t = ic/chunks_per_token;
+            const int first = chunk_size*(ic % chunks_per_token);
+            const int last = MIN(first + chunk_size, ne0);
+
+            const float * x_r    = (const float *)((const char *)x->data + t*x->nb[1]);
+            const float * post_r = (const float *)((const char *)post->data + t*post->nb[1]);
+            const float * comb_r = (const float *)((const char *)comb->data + t*comb->nb[2]);
+
+            for (int i0 = first; i0 < last; ++i0) {
+                for (int j = 0; j < S; ++j) {
+                    const float * res_r  = (const float *)((const char *)res->data + t*res->nb[2] + j*res->nb[1]);
+                    r[j] = res_r[i0];
+                }
+                for (int i = 0; i < S; ++i) {
+                    float sum = x_r[i0] * post_r[i];
+                    for (int j = 0; j < S; ++j) {
+                        sum += comb_r[j*S + i] * r[j];
+                    }
+                    float * dst_r = (float *)((char *)dst->data + t*dst->nb[2] + i*dst->nb[1]);
+                    dst_r[i0] = sum;
+                }
+            }
+        }
+        return;
+    }
+
+    const int64_t npt = (T + nth - 1)/nth;
+    const int64_t t0 = ith*npt;
+    const int64_t t1 = MIN(t0 + npt, T);
 
     for (int64_t t = t0; t < t1; ++t) {
         const float * x_r    = (const float *)((const char *)x->data + t*x->nb[1]);
@@ -24724,7 +24722,6 @@ static void ggml_compute_forward_hc_post_f32(
             for (int i = 0; i < S; ++i) {
                 float sum = x_r[i0] * post_r[i];
                 for (int j = 0; j < S; ++j) {
-                    //sum += comb_r[i*S + j] * r[j];
                     sum += comb_r[j*S + i] * r[j];
                 }
                 float * dst_r = (float *)((char *)dst->data + t*dst->nb[2] + i*dst->nb[1]);
