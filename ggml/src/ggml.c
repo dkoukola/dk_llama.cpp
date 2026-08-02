@@ -17740,6 +17740,29 @@ static void ggml_compute_forward_fused_norm(
 
 // ggml_compute_forward_group_rms_norm
 
+enum {
+    GGML_RMS_NORM_PARALLEL_MIN_ELEMS = 8192,
+    GGML_RMS_NORM_PARALLEL_CHUNK_ELEMS = 256,
+};
+
+static size_t ggml_rms_norm_parallel_n_chunks(int64_t ne0) {
+    GGML_ASSERT(ne0 > 0);
+    GGML_ASSERT(ne0 >= GGML_RMS_NORM_PARALLEL_MIN_ELEMS);
+    GGML_ASSERT((uint64_t) ne0 <= (uint64_t) SIZE_MAX);
+
+    const size_t ne0_size = (size_t) ne0;
+    const size_t chunk_elems = GGML_RMS_NORM_PARALLEL_CHUNK_ELEMS;
+
+    return ne0_size / chunk_elems + (ne0_size % chunk_elems != 0);
+}
+
+static size_t ggml_rms_norm_parallel_work_size(int64_t ne0) {
+    const size_t n_chunks = ggml_rms_norm_parallel_n_chunks(ne0);
+    GGML_ASSERT(n_chunks <= SIZE_MAX / CACHE_LINE_SIZE);
+
+    return n_chunks * CACHE_LINE_SIZE;
+}
+
 static void ggml_compute_forward_rms_norm_f32(
         const struct ggml_compute_params * params,
         struct ggml_tensor * dst) {
@@ -17759,6 +17782,54 @@ static void ggml_compute_forward_rms_norm_f32(
     memcpy(&eps, dst->op_params, sizeof(float));
 
     GGML_ASSERT(eps > 0.0f);
+
+    if (dst->op == GGML_OP_RMS_NORM &&
+        ggml_nrows(src0) == 1 &&
+        ne00 >= GGML_RMS_NORM_PARALLEL_MIN_ELEMS &&
+        nth > 1) {
+        const size_t n_chunks = ggml_rms_norm_parallel_n_chunks(ne00);
+        const size_t ne00_size = (size_t) ne00;
+        const size_t chunk_elems = GGML_RMS_NORM_PARALLEL_CHUNK_ELEMS;
+        const size_t work_size = ggml_rms_norm_parallel_work_size(ne00);
+        GGML_ASSERT(ne00_size <= SIZE_MAX / sizeof(float));
+        GGML_ASSERT(params->wdata != NULL);
+        GGML_ASSERT(params->wsize >= work_size);
+
+        const float * x = (const float *) src0->data;
+        float * y = (float *) dst->data;
+
+        for (size_t chunk = (size_t) ith; chunk < n_chunks; chunk += (size_t) nth) {
+            const size_t i00_begin = chunk * chunk_elems;
+            const size_t remaining = ne00_size - i00_begin;
+            const size_t count = MIN(remaining, chunk_elems);
+
+            ggml_float sum = 0.0;
+            for (size_t i00 = i00_begin; i00 < i00_begin + count; ++i00) {
+                sum += (ggml_float) (x[i00] * x[i00]);
+            }
+            memcpy((char *) params->wdata + chunk * CACHE_LINE_SIZE, &sum, sizeof(sum));
+        }
+
+        ggml_barrier(params->shared);
+
+        if (ith == 0) {
+            ggml_float sum = 0.0;
+            for (size_t chunk = 0; chunk < n_chunks; ++chunk) {
+                ggml_float partial;
+                memcpy(&partial, (const char *) params->wdata + chunk * CACHE_LINE_SIZE, sizeof(partial));
+                sum += partial;
+            }
+
+            const float mean = sum / ne00;
+            const float scale = 1.0f / sqrtf(mean + eps);
+
+            if (y != x) {
+                memcpy(y, x, ne00_size * sizeof(float));
+            }
+            ggml_vec_scale_f32(ne00, y, scale);
+        }
+        return;
+    }
 
     // TODO: optimize
     for (int64_t i03 = 0; i03 < ne03; i03++) {
@@ -29007,6 +29078,16 @@ struct ggml_cplan ggml_graph_plan(const struct ggml_cgraph * cgraph, int n_threa
         size_t cur = 0;
 
         switch (node->op) {
+            case GGML_OP_RMS_NORM:
+                {
+                    const struct ggml_tensor * src0 = node->src[0];
+                    if (src0->type == GGML_TYPE_F32 &&
+                        ggml_nrows(src0) == 1 &&
+                        src0->ne[0] >= GGML_RMS_NORM_PARALLEL_MIN_ELEMS &&
+                        n_tasks > 1) {
+                        cur = ggml_rms_norm_parallel_work_size(src0->ne[0]);
+                    }
+                } break;
             case GGML_OP_CPY:
             case GGML_OP_DUP:
                 {
