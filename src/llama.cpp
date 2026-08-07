@@ -9481,6 +9481,18 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
     llama_dsv4_spec_ckpt_discard(ctx);
 }
 
+void llama_spec_ckpt_release(struct llama_context * ctx) {
+    if (ctx == nullptr) {
+        return;
+    }
+
+    llama_spec_ckpt_discard(ctx);
+
+    auto & kv = ctx->kv_self;
+    kv.ckpt.release();
+    kv.save_per_step_ssm = false;
+}
+
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
     if (result && ctx->model.arch == LLM_ARCH_DEEPSEEK4 && p0 <= 0 && p1 < 0) {
@@ -10838,7 +10850,8 @@ struct llama_data_read_file : llama_data_read {
     }
 };
 
-// Public state I/O excludes private DSV4 state, speculation uses an internal checkpoint.
+// Public state I/O excludes transient speculative-checkpoint and DSV4 execution state.
+// Canonical DSV4 cache tensors are serialized by write_kv_cache()/read_kv_cache().
 static bool llama_state_io_supported(const struct llama_context * ctx, const char * func) {
     if (ctx->model.arch == LLM_ARCH_OPENPANGU) {
         LLAMA_LOG_ERROR("%s: state save/restore is not supported for openPangu (private cache and side state are not serialized)\n", func);
@@ -11202,21 +11215,49 @@ struct llama_batch llama_batch_get_one(
 struct llama_batch llama_batch_init(int32_t n_tokens_alloc, int32_t embd, int32_t n_seq_max) {
     llama_batch batch = { 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, };
 
+    if (n_tokens_alloc <= 0 || embd < 0 || n_seq_max <= 0) {
+        return batch;
+    }
+    const size_t token_count = (size_t) n_tokens_alloc;
+    const size_t sequence_count = (size_t) n_seq_max;
+    if (token_count > SIZE_MAX / sizeof(llama_token) ||
+            token_count > SIZE_MAX / sizeof(llama_pos) ||
+            token_count > SIZE_MAX / sizeof(int32_t) ||
+            token_count > SIZE_MAX / sizeof(int8_t) ||
+            token_count > SIZE_MAX / sizeof(llama_seq_id *) - 1 ||
+            sequence_count > SIZE_MAX / sizeof(llama_seq_id) ||
+            (embd > 0 && ((size_t) embd > SIZE_MAX / sizeof(float) ||
+                          token_count > SIZE_MAX / ((size_t) embd * sizeof(float))))) {
+        return batch;
+    }
+
     if (embd) {
-        batch.embd = (float *) malloc(sizeof(float) * n_tokens_alloc * embd);
+        batch.embd = (float *) malloc(sizeof(float) * token_count * (size_t) embd);
     } else {
-        batch.token = (llama_token *) malloc(sizeof(llama_token) * n_tokens_alloc);
+        batch.token = (llama_token *) malloc(sizeof(llama_token) * token_count);
     }
 
-    batch.pos      = (llama_pos *)     malloc(sizeof(llama_pos)      * n_tokens_alloc);
-    batch.n_seq_id = (int32_t *)       malloc(sizeof(int32_t)        * n_tokens_alloc);
-    batch.seq_id   = (llama_seq_id **) malloc(sizeof(llama_seq_id *) * (n_tokens_alloc + 1));
-    for (int i = 0; i < n_tokens_alloc; ++i) {
-        batch.seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * n_seq_max);
+    batch.pos      = (llama_pos *) malloc(sizeof(llama_pos) * token_count);
+    batch.n_seq_id = (int32_t *) malloc(sizeof(int32_t) * token_count);
+    batch.seq_id   = (llama_seq_id **) calloc(token_count + 1, sizeof(llama_seq_id *));
+    for (size_t i = 0; batch.seq_id != nullptr && i < token_count; ++i) {
+        batch.seq_id[i] = (llama_seq_id *) malloc(sizeof(llama_seq_id) * sequence_count);
+        if (batch.seq_id[i] == nullptr) {
+            break;
+        }
     }
-    batch.seq_id[n_tokens_alloc] = nullptr;
 
-    batch.logits   = (int8_t *)        malloc(sizeof(int8_t)         * n_tokens_alloc);
+    batch.logits = (int8_t *) malloc(sizeof(int8_t) * token_count);
+
+    bool valid = (embd > 0 ? batch.embd != nullptr : batch.token != nullptr) &&
+            batch.pos != nullptr && batch.n_seq_id != nullptr && batch.seq_id != nullptr && batch.logits != nullptr;
+    for (size_t i = 0; valid && i < token_count; ++i) {
+        valid = batch.seq_id[i] != nullptr;
+    }
+    if (!valid) {
+        llama_batch_free(batch);
+        return { 0, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0, 0, 0, };
+    }
 
     return batch;
 }
@@ -11337,6 +11378,27 @@ float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
 #endif
         return nullptr;
     }
+}
+
+bool llama_spec_restore_logits(
+        struct llama_context * ctx,
+        const float          * logits,
+        size_t                 logits_count) {
+    if (ctx == nullptr || logits == nullptr || logits_count != (size_t) ctx->model.hparams.n_vocab) {
+        return false;
+    }
+
+    llama_synchronize(ctx);
+    if (ctx->logits == nullptr || ctx->logits_size < logits_count || ctx->output_ids.empty()) {
+        return false;
+    }
+
+    std::memcpy(ctx->logits, logits, logits_count * sizeof(*logits));
+    std::fill(ctx->output_ids.begin(), ctx->output_ids.end(), -1);
+    ctx->output_ids[0] = 0;
+    ctx->n_outputs = 1;
+    ctx->n_outputs_embd = 0;
+    return true;
 }
 
 llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i) {

@@ -82,6 +82,12 @@ common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt);
 
+// Initializes a session after its DFlash model IO tensors have already been
+// transactionally shared and validated by the owning engine.
+common_speculative * common_speculative_init_prepared(
+        common_params_speculative & params,
+        llama_context             * ctx_tgt);
+
 common_speculative_init_status common_speculative_try_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt,
@@ -270,6 +276,46 @@ common_speculative_type common_speculative_current_type(const common_speculative
 // Number of target prompt rows that must be re-evaluated after restoring a
 // prompt cache because DFlash target features are not part of the cache state.
 int32_t common_speculative_dflash_rewarm_tokens(const common_speculative * spec);
+
+struct common_speculative_dflash_state_data {
+    int32_t row_count = 0;
+    int32_t feature_width = 0;
+    int32_t cross_ctx = 0;
+    int32_t target_layer_count = 0;
+    llama_pos sequence_start_position = 0;
+    llama_pos coverage_start_position = 0;
+    llama_pos window_start_position = 0;
+    llama_pos next_position = 0;
+    const int32_t * target_layer_ids = nullptr;
+    const llama_pos * positions = nullptr;
+    const float * features = nullptr;
+    size_t feature_count = 0;
+};
+
+struct common_speculative_dflash_state_view {
+    common_speculative_dflash_state_data data;
+    bool ready = false;
+};
+
+// Establishes an empty canonical conditioning state. Empty state is valid only
+// when its coverage/window boundary is the exact next target position.
+bool common_speculative_dflash_state_reset(
+        common_speculative * spec,
+        llama_pos sequence_start_position,
+        llama_pos coverage_start_position,
+        llama_pos next_position);
+
+// The returned pointers are borrowed and remain valid only until the next
+// mutable operation on spec.
+bool common_speculative_dflash_state_get_view(
+        common_speculative * spec,
+        common_speculative_dflash_state_view & view);
+
+// Validates and copies the complete canonical state before replacing the live
+// state. Failure leaves the live state unchanged.
+bool common_speculative_dflash_state_import(
+        common_speculative * spec,
+        const common_speculative_dflash_state_data & data);
 
 common_speculative_metrics_snapshot common_speculative_get_metrics_snapshot(const common_speculative * spec);
 

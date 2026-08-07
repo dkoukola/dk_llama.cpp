@@ -217,4 +217,8 @@ get_filename_component(TEST_TARGET test-c.c NAME_WE)
 add_executable(${TEST_TARGET} test-c.c)
 target_link_libraries(${TEST_TARGET} PRIVATE llama)
 
-
+if (TARGET llama::speculative)
+    add_executable(test-speculative-api test-speculative-api.c)
+    target_link_libraries(test-speculative-api PRIVATE llama::speculative llama)
+    add_test(NAME test-speculative-api COMMAND test-speculative-api)
+endif()

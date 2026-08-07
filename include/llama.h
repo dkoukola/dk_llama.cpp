@@ -65,6 +65,11 @@ extern "C" {
     // TODO: show sample usage
     //
 
+    // Returns the deterministic 64-character lowercase hexadecimal identity
+    // of this libllama build. The returned pointer remains valid for the
+    // lifetime of the process.
+    LLAMA_API const char * llama_build_id(void);
+
     struct llama_model;
     struct llama_context;
 
@@ -871,6 +876,9 @@ extern "C" {
     // Discard the saved checkpoint and reset internal mode state.
     LLAMA_API void llama_spec_ckpt_discard(struct llama_context * ctx);
 
+    // Discard any saved checkpoint and release preallocated checkpoint resources.
+    LLAMA_API void llama_spec_ckpt_release(struct llama_context * ctx);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence
@@ -1131,6 +1139,14 @@ extern "C" {
     // Negative indicies can be used to access logits in reverse order, -1 is the last logit.
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+
+    // Replace the visible logits with one authoritative row after an internal
+    // speculative checkpoint restore. This invalidates the preceding batch's
+    // output-index mapping and exposes the supplied row as output index 0.
+    LLAMA_API bool llama_spec_restore_logits(
+            struct llama_context * ctx,
+            const float          * logits,
+            size_t                 logits_count);
 
     // Get the argmax token ID for DFlash draft position i without materializing full logits.
     // Returns LLAMA_TOKEN_NULL if argmax is not available (falls back to logits path).

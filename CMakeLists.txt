@@ -79,6 +79,11 @@ option(LLAMA_SANITIZE_UNDEFINED "llama: enable undefined sanitizer" OFF)
 option(LLAMA_BUILD_TESTS    "llama: build tests"          ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_EXAMPLES "llama: build examples"       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_SERVER   "llama: build server example" ${LLAMA_STANDALONE})
+option(LLAMA_BUILD_SPECULATIVE "llama: build the installed speculative-decoding bridge" ${BUILD_SHARED_LIBS})
+
+if (LLAMA_BUILD_SPECULATIVE AND NOT BUILD_SHARED_LIBS)
+    message(FATAL_ERROR "LLAMA_BUILD_SPECULATIVE requires BUILD_SHARED_LIBS=ON")
+endif()
 
 # 3rd party libs
 option(LLAMA_CURL "llama: use libcurl to download model from an URL" OFF)
@@ -152,6 +157,8 @@ if (NOT TARGET ggml)
     add_subdirectory(ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
+
+include(llama-build-id)
 
 #
 # build the library

@@ -87,4 +87,20 @@ set_target_properties(llama
         INTERFACE_COMPILE_FEATURES cxx_std_11
         POSITION_INDEPENDENT_CODE ON )
 
+if (@LLAMA_BUILD_SPECULATIVE@)
+    find_library(llama_speculative_LIBRARY llama-speculative
+        REQUIRED
+        HINTS ${LLAMA_LIB_DIR})
+
+    add_library(llama::speculative UNKNOWN IMPORTED)
+
+    set_target_properties(llama::speculative
+        PROPERTIES
+            INTERFACE_INCLUDE_DIRECTORIES "${LLAMA_INCLUDE_DIR}"
+            INTERFACE_LINK_LIBRARIES "llama"
+            IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+            IMPORTED_LOCATION "${llama_speculative_LIBRARY}"
+            POSITION_INDEPENDENT_CODE ON )
+endif()
+
 check_required_components(Llama)

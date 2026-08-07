@@ -1,0 +1,11 @@
+#include "llama.h"
+#include "llama-build-id.h"
+
+static const char llama_build_id_value[] = LLAMA_GENERATED_BUILD_ID;
+
+static_assert(sizeof(llama_build_id_value) == 65,
+        "libllama build identities must contain 64 characters plus NUL");
+
+LLAMA_API const char * llama_build_id(void) {
+    return llama_build_id_value;
+}

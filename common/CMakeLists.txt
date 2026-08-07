@@ -152,3 +152,49 @@ endif ()
 target_include_directories(${TARGET} PUBLIC . ../vendor)
 target_compile_features   (${TARGET} PUBLIC cxx_std_17)
 target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC llama Threads::Threads)
+
+if (LLAMA_BUILD_SPECULATIVE)
+    add_library(llama-speculative-bridge SHARED
+        speculative-bridge.cpp
+        ../include/llama-speculative.h
+        )
+    add_library(llama::speculative ALIAS llama-speculative-bridge)
+
+    target_compile_features(llama-speculative-bridge PRIVATE cxx_std_17)
+    target_compile_definitions(llama-speculative-bridge PRIVATE
+        LLAMA_SPECULATIVE_SHARED
+        LLAMA_SPECULATIVE_BUILD
+        )
+    target_include_directories(llama-speculative-bridge
+        PUBLIC
+            $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+            $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}>
+        PRIVATE
+            ${LLAMA_BUILD_ID_INCLUDE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src
+            ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
+        )
+    target_link_libraries(llama-speculative-bridge PRIVATE common llama Threads::Threads)
+    add_dependencies(llama-speculative-bridge llama-build-id)
+
+    set_target_properties(llama-speculative-bridge PROPERTIES
+        CXX_VISIBILITY_PRESET hidden
+        VISIBILITY_INLINES_HIDDEN ON
+        OUTPUT_NAME llama-speculative
+        VERSION 1.0.0
+        SOVERSION 1
+        PUBLIC_HEADER ${CMAKE_CURRENT_SOURCE_DIR}/../include/llama-speculative.h
+        )
+
+    if (UNIX AND NOT APPLE)
+        target_link_options(llama-speculative-bridge PRIVATE
+            "-Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/llama-speculative.map")
+        target_link_options(llama-speculative-bridge PRIVATE "-Wl,--exclude-libs,ALL")
+    endif()
+
+    install(TARGETS llama-speculative-bridge
+        LIBRARY DESTINATION ${LLAMA_LIB_INSTALL_DIR}
+        PUBLIC_HEADER DESTINATION ${LLAMA_INCLUDE_INSTALL_DIR}
+        )
+endif()

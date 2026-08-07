@@ -201,6 +201,10 @@ struct llama_kv_cache {
             release_dsv4_per_step();
             release_dsv4_snapshot();
 
+            std::vector<llama_kv_cell>().swap(cells_snapshot);
+            head_snapshot = 0;
+            used_snapshot = 0;
+
             for (struct ggml_context * ctx : shadow_ctxs) {
                 ggml_free(ctx);
             }
@@ -224,7 +228,17 @@ struct llama_kv_cache {
             per_step_bufs.clear();
             per_step_ssm.clear();
             per_step_conv.clear();
+            per_step_n_tokens = 0;
             per_step_max_allocated = 0;
+            per_step_ssm_state_size = 0;
+            per_step_conv_state_dim = 0;
+            per_step_conv_dim = 0;
+            per_step_d_conv = 0;
+
+            std::vector<uint8_t>().swap(cpu_state_data);
+            selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
+            fixed_spec_mode = LLAMA_SPEC_CKPT_NONE;
+            fixed_max_tokens = 0;
         }
 
         ~gpu_checkpoint() {

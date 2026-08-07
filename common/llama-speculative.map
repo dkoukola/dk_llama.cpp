@@ -1,0 +1,6 @@
+LLAMA_SPECULATIVE_1 {
+    global:
+        llama_speculative_*;
+    local:
+        *;
+};

@@ -4,7 +4,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <iterator>
+#include <limits>
 #include <vector>
 
 static bool common_speculative_are_dflash_compatible(
@@ -72,6 +74,7 @@ static bool common_speculative_are_dflash_compatible(
 
 struct common_speculative_state_dflash;
 static void dflash_materialize_target_window_features(common_speculative_state_dflash & state);
+static bool dflash_conditioning_ready(const common_speculative_state_dflash & state);
 
 // DFlash runtime state and draft path.
 struct common_speculative_state_dflash : public common_speculative_state {
@@ -85,12 +88,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int32_t n_target_features = 0;
     int32_t cross_ctx = 0;
     bool is_dspark = false;
+    bool capture_installed = false;
     bool ready = false;
 
     std::vector<int32_t> target_layer_ids;
     std::vector<float> target_window;
     std::vector<llama_pos> target_window_pos;
-    std::vector<float> target_window_stage;
     std::vector<llama_pos> target_window_pos_stage;
     std::vector<float> target_window_ring;
     std::vector<float> target_window_append_features;
@@ -102,6 +105,9 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int32_t target_window_append_rows = 0;
     bool target_window_replace = false;
     bool target_window_materialized = false;
+    llama_pos sequence_start_position = 0;
+    llama_pos coverage_start_position = 0;
+    llama_pos next_position = 0;
     llama_pos last_target_pos = -1;
 
     common_speculative_state_dflash(
@@ -115,6 +121,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
         , cross_ctx(std::max(1, cross_ctx))
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DSPARK)
     {
+        try {
+            initialize(type);
+        } catch (const std::exception & err) {
+            LOG_ERR("%s: failed to prepare DFlash speculative state: %s\n", __func__, err.what());
+        }
+    }
+
+    void initialize(enum common_speculative_type type) {
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
         const llama_model * model_dft = llama_get_model(ctx_dft);
 
@@ -211,34 +225,47 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
+        const int32_t draft_batch_size = std::max(1, block_size);
+        batch = llama_batch_init(draft_batch_size, 0, 1);
+        bool have_seq_ids = batch.seq_id != nullptr;
+        for (int32_t i = 0; have_seq_ids && i < draft_batch_size; ++i) {
+            have_seq_ids = batch.seq_id[i] != nullptr;
+        }
+        if (batch.token == nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr ||
+            !have_seq_ids || batch.logits == nullptr) {
+            LOG_ERR("%s: failed to allocate DFlash draft batch\n", __func__);
+            return;
+        }
+
+        target_window.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
+        target_window_ring.resize((size_t) this->cross_ctx * (size_t) n_target_features);
+        target_window_append_features.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
+        target_window_pos.reserve((size_t) this->cross_ctx);
+        target_window_pos_stage.reserve((size_t) this->cross_ctx);
+
+        llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
+        LOG_INF("%s: %s context prepared (n_ctx=%d, block_size=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
+                __func__, common_speculative_type_to_str(type).c_str(), llama_n_ctx(ctx_dft), block_size,
+                this->cross_ctx, n_target_features, n_target_layers);
+
+        // The target-global callback is the final externally visible initialization step.
         if (!llama_set_dflash_capture_layers(ctx_tgt, target_layer_ids.data(), (int32_t) target_layer_ids.size())) {
             LOG_ERR("%s: failed to configure DFlash target capture callback\n", __func__);
             return;
         }
 
-        batch = llama_batch_init(std::max(1, block_size), 0, 1);
-        target_window.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
-        target_window_stage.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
-        target_window_ring.resize((size_t) this->cross_ctx * (size_t) n_target_features);
-        target_window_append_features.reserve((size_t) this->cross_ctx * (size_t) n_target_features);
-        target_window_pos.reserve((size_t) this->cross_ctx);
-        target_window_pos_stage.reserve((size_t) this->cross_ctx);
+        capture_installed = true;
         ready = true;
-
-        llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
-        LOG_INF("%s: %s context ready (n_ctx=%d, block_size=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
-                __func__, common_speculative_type_to_str(type).c_str(), llama_n_ctx(ctx_dft), block_size,
-                this->cross_ctx, n_target_features, n_target_layers);
     }
 
     ~common_speculative_state_dflash() override {
-        llama_clear_dflash_capture(ctx_tgt);
+        if (capture_installed) {
+            llama_clear_dflash_capture(ctx_tgt);
+        }
         if (ctx_dft) {
             llama_free(ctx_dft);
         }
-        if (batch.token != nullptr) {
-            llama_batch_free(batch);
-        }
+        llama_batch_free(batch);
     }
 
     void begin(const llama_tokens & prompt) override {
@@ -255,7 +282,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         GGML_UNUSED(prompt_tgt);
 
         result.clear();
-        if (!ready || target_window_rows <= 0) {
+        if (!ready || target_window_rows <= 0 || (is_dspark && !dflash_conditioning_ready(*this))) {
             return;
         }
 
@@ -439,6 +466,49 @@ static void dflash_materialize_target_window_features(common_speculative_state_d
     state.target_window_materialized = true;
 }
 
+static llama_pos dflash_horizon_start(const common_speculative_state_dflash & state) {
+    const int64_t horizon_start = std::max<int64_t>(
+            state.sequence_start_position,
+            (int64_t) state.next_position - state.cross_ctx);
+    return (llama_pos) horizon_start;
+}
+
+static llama_pos dflash_expected_window_start(const common_speculative_state_dflash & state) {
+    return std::max(state.coverage_start_position, dflash_horizon_start(state));
+}
+
+static bool dflash_window_is_valid(const common_speculative_state_dflash & state) {
+    if (state.cross_ctx <= 0 || state.n_target_features <= 0 ||
+            state.sequence_start_position < 0 ||
+            state.sequence_start_position > state.coverage_start_position ||
+            state.coverage_start_position > state.next_position ||
+            state.target_window_rows < 0 || state.target_window_rows > state.cross_ctx ||
+            state.target_window_rows != (int32_t) state.target_window_pos.size()) {
+        return false;
+    }
+
+    const llama_pos window_start = state.target_window_rows > 0
+            ? state.target_window_pos.front()
+            : state.next_position;
+    if (window_start != dflash_expected_window_start(state) ||
+            (int64_t) state.next_position - window_start != state.target_window_rows) {
+        return false;
+    }
+
+    for (int32_t i = 0; i < state.target_window_rows; ++i) {
+        if (state.target_window_pos[(size_t) i] != window_start + i) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool dflash_conditioning_ready(const common_speculative_state_dflash & state) {
+    return dflash_window_is_valid(state) &&
+            state.coverage_start_position <= dflash_horizon_start(state);
+}
+
 static bool dflash_append_target_features(
         common_speculative_state_dflash & state,
         const common_speculative_feature_view & features,
@@ -451,6 +521,10 @@ static bool dflash_append_target_features(
     }
 
     const size_t row_width = (size_t) state.n_target_features;
+    if (features.rows.size() > std::numeric_limits<size_t>::max() / row_width) {
+        return false;
+    }
+
     std::vector<float> new_rows;
     std::vector<llama_pos> new_positions;
     new_rows.reserve(features.rows.size() * row_width);
@@ -459,6 +533,9 @@ static bool dflash_append_target_features(
     for (const auto & row : features.rows) {
         if (row.seq_id != seq_id || row.data == nullptr) {
             continue;
+        }
+        if (row.pos < state.sequence_start_position) {
+            return false;
         }
 
         new_positions.push_back(row.pos);
@@ -469,20 +546,62 @@ static bool dflash_append_target_features(
         return false;
     }
 
-    const int32_t n_rows = (int32_t) new_positions.size();
-    if (n_rows >= state.cross_ctx) {
-        const int32_t keep_from = n_rows - state.cross_ctx;
-        state.target_window_pos.assign(new_positions.begin() + keep_from, new_positions.end());
-        state.target_window_append_features.assign(
-                new_rows.begin() + (ptrdiff_t) keep_from * (ptrdiff_t) row_width,
-                new_rows.end());
-        dflash_ring_reset_rows(state, state.target_window_append_features.data(), state.cross_ctx);
+    size_t suffix_start = 0;
+    for (size_t i = 1; i < new_positions.size(); ++i) {
+        if (new_positions[i - 1] == std::numeric_limits<llama_pos>::max() ||
+                new_positions[i] != new_positions[i - 1] + 1) {
+            suffix_start = i;
+        }
+    }
+    if (new_positions.back() == std::numeric_limits<llama_pos>::max()) {
+        return false;
+    }
 
-        state.target_window_rows = state.cross_ctx;
-        state.target_window_ring_filled = state.target_window_rows;
-        state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
-        dflash_record_window_update(state, 0, state.target_window_rows, true);
-        return true;
+    const bool continues_window = suffix_start == 0 &&
+            new_positions.front() == state.next_position &&
+            dflash_window_is_valid(state);
+    const size_t append_start = continues_window ? 0 : suffix_start;
+    const size_t append_count = new_positions.size() - append_start;
+    if (append_count == 0 || append_count > (size_t) std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+
+    const llama_pos next_position = new_positions.back() + 1;
+    const llama_pos coverage_start_position = continues_window
+            ? state.coverage_start_position
+            : new_positions[append_start];
+    const int32_t n_rows = (int32_t) append_count;
+
+    if (!continues_window || n_rows >= state.cross_ctx) {
+        const int32_t replacement_rows = std::min(n_rows, state.cross_ctx);
+        const size_t replacement_start = new_positions.size() - (size_t) replacement_rows;
+        std::vector<llama_pos> replacement_positions(
+                new_positions.begin() + (ptrdiff_t) replacement_start,
+                new_positions.end());
+        std::vector<float> replacement_features(
+                new_rows.begin() + (ptrdiff_t) replacement_start * (ptrdiff_t) row_width,
+                new_rows.end());
+
+        if (row_width > std::numeric_limits<size_t>::max() / (size_t) state.cross_ctx) {
+            return false;
+        }
+        std::vector<float> replacement_ring((size_t) state.cross_ctx * row_width);
+        std::copy(replacement_features.begin(), replacement_features.end(), replacement_ring.begin());
+
+        state.target_window.clear();
+        state.target_window_pos.swap(replacement_positions);
+        state.target_window_pos_stage.clear();
+        state.target_window_append_features.swap(replacement_features);
+        state.target_window_ring.swap(replacement_ring);
+        state.target_window_rows = replacement_rows;
+        state.target_window_ring_write_pos = replacement_rows % state.cross_ctx;
+        state.target_window_ring_filled = replacement_rows;
+        state.target_window_materialized = false;
+        state.coverage_start_position = coverage_start_position;
+        state.next_position = next_position;
+        state.last_target_pos = state.target_window_pos.back();
+        dflash_record_window_update(state, 0, replacement_rows, true);
+        return dflash_window_is_valid(state);
     }
 
     const int32_t keep_old_rows = std::min<int32_t>(state.target_window_rows, state.cross_ctx - n_rows);
@@ -493,23 +612,28 @@ static bool dflash_append_target_features(
         std::copy(state.target_window_pos.end() - keep_old_rows, state.target_window_pos.end(), next_window_pos.begin());
     }
 
-    state.target_window_append_features.assign(new_rows.begin(), new_rows.end());
+    state.target_window_append_features.assign(
+            new_rows.begin() + (ptrdiff_t) append_start * (ptrdiff_t) row_width,
+            new_rows.end());
     dflash_ring_append_rows(state, state.target_window_append_features.data(), n_rows);
-    std::copy(new_positions.begin(), new_positions.end(), next_window_pos.begin() + keep_old_rows);
+    std::copy(
+            new_positions.begin() + (ptrdiff_t) append_start,
+            new_positions.end(),
+            next_window_pos.begin() + keep_old_rows);
 
     state.target_window_pos.swap(next_window_pos);
     next_window_pos.clear();
     state.target_window_rows = keep_old_rows + n_rows;
     state.target_window_ring_filled = state.target_window_rows;
-    state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
+    state.next_position = next_position;
+    state.last_target_pos = state.target_window_pos.back();
     dflash_record_window_update(state, keep_old_rows, n_rows, false);
-    return true;
+    return dflash_window_is_valid(state);
 }
 
 static void dflash_clear_target_features(common_speculative_state_dflash & state) {
     state.target_window.clear();
     state.target_window_pos.clear();
-    state.target_window_stage.clear();
     state.target_window_pos_stage.clear();
     state.target_window_append_features.clear();
     state.target_window_rows = 0;
@@ -519,6 +643,7 @@ static void dflash_clear_target_features(common_speculative_state_dflash & state
     state.target_window_append_rows = 0;
     state.target_window_replace = false;
     state.target_window_materialized = false;
+    state.coverage_start_position = state.next_position;
     state.last_target_pos = -1;
     llama_reset_dflash_kv_cache_state(state.ctx_dft);
 }
@@ -526,7 +651,15 @@ static void dflash_clear_target_features(common_speculative_state_dflash & state
 static void dflash_trim_target_features(
         common_speculative_state_dflash & state,
         llama_pos                         pos_begin) {
+    if (pos_begin < state.sequence_start_position || pos_begin > state.next_position) {
+        return;
+    }
+    if (pos_begin == state.next_position) {
+        return;
+    }
     if (state.target_window_rows <= 0 || state.target_window_pos.empty()) {
+        state.next_position = pos_begin;
+        dflash_clear_target_features(state);
         return;
     }
 
@@ -535,10 +668,8 @@ static void dflash_trim_target_features(
         state.target_window_pos.end(),
         pos_begin);
     const int32_t keep_rows = (int32_t) std::distance(state.target_window_pos.begin(), keep_end);
-    if (keep_rows == state.target_window_rows) {
-        return;
-    }
     if (keep_rows <= 0) {
+        state.next_position = pos_begin;
         dflash_clear_target_features(state);
         return;
     }
@@ -547,12 +678,12 @@ static void dflash_trim_target_features(
     const size_t row_width = (size_t) state.n_target_features;
     state.target_window.resize((size_t) keep_rows * row_width);
     state.target_window_pos.resize((size_t) keep_rows);
-    state.target_window_stage.clear();
     state.target_window_pos_stage.clear();
     state.target_window_append_features.clear();
     state.target_window_rows = keep_rows;
     dflash_ring_reset_rows(state, state.target_window.data(), keep_rows);
-    state.target_window_ring_filled = keep_rows;
+    state.coverage_start_position = state.target_window_pos.front();
+    state.next_position = pos_begin;
     state.last_target_pos = state.target_window_pos.back();
     dflash_record_window_update(state, 0, keep_rows, true);
     llama_reset_dflash_kv_cache_state(state.ctx_dft);
@@ -563,15 +694,38 @@ static void dflash_context_shift(
         llama_pos kv_keep,
         llama_pos kv_discard,
         llama_pos kv_past) {
-    if (kv_discard <= 0 || state.target_window_rows <= 0 || state.target_window_pos.empty()) {
+    if (kv_discard <= 0 || kv_keep < state.sequence_start_position ||
+            (int64_t) kv_keep + kv_discard > kv_past) {
+        return;
+    }
+
+    if (state.next_position != kv_past) {
+        state.next_position = kv_past;
+        dflash_clear_target_features(state);
+    }
+
+    const llama_pos discard_begin = kv_keep;
+    const llama_pos discard_end = kv_keep + kv_discard;
+    const llama_pos shifted_next_position = kv_past - kv_discard;
+    const auto shift_boundary = [discard_begin, discard_end, kv_discard](llama_pos position) {
+        if (position <= discard_begin) {
+            return position;
+        }
+        if (position < discard_end) {
+            return discard_begin;
+        }
+        return (llama_pos) (position - kv_discard);
+    };
+
+    if (state.target_window_rows <= 0 || state.target_window_pos.empty()) {
+        state.next_position = shifted_next_position;
+        dflash_clear_target_features(state);
         return;
     }
 
     dflash_materialize_target_window_features(state);
 
     const size_t row_width = (size_t) state.n_target_features;
-    const llama_pos discard_begin = kv_keep;
-    const llama_pos discard_end = kv_keep + kv_discard;
 
     std::vector<float> shifted_rows;
     std::vector<llama_pos> shifted_positions;
@@ -596,8 +750,34 @@ static void dflash_context_shift(
     state.target_window = std::move(shifted_rows);
     state.target_window_pos = std::move(shifted_positions);
     state.target_window_rows = (int32_t) state.target_window_pos.size();
+    state.coverage_start_position = shift_boundary(state.coverage_start_position);
+    state.next_position = shifted_next_position;
+
+    if (state.target_window_rows <= 0) {
+        dflash_clear_target_features(state);
+        return;
+    }
+
+    const llama_pos expected_window_start = dflash_expected_window_start(state);
+    if (state.target_window_pos.front() < expected_window_start) {
+        const int32_t discard_rows = (int32_t) (expected_window_start - state.target_window_pos.front());
+        if (discard_rows >= state.target_window_rows) {
+            dflash_clear_target_features(state);
+            return;
+        }
+        state.target_window.erase(
+                state.target_window.begin(),
+                state.target_window.begin() + (ptrdiff_t) discard_rows * (ptrdiff_t) row_width);
+        state.target_window_pos.erase(
+                state.target_window_pos.begin(),
+                state.target_window_pos.begin() + discard_rows);
+        state.target_window_rows -= discard_rows;
+    } else if (state.target_window_pos.front() > expected_window_start) {
+        state.coverage_start_position = state.target_window_pos.front();
+    }
+
     dflash_ring_reset_rows(state, state.target_window.data(), state.target_window_rows);
-    state.last_target_pos = state.target_window_pos.empty() ? -1 : state.target_window_pos.back();
+    state.last_target_pos = state.target_window_pos.back();
     dflash_record_window_update(state, 0, state.target_window_rows, true);
     llama_reset_dflash_kv_cache_state(state.ctx_dft);
 }

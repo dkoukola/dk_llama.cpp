@@ -11,6 +11,8 @@ endif()
 
 # llama
 
+set_source_files_properties(${LLAMA_BUILD_ID_SOURCE} PROPERTIES GENERATED TRUE)
+
 if (LLAMA_ALL_WARNINGS)
     if (NOT MSVC)
         list(APPEND WARNING_FLAGS -Wall -Wextra -Wpedantic -Wcast-qual -Wno-unused-function -Wno-sign-compare)
@@ -39,6 +41,7 @@ endif()
 
 add_library(llama
             ../include/llama.h
+            ${LLAMA_BUILD_ID_SOURCE}
             llama.cpp
             llama-spec-features.cpp
             llama-spec-features-dflash.cpp
@@ -137,6 +140,8 @@ target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
+
+add_dependencies(llama llama-build-id)
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

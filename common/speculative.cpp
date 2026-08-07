@@ -1352,9 +1352,15 @@ done:
 
 // initialization of the speculative decoding system
 //
-common_speculative * common_speculative_init(
+enum class common_speculative_model_preparation {
+    SHARE_DFLASH_IO,
+    ALREADY_SHARED_DFLASH_IO,
+};
+
+static common_speculative * common_speculative_init_internal(
         common_params_speculative & params,
-        llama_context             * ctx_tgt) {
+        llama_context             * ctx_tgt,
+        common_speculative_model_preparation model_preparation) {
     std::string chain_error;
     if (!common_speculative_validate_chain(params, &chain_error)) {
         LOG_ERR("%s: invalid speculative stage chain: %s\n", __func__, chain_error.c_str());
@@ -1383,7 +1389,7 @@ common_speculative * common_speculative_init(
                (stage.type == COMMON_SPECULATIVE_TYPE_MTP && params.model_dft != nullptr);
     });
 
-    llama_context * ctx_dft = nullptr;
+    std::unique_ptr<llama_context, decltype(&llama_free)> ctx_dft(nullptr, llama_free);
     if (needs_draft_ctx) {
         if (!params.model_dft) {
             LOG_ERR("%s: draft speculative stage requires a loaded draft model\n", __func__);
@@ -1393,8 +1399,15 @@ common_speculative * common_speculative_init(
         llama_context_params cparams_dft = params.cparams_dft;
 
         if (has_dflash_stage) {
-            if (!llama_model_share_dflash_io_tensors(params.model_dft, llama_get_model(ctx_tgt))) {
+            if (model_preparation == common_speculative_model_preparation::SHARE_DFLASH_IO &&
+                    !llama_model_share_dflash_io_tensors(params.model_dft, llama_get_model(ctx_tgt))) {
                 LOG_ERR("%s: failed to share target IO tensors with DFlash draft model\n", __func__);
+                return nullptr;
+            }
+
+            const int32_t io_mode = llama_model_dflash_io_mode(params.model_dft, llama_get_model(ctx_tgt));
+            if (io_mode == LLAMA_DFLASH_IO_MODE_INVALID || io_mode == LLAMA_DFLASH_IO_MODE_MIXED) {
+                LOG_ERR("%s: DFlash IO tensors are not fully shared or fully self-contained\n", __func__);
                 return nullptr;
             }
 
@@ -1426,12 +1439,22 @@ common_speculative * common_speculative_init(
             cparams_dft.n_ctx = (uint32_t) required_n_ctx;
         }
 
-        ctx_dft = llama_init_from_model(params.model_dft, cparams_dft);
+        ctx_dft.reset(llama_init_from_model(params.model_dft, cparams_dft));
         if (ctx_dft == nullptr) {
             LOG_ERR("%s", "failed to create draft context\n");
             return nullptr;
         }
     }
+
+    struct checkpoint_release_guard {
+        llama_context * ctx = nullptr;
+
+        ~checkpoint_release_guard() {
+            if (ctx != nullptr) {
+                llama_spec_ckpt_release(ctx);
+            }
+        }
+    } checkpoint_guard;
 
     // Compute the implementations to use based on the resolved stage chain.
     std::vector<common_speculative_config> configs = {};
@@ -1477,13 +1500,11 @@ common_speculative * common_speculative_init(
                     params.spec_ckpt_mode == LLAMA_SPEC_CKPT_GPU_FALLBACK ? "gpu-fallback" :
                     params.spec_ckpt_mode == LLAMA_SPEC_CKPT_CPU ? "cpu" : "auto",
                     ckpt_tokens);
-            if (ctx_dft != nullptr) {
-                llama_free(ctx_dft);
-            }
             return nullptr;
         }
         llama_spec_ckpt_discard(ctx_tgt);
         params.spec_ckpt_mode = actual_mode;
+        checkpoint_guard.ctx = ctx_tgt;
     }
 
     std::vector<std::unique_ptr<common_speculative_state>> impls = {};
@@ -1494,11 +1515,13 @@ common_speculative * common_speculative_init(
             case COMMON_SPECULATIVE_TYPE_NONE:
                 break;
             case COMMON_SPECULATIVE_TYPE_DRAFT: {
-                impls.push_back(std::make_unique<common_speculative_state_draft>(config.type,
+                auto state = std::make_unique<common_speculative_state_draft>(config.type,
                     /* .ctx_tgt      = */ ctx_tgt,
-                    /* .ctx_dft      = */ ctx_dft,
+                    /* .ctx_dft      = */ ctx_dft.get(),
                     /* .replacements = */ config.params.replacements
-                ));
+                );
+                ctx_dft.release();
+                impls.push_back(std::move(state));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DFLASH:
@@ -1506,32 +1529,34 @@ common_speculative * common_speculative_init(
                 auto state = std::make_unique<common_speculative_state_dflash>(
                     config.type,
                     ctx_tgt,
-                    ctx_dft,
+                    ctx_dft.get(),
                     config.params.dflash_cross_ctx);
+                ctx_dft.release();
                 if (!state->ready) {
                     LOG_ERR("%s: failed to initialize %s speculative state\n",
                             __func__, common_speculative_type_to_str(config.type).c_str());
                     return nullptr;
                 }
                 impls.push_back(std::move(state));
-                ctx_dft = nullptr;
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_MTP: {
-                llama_context * ctx_mtp = ctx_dft;
+                std::unique_ptr<llama_context, decltype(&llama_free)> ctx_mtp(ctx_dft.release(), llama_free);
                 if (!ctx_mtp) {
                     const llama_model * model = llama_get_model(ctx_tgt);
-                    ctx_mtp = llama_init_from_model(const_cast<llama_model *>(model), config.params.cparams_dft);
+                    ctx_mtp.reset(llama_init_from_model(const_cast<llama_model *>(model), config.params.cparams_dft));
                     if (!ctx_mtp) {
                         LOG_ERR("%s: failed to create MTP context\n", __func__);
                         return nullptr;
                     }
                 }
-                ctx_dft = nullptr;
 
-                const bool use_constant_draft_positions = llama_model_is_gemma4_mtp_assistant(llama_get_model(ctx_mtp));
-                impls.push_back(std::make_unique<common_speculative_state_mtp>(
-                    config.type, ctx_tgt, ctx_mtp, use_constant_draft_positions));
+                const bool use_constant_draft_positions =
+                    llama_model_is_gemma4_mtp_assistant(llama_get_model(ctx_mtp.get()));
+                auto state = std::make_unique<common_speculative_state_mtp>(
+                    config.type, ctx_tgt, ctx_mtp.get(), use_constant_draft_positions);
+                ctx_mtp.release();
+                impls.push_back(std::move(state));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
@@ -1591,11 +1616,11 @@ common_speculative * common_speculative_init(
         return nullptr;
     }
 
-    auto * result = new common_speculative {
+    auto result = std::unique_ptr<common_speculative>(new common_speculative {
         /* .configs = */ std::move(configs),
         /* .impls = */ std::move(impls)
-    };
-    common_speculative_prepare_request(result, params);
+    });
+    common_speculative_prepare_request(result.get(), params);
 
     // initialize autotune if requested
     if (params.autotune && params.has_composite_stage_chain()) {
@@ -1622,7 +1647,22 @@ common_speculative * common_speculative_init(
         }
     }
 
-    return result;
+    checkpoint_guard.ctx = nullptr;
+    return result.release();
+}
+
+common_speculative * common_speculative_init(
+        common_params_speculative & params,
+        llama_context             * ctx_tgt) {
+    return common_speculative_init_internal(
+            params, ctx_tgt, common_speculative_model_preparation::SHARE_DFLASH_IO);
+}
+
+common_speculative * common_speculative_init_prepared(
+        common_params_speculative & params,
+        llama_context             * ctx_tgt) {
+    return common_speculative_init_internal(
+            params, ctx_tgt, common_speculative_model_preparation::ALREADY_SHARED_DFLASH_IO);
 }
 
 void common_speculative_free(common_speculative * spec) {
@@ -2391,15 +2431,40 @@ static bool common_speculative_apply_hidden_rows(
         return true;
     }
 
+    if (ids.size() > (size_t) std::numeric_limits<int32_t>::max() ||
+            ids.size() > std::numeric_limits<size_t>::max() / (size_t) feature_width ||
+            pos_base < 0 || ids.size() - 1 > (size_t) (std::numeric_limits<llama_pos>::max() - pos_base)) {
+        return false;
+    }
     const size_t expected_floats = ids.size() * (size_t) feature_width;
     if (hidden_rows.size() != expected_floats) {
         return false;
     }
 
-    llama_batch accepted_batch = llama_batch_init(ids.size(), 0, 1);
-    for (size_t i = 0; i < ids.size(); ++i) {
-        common_batch_add(accepted_batch, ids[i], pos_base + (llama_pos) i, { seq_id }, true);
+    struct batch_owner {
+        llama_batch value;
+
+        ~batch_owner() {
+            llama_batch_free(value);
+        }
+    } accepted = { llama_batch_init((int32_t) ids.size(), 0, 1) };
+    llama_batch & accepted_batch = accepted.value;
+    if (accepted_batch.token == nullptr || accepted_batch.pos == nullptr ||
+            accepted_batch.n_seq_id == nullptr || accepted_batch.seq_id == nullptr ||
+            accepted_batch.logits == nullptr) {
+        return false;
     }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (accepted_batch.seq_id[i] == nullptr) {
+            return false;
+        }
+        accepted_batch.token[i] = ids[i];
+        accepted_batch.pos[i] = pos_base + (llama_pos) i;
+        accepted_batch.n_seq_id[i] = 1;
+        accepted_batch.seq_id[i][0] = seq_id;
+        accepted_batch.logits[i] = true;
+    }
+    accepted_batch.n_tokens = (int32_t) ids.size();
 
     common_speculative_feature_view feature_view;
     const bool have_feature_view = common_speculative_feature_view_from_hidden_rows(
@@ -2408,7 +2473,6 @@ static bool common_speculative_apply_hidden_rows(
         ? common_speculative_on_target_batch(spec, accepted_batch, feature_view, false)
         : -1;
 
-    llama_batch_free(accepted_batch);
     return ret == 0;
 }
 
@@ -2801,6 +2865,173 @@ int32_t common_speculative_dflash_rewarm_tokens(const common_speculative * spec)
     return state != nullptr ? state->cross_ctx : 0;
 }
 
+bool common_speculative_dflash_state_reset(
+        common_speculative * spec,
+        llama_pos sequence_start_position,
+        llama_pos coverage_start_position,
+        llama_pos next_position) {
+    auto * state = common_speculative_get_dflash_state(spec);
+    if (state == nullptr || !state->is_dspark || state->cross_ctx <= 0 ||
+            sequence_start_position < 0 ||
+            sequence_start_position > coverage_start_position ||
+            coverage_start_position > next_position) {
+        return false;
+    }
+
+    const llama_pos horizon_start = (llama_pos) std::max<int64_t>(
+            sequence_start_position,
+            (int64_t) next_position - state->cross_ctx);
+    if (std::max(coverage_start_position, horizon_start) != next_position) {
+        return false;
+    }
+
+    state->sequence_start_position = sequence_start_position;
+    state->next_position = next_position;
+    dflash_clear_target_features(*state);
+    state->coverage_start_position = coverage_start_position;
+    return true;
+}
+
+bool common_speculative_dflash_state_get_view(
+        common_speculative * spec,
+        common_speculative_dflash_state_view & view) {
+    view = {};
+    auto * state = common_speculative_get_dflash_state(spec);
+    if (state == nullptr || !state->is_dspark || !dflash_window_is_valid(*state) ||
+            state->target_layer_ids.size() > (size_t) std::numeric_limits<int32_t>::max()) {
+        return false;
+    }
+
+    try {
+        dflash_materialize_target_window_features(*state);
+    } catch (const std::exception &) {
+        return false;
+    } catch (...) {
+        return false;
+    }
+
+    const size_t row_count = (size_t) state->target_window_rows;
+    const size_t feature_width = (size_t) state->n_target_features;
+    if (row_count > std::numeric_limits<size_t>::max() / feature_width ||
+            state->target_window.size() != row_count * feature_width ||
+            !std::all_of(state->target_window.begin(), state->target_window.end(), [](float value) {
+                return std::isfinite(value);
+            })) {
+        return false;
+    }
+
+    view.data.row_count = state->target_window_rows;
+    view.data.feature_width = state->n_target_features;
+    view.data.cross_ctx = state->cross_ctx;
+    view.data.target_layer_count = (int32_t) state->target_layer_ids.size();
+    view.data.sequence_start_position = state->sequence_start_position;
+    view.data.coverage_start_position = state->coverage_start_position;
+    view.data.window_start_position = state->target_window_rows > 0
+            ? state->target_window_pos.front()
+            : state->next_position;
+    view.data.next_position = state->next_position;
+    view.data.target_layer_ids = state->target_layer_ids.empty() ? nullptr : state->target_layer_ids.data();
+    view.data.positions = state->target_window_pos.empty() ? nullptr : state->target_window_pos.data();
+    view.data.features = state->target_window.empty() ? nullptr : state->target_window.data();
+    view.data.feature_count = state->target_window.size();
+    view.ready = dflash_conditioning_ready(*state);
+    return true;
+}
+
+bool common_speculative_dflash_state_import(
+        common_speculative * spec,
+        const common_speculative_dflash_state_data & data) {
+    auto * state = common_speculative_get_dflash_state(spec);
+    if (state == nullptr || !state->is_dspark || state->cross_ctx <= 0 ||
+            data.row_count < 0 || data.row_count > state->cross_ctx ||
+            data.feature_width != state->n_target_features ||
+            data.cross_ctx != state->cross_ctx ||
+            data.target_layer_count != (int32_t) state->target_layer_ids.size() ||
+            data.sequence_start_position < 0 ||
+            data.sequence_start_position > data.coverage_start_position ||
+            data.coverage_start_position > data.window_start_position ||
+            data.window_start_position > data.next_position) {
+        return false;
+    }
+
+    if (data.target_layer_count > 0 &&
+            (data.target_layer_ids == nullptr || !std::equal(
+                state->target_layer_ids.begin(),
+                state->target_layer_ids.end(),
+                data.target_layer_ids))) {
+        return false;
+    }
+
+    const llama_pos horizon_start = (llama_pos) std::max<int64_t>(
+            data.sequence_start_position,
+            (int64_t) data.next_position - state->cross_ctx);
+    if (data.window_start_position != std::max(data.coverage_start_position, horizon_start) ||
+            (int64_t) data.next_position - data.window_start_position != data.row_count) {
+        return false;
+    }
+
+    const size_t row_count = (size_t) data.row_count;
+    const size_t feature_width = (size_t) data.feature_width;
+    if (row_count > std::numeric_limits<size_t>::max() / feature_width) {
+        return false;
+    }
+    const size_t feature_count = row_count * feature_width;
+    if (data.feature_count != feature_count ||
+            (row_count > 0 && (data.positions == nullptr || data.features == nullptr))) {
+        return false;
+    }
+
+    for (size_t i = 0; i < row_count; ++i) {
+        if (data.positions[i] != data.window_start_position + (llama_pos) i) {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < feature_count; ++i) {
+        if (!std::isfinite(data.features[i])) {
+            return false;
+        }
+    }
+
+    try {
+        std::vector<llama_pos> positions;
+        std::vector<float> features;
+        if (row_count > 0) {
+            positions.assign(data.positions, data.positions + row_count);
+            features.assign(data.features, data.features + feature_count);
+        }
+
+        if (feature_width > std::numeric_limits<size_t>::max() / (size_t) state->cross_ctx) {
+            return false;
+        }
+        std::vector<float> ring((size_t) state->cross_ctx * feature_width);
+        std::copy(features.begin(), features.end(), ring.begin());
+
+        // Reset rebuildable draft state before publishing the prepared
+        // canonical window so a throwing backend reset cannot leave a
+        // partially imported canonical state.
+        llama_reset_dflash_kv_cache_state(state->ctx_dft);
+
+        state->target_window.swap(features);
+        state->target_window_pos.swap(positions);
+        state->target_window_pos_stage.clear();
+        state->target_window_ring.swap(ring);
+        state->target_window_append_features.clear();
+        state->target_window_rows = data.row_count;
+        state->target_window_ring_write_pos = data.row_count % state->cross_ctx;
+        state->target_window_ring_filled = data.row_count;
+        state->target_window_materialized = true;
+        state->sequence_start_position = data.sequence_start_position;
+        state->coverage_start_position = data.coverage_start_position;
+        state->next_position = data.next_position;
+        state->last_target_pos = data.row_count > 0 ? data.next_position - 1 : -1;
+        state->batch.n_tokens = 0;
+        dflash_record_window_update(*state, 0, data.row_count, true);
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
 static int32_t common_speculative_feature_width(const common_speculative * spec) {
     if (const auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
         return dflash_state->n_target_features;
@@ -3028,18 +3259,28 @@ int32_t common_speculative_on_target_batch(
             return -1;
         }
 
-        if (batch.n_seq_id == nullptr || batch.seq_id == nullptr || batch.n_seq_id[0] <= 0 || batch.seq_id[0] == nullptr) {
+        if (batch.pos == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr ||
+                batch.n_seq_id[0] <= 0 || batch.seq_id[0] == nullptr ||
+                batch.pos[0] < dflash_state->sequence_start_position) {
             return -1;
         }
 
         const llama_seq_id seq_id = batch.seq_id[0][0];
         for (int i = 0; i < batch.n_tokens; ++i) {
-            if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr || batch.seq_id[i][0] != seq_id) {
+            if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr || batch.seq_id[i][0] != seq_id ||
+                    (int64_t) batch.pos[i] != (int64_t) batch.pos[0] + i) {
                 return -1;
             }
         }
+        if (batch.pos[batch.n_tokens - 1] == std::numeric_limits<llama_pos>::max()) {
+            return -1;
+        }
+        const llama_pos decoded_next_position = batch.pos[batch.n_tokens - 1] + 1;
 
-        if (!dflash_append_target_features(*dflash_state, features, seq_id)) {
+        if (!dflash_append_target_features(*dflash_state, features, seq_id) ||
+                dflash_state->next_position != decoded_next_position) {
+            dflash_state->next_position = decoded_next_position;
+            dflash_clear_target_features(*dflash_state);
             return -1;
         }
         return 0;
