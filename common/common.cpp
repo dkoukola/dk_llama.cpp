@@ -304,7 +304,8 @@ bool common_speculative_validate_chain(const common_params_speculative & params,
             return fail("speculative stage has n_min greater than n_max");
         }
 
-        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || common_speculative_type_is_dflash_family(stage.type)) && !params.has_dft()) {
+        if ((stage.type == COMMON_SPECULATIVE_TYPE_DRAFT || common_speculative_type_is_dflash_family(stage.type)) &&
+                params.model_dft == nullptr && !params.has_dft()) {
             return fail(common_speculative_type_to_str(stage.type) + " speculative stage requires a draft model or draft params");
         }
 
