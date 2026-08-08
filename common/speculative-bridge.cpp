@@ -1504,6 +1504,10 @@ llama_speculative_status llama_speculative_sampler_create(
             LLAMA_SPECULATIVE_SAMPLER_SUPPRESS_NON_EOG_CONTROL)) != 0) {
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "unknown sampler flag");
     }
+    if ((params->flags & LLAMA_SPECULATIVE_SAMPLER_FIXED_SEED) != 0 &&
+            params->seed == LLAMA_DEFAULT_SEED) {
+        return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "fixed-seed sampling requires an explicit seed");
+    }
     if (params->top_k < -1 || params->penalty_last_n < -1 ||
             (!std::isnan(params->top_p) && !std::isfinite(params->top_p)) ||
             (!std::isnan(params->min_p) && !std::isfinite(params->min_p)) ||
@@ -2107,7 +2111,10 @@ llama_speculative_status llama_speculative_round_begin(
             maximum_draft = std::min(maximum_draft, params->context_token_allowance - 1);
         }
         maximum_draft = std::min(maximum_draft, (uint64_t) llama_n_batch(session->target_context) - 1);
-        if ((params->flags & LLAMA_SPECULATIVE_ROUND_FORCE_TARGET_ONLY) != 0) {
+        if ((session->sampler->params.flags & LLAMA_SPECULATIVE_SAMPLER_FIXED_SEED) != 0 ||
+                (params->flags & LLAMA_SPECULATIVE_ROUND_FORCE_TARGET_ONLY) != 0) {
+            // Multi-token verification can use numerically different target kernels. Preserve
+            // fixed-seed target-stream identity through the canonical one-token path.
             maximum_draft = 0;
         }
         if (maximum_draft > (uint64_t) std::numeric_limits<int32_t>::max()) {

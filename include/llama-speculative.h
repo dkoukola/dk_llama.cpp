@@ -107,6 +107,8 @@ struct llama_speculative_engine_params {
 };
 
 enum {
+    // Guarantees target-stream identity, but does not promise speculative acceleration while
+    // LLAMA_SPECULATIVE_SAMPLER_FIXED_SEED is active.
     LLAMA_SPECULATIVE_CAP_FIXED_SEED_TARGET_IDENTITY = UINT64_C(1) << 0,
     LLAMA_SPECULATIVE_CAP_CANONICAL_STATE = UINT64_C(1) << 1,
     LLAMA_SPECULATIVE_CAP_PORTABLE_CANONICAL_STATE = UINT64_C(1) << 2,
@@ -146,7 +148,9 @@ enum {
 };
 
 struct llama_speculative_sampler_params {
-    uint32_t seed; /* LLAMA_DEFAULT_SEED keeps its legacy randomized-sentinel meaning. */
+    /* LLAMA_DEFAULT_SEED keeps its legacy randomized-sentinel meaning and is invalid with
+     * LLAMA_SPECULATIVE_SAMPLER_FIXED_SEED. */
+    uint32_t seed;
     int32_t top_k;
     int32_t penalty_last_n;
     float top_p;
