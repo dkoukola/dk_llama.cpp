@@ -319,6 +319,9 @@ struct gpt_params {
     float   ban_phrases_bias      = -999.0f; // logit bias applied to ban phrases
     int32_t max_extra_alloc_MiB   =     256; // additional VRAM per GPU the scheduler may allocate for more efficient compute graph evaluation
     int32_t nrep                  =       1; // number of repetitions used in sweep bench
+    int32_t sweep_stride          =       1;
+    bool    sweep_memory          =   false;
+    bool    sweep_bench           =   false;
 
     ggml_backend_sched_eval_callback cb_eval = nullptr;
     void * cb_eval_user_data                 = nullptr;
@@ -367,7 +370,7 @@ struct gpt_params {
         ,uint32_t       // upper codepoint
         ,std::string    // unicode script name
         ,float          // bias
-    >>> allow_ruless;
+    >>> allow_rules;
     std::vector<std::string> allow_pieces;  // each token to allowlist
     std::vector<std::string> allow_kws;     // keywords
     size_t allow_kw_delay;  // minimum n_decoded before first keyword is active
@@ -424,7 +427,8 @@ struct gpt_params {
     bool rope_cache        = false; // if to use RoPE cache (for supported models)
     bool graph_reuse       = true;  // if to reuse compute graphs
     bool dsa               = false; // enable GLM DSA sparse attention (off by default; opt-in via --dsa)
-    bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx pr --fused-indexer-topk)
+    bool fused_idx_topk    = true;  // enable the fused indexer topk op (off by default; opt-in via -fidx or --fused-indexer-topk)
+    bool swa_compress      = false;
     int  dsa_top_k         = -1;    // DSA top-k override (<0 => use the model's configured indexer_top_k)
     int  min_experts       = -1;
     float thresh_experts   = 0;
@@ -489,9 +493,9 @@ struct gpt_params {
 
     // embedding
     bool embedding         = false; // get only sentence embedding
-    int32_t embd_normalize = 2;     // normalisation for embendings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
-    std::string embd_out   = "";    // empty = default, "array" = [[],[]...], "json" = openai style, "json+" = same "json" + cosine similarity matrix
-    std::string embd_sep   = "\n";  // separator of embendings
+    int32_t embd_normalize = 2;     // normalization for embeddings (-1=none, 0=max absolute int16, 1=taxicab, 2=euclidean, >2=p-norm)
+    std::string embd_out   = "";    // empty = default, "array" = [[],[]...], "json" = OpenAI style, "json+" = same "json" + cosine similarity matrix
+    std::string embd_sep   = "\n";  // separator of embeddings
 
     // server params
     int32_t port           = 8080;         // server listens on this network port

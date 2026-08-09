@@ -2,6 +2,7 @@
 
 #include "llama-context.h"
 #include "llama-model.h"
+#include "llama-spec-features-dflash.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -51,9 +52,34 @@ int main() {
 
     CHECK(!llama_context_get_memory_info(nullptr, nullptr));
     CHECK(!llama_context_get_memory_info(nullptr, &info));
+    CHECK(!llama_supports_full_state_io(nullptr));
 
     llama_model model = {};
     llama_context ctx(model);
+
+    CHECK(llama_supports_full_state_io(&ctx));
+    model.arch = LLM_ARCH_OPENPANGU;
+    CHECK(!llama_supports_full_state_io(&ctx));
+    model.arch = LLM_ARCH_UNKNOWN;
+
+    llama_model target_a = {};
+    llama_model target_b = {};
+    llama_model draft = {};
+    ggml_tensor target_a_tok = {};
+    ggml_tensor target_b_tok = {};
+    target_a.tok_embd = &target_a_tok;
+    target_b.tok_embd = &target_b_tok;
+    draft.arch = LLM_ARCH_DFLASH_DRAFT;
+    CHECK(llama_model_share_dflash_io_tensors(&draft, &target_a));
+    CHECK(llama_model_dflash_io_mode(&draft, &target_a) == LLAMA_DFLASH_IO_MODE_SHARED);
+    CHECK(llama_model_share_dflash_io_tensors(&draft, &target_a));
+    target_a.tok_embd = &target_b_tok;
+    CHECK(!llama_model_share_dflash_io_tensors(&draft, &target_a));
+    target_a.tok_embd = &target_a_tok;
+    target_a.output = &target_b_tok;
+    CHECK(!llama_model_share_dflash_io_tensors(&draft, &target_a));
+    target_a.output = nullptr;
+    CHECK(!llama_model_share_dflash_io_tensors(&draft, &target_b));
 
     llama_context_memory_info undersized = {};
     undersized.struct_size = LLAMA_CONTEXT_MEMORY_INFO_STRUCT_SIZE_V1 - 1;
@@ -186,6 +212,7 @@ int main() {
     // container nodes are intentionally outside the accounting scope; their vector payloads are
     // still included.
     ctx.cparams.devices.emplace_back(64, 'd');
+    ctx.kv_self.row_count.reserve(7);
     ctx.kv_self.split_k_l.resize(1);
     ctx.kv_self.split_k_l[0].tensor_splits.reserve(2);
     ctx.kv_self.split_k_l[0].ranges.resize(1);
@@ -201,6 +228,7 @@ int main() {
     ctx.dsv4.raw.sinfo_write.idxs.resize(1);
     ctx.dsv4.raw.sinfo_write.idxs[0].reserve(5);
     ctx.dsv4.cache.csa_k.reserve(2);
+    ctx.swa_compact_buf.reserve(19);
     ctx.embd_seq[42].reserve(6);
 
     llama_context_memory_info auxiliaries = {};
@@ -209,6 +237,7 @@ int main() {
     const uint64_t expected_auxiliary_delta =
             ctx.cparams.devices.capacity()*sizeof(ctx.cparams.devices[0]) +
             ctx.cparams.devices[0].capacity() + 1 +
+            ctx.kv_self.row_count.capacity()*sizeof(ctx.kv_self.row_count[0]) +
             ctx.kv_self.split_k_l.capacity()*sizeof(ctx.kv_self.split_k_l[0]) +
             ctx.kv_self.split_k_l[0].tensor_splits.capacity()*
                     sizeof(ctx.kv_self.split_k_l[0].tensor_splits[0]) +
@@ -233,6 +262,7 @@ int main() {
             ctx.dsv4.raw.sinfo_write.idxs[0].capacity()*
                     sizeof(ctx.dsv4.raw.sinfo_write.idxs[0][0]) +
             ctx.dsv4.cache.csa_k.capacity()*sizeof(ctx.dsv4.cache.csa_k[0]) +
+            ctx.swa_compact_buf.capacity()*sizeof(ctx.swa_compact_buf[0]) +
             ctx.embd_seq[42].capacity()*sizeof(ctx.embd_seq[42][0]);
     CHECK(auxiliaries.host_bytes == extended.info.host_bytes + expected_auxiliary_delta);
     CHECK(auxiliaries.device_bytes == extended.info.device_bytes);

@@ -72,6 +72,7 @@ struct llm_build_context {
     const int32_t n_outputs;
     const int32_t n_outputs_enc;
     const int32_t kv_head;  // index of where we store new KV data in the cache
+    const int32_t swa_head; // same, for --swa-compress layers; equals kv_head otherwise
     const int32_t n_ctx_orig;
 
     const bool flash_attn;
@@ -129,6 +130,15 @@ struct llm_build_context {
 
     struct ggml_tensor * build_inp_embd_mtp(struct ggml_tensor * mtp_tok_embd);
 
+    struct ggml_tensor * build_inp_mtp_states(int64_t n_hidden);
+
+    struct ggml_tensor * build_mtp_input(
+            const struct llama_layer & mtp_layer,
+            struct ggml_tensor * hidden_state,
+            struct ggml_tensor * token_embd,
+            int il,
+            const char * output_name = "mtp_eh_proj");
+
     ggml_tensor * build_inp_pos();
 
     ggml_tensor * build_input_scale(int n_tokens);
@@ -142,6 +152,8 @@ struct llm_build_context {
     ggml_tensor * build_inp_KQ_mask_swa(bool causal = true);
 
     ggml_tensor * build_inp_KQ_mask_swa_win(int64_t n_kv_win, bool causal = true);
+
+    ggml_tensor * build_swa_mask_for_graph(uint32_t window, bool compacted, bool * windowed);
 
     ggml_tensor * build_inp_mean();
 
@@ -427,6 +439,15 @@ struct llm_build_context {
 
     ggml_cgraph * build_step35();
 
+    ggml_tensor * build_step35_mtp(
+            const llama_layer & mtp_layer,
+            ggml_tensor * hidden_states_from_main_model,
+            ggml_cgraph * gf,
+            ggml_tensor * inp_pos,
+            bool reduce_output = true,
+            bool emit_logits = true,
+            ggml_tensor ** hidden_out = nullptr);
+
     //
     static ggml_tensor * llm_build_lora_mm(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * w, ggml_tensor * cur);
@@ -575,7 +596,7 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
-            bool is_multi = false, ggml_tensor * post_norm = nullptr);
+            bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 

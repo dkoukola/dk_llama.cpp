@@ -98,6 +98,10 @@ enum {
 };
 
 struct llama_speculative_engine_params {
+    /* Target and auxiliary models must remain alive until engine destruction. A DFlash-family
+     * auxiliary whose missing IO tensors are borrowed or cloned from the target becomes bound
+     * to that target; keep the target alive until the auxiliary is freed, and reload the
+     * auxiliary model instead of rebinding it to another target. */
     const struct llama_model * target_model;
     const struct llama_speculative_model_binding * auxiliary_models;
     uint32_t auxiliary_model_count;

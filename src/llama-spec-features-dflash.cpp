@@ -164,6 +164,76 @@ int32_t llama_model_dflash_io_mode(
     return LLAMA_DFLASH_IO_MODE_MIXED;
 }
 
+struct llama_dflash_io_clone {
+    std::unique_ptr<ggml_tensor> tensor;
+    ggml_backend_buffer_t buffer = nullptr;
+
+    ~llama_dflash_io_clone() {
+        if (buffer != nullptr) {
+            ggml_backend_buffer_free(buffer);
+        }
+    }
+};
+
+static bool llama_dflash_io_can_clone(const ggml_tensor * source) {
+    if (source == nullptr || source->buffer == nullptr) {
+        return false;
+    }
+    // Split tensors do not have a generally invertible host materialization path. In
+    // particular, CUDA aborts for repacked and explicit-range split weights.
+    for (const ggml_tensor * tensor = source; tensor != nullptr; tensor = tensor->view_src) {
+        if (tensor->extra != nullptr) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static ggml_tensor * llama_dflash_clone_io_tensor(
+        ggml_tensor * source,
+        ggml_backend_buffer_type_t buft,
+        llama_dflash_io_clone & clone,
+        const char * name) {
+    if (!llama_dflash_io_can_clone(source) || buft == nullptr) {
+        return nullptr;
+    }
+
+    clone.tensor = std::make_unique<ggml_tensor>(*source);
+    clone.buffer =
+            ggml_backend_buft_alloc_buffer(buft, ggml_backend_buft_get_alloc_size(buft, source));
+    if (clone.buffer == nullptr) {
+        clone.tensor.reset();
+        return nullptr;
+    }
+
+    clone.tensor->buffer = nullptr;
+    clone.tensor->data = nullptr;
+    clone.tensor->op = GGML_OP_NONE;
+    clone.tensor->grad = nullptr;
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        clone.tensor->src[j] = nullptr;
+    }
+    clone.tensor->view_src = nullptr;
+    clone.tensor->view_offs = 0;
+    clone.tensor->extra = nullptr;
+    // The clone owns a different backend buffer. Never inherit the source tensor's
+    // node-local mirror table or its lifetime.
+    clone.tensor->data_numa = nullptr;
+    ggml_set_name(clone.tensor.get(), name);
+    ggml_backend_buffer_set_usage(clone.buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_backend_tensor_alloc(
+            clone.buffer, clone.tensor.get(), ggml_backend_buffer_get_base(clone.buffer));
+
+    ggml_backend_tensor_copy(source, clone.tensor.get());
+
+    return clone.tensor.get();
+}
+
+static bool llama_dflash_io_needs_clone(const ggml_tensor * tensor, ggml_backend_buffer_type_t buft) {
+    return tensor != nullptr && tensor->buffer != nullptr && buft != nullptr &&
+           ggml_backend_buffer_get_type(tensor->buffer) != buft;
+}
+
 bool llama_model_dflash_io_tensors_match(
         const struct llama_model * draft_model,
         int32_t n_embd,
@@ -188,6 +258,15 @@ bool llama_model_share_dflash_io_tensors(
 
     if (draft_model->arch != LLM_ARCH_DFLASH_DRAFT) {
         return true;
+    }
+
+    if (draft_model->dflash_io_target_model != nullptr) {
+        if (draft_model->dflash_io_target_model != target_model ||
+                draft_model->dflash_io_target_tok_embd != target_model->tok_embd ||
+                draft_model->dflash_io_target_output != target_model->output ||
+                draft_model->dflash_io_target_output_mtp != target_model->output_mtp) {
+            return false;
+        }
     }
 
     // Resolve the complete candidate set before publishing any borrowed target pointer.
@@ -220,20 +299,108 @@ bool llama_model_share_dflash_io_tensors(
         }
     }
 
+    const bool output_mtp_aliases_output = output_mtp == output;
+    const bool tok_embd_is_shared = tok_embd == target_model->tok_embd;
+    const bool output_is_shared = output == target_model->output ||
+            output == target_model->tok_embd;
+    const bool output_mtp_is_shared = output_mtp == target_model->output_mtp ||
+            output_mtp == target_model->output ||
+            output_mtp == target_model->tok_embd;
+    const bool binds_target_io = tok_embd_is_shared || output_is_shared || output_mtp_is_shared;
+    const bool isolate_shared_io =
+            (tok_embd_is_shared && llama_dflash_io_needs_clone(tok_embd, draft_model->buft_input.buft)) ||
+            (output_is_shared && llama_dflash_io_needs_clone(output, draft_model->buft_output.buft)) ||
+            (output_mtp_is_shared && llama_dflash_io_needs_clone(output_mtp, draft_model->buft_output.buft));
+    const bool clone_tok_embd = tok_embd_is_shared &&
+            (isolate_shared_io || llama_dflash_io_needs_clone(tok_embd, draft_model->buft_input.buft));
+    const bool clone_output = output_is_shared &&
+            (isolate_shared_io || llama_dflash_io_needs_clone(output, draft_model->buft_output.buft));
+    const bool clone_output_mtp = !output_mtp_aliases_output && output_mtp_is_shared &&
+            (isolate_shared_io || llama_dflash_io_needs_clone(output_mtp, draft_model->buft_output.buft));
+
+    // Reject unsupported sources before allocating any potentially large clone.
+    if ((clone_tok_embd && (draft_model->dflash_tok_embd_ptr != nullptr ||
+                            !llama_dflash_io_can_clone(tok_embd))) ||
+            (clone_output && (draft_model->dflash_output_ptr != nullptr ||
+                              !llama_dflash_io_can_clone(output))) ||
+            (clone_output_mtp && (draft_model->dflash_output_mtp_ptr != nullptr ||
+                                  !llama_dflash_io_can_clone(output_mtp)))) {
+        return false;
+    }
+
+    llama_dflash_io_clone tok_embd_clone;
+    llama_dflash_io_clone output_clone;
+    llama_dflash_io_clone output_mtp_clone;
+
+    if (clone_tok_embd) {
+        ggml_tensor * source = tok_embd;
+        tok_embd = llama_dflash_clone_io_tensor(
+                source, draft_model->buft_input.buft, tok_embd_clone,
+                "dflash_tok_embd");
+        if (tok_embd == nullptr) {
+            return false;
+        }
+    }
+
+    if (clone_output) {
+        ggml_tensor * source = output;
+        output = llama_dflash_clone_io_tensor(
+                source, draft_model->buft_output.buft, output_clone,
+                "dflash_output");
+        if (output == nullptr) {
+            return false;
+        }
+        if (output_mtp_aliases_output) {
+            output_mtp = output;
+        }
+    }
+
+    if (clone_output_mtp) {
+        ggml_tensor * source = output_mtp;
+        output_mtp = llama_dflash_clone_io_tensor(
+                source, draft_model->buft_output.buft, output_mtp_clone,
+                "dflash_output_mtp");
+        if (output_mtp == nullptr) {
+            return false;
+        }
+    }
+
     const ggml_tensor * target_output = llama_dflash_output_tensor(target_model);
     const bool shared_tok = tok_embd == target_model->tok_embd;
     const bool shared_output = output_mtp == target_output;
-
     if (tok_embd == nullptr || output_mtp == nullptr ||
         target_model->tok_embd == nullptr || target_output == nullptr ||
         shared_tok != shared_output) {
         return false;
     }
 
+    const size_t clone_count = (size_t) clone_tok_embd +
+            (size_t) clone_output + (size_t) clone_output_mtp;
+    draft_model->bufs.reserve(draft_model->bufs.size() + clone_count);
+    const auto commit_clone = [draft_model](
+            llama_dflash_io_clone & clone,
+            std::unique_ptr<ggml_tensor> & storage) {
+        if (clone.tensor == nullptr) {
+            return;
+        }
+        draft_model->bufs.push_back(clone.buffer);
+        clone.buffer = nullptr;
+        storage = std::move(clone.tensor);
+    };
+    commit_clone(tok_embd_clone, draft_model->dflash_tok_embd_ptr);
+    commit_clone(output_clone, draft_model->dflash_output_ptr);
+    commit_clone(output_mtp_clone, draft_model->dflash_output_mtp_ptr);
+
     draft_model->tok_embd = tok_embd;
     draft_model->output = output;
     draft_model->output_mtp = output_mtp;
-    return true;
+    if (binds_target_io) {
+        draft_model->dflash_io_target_model = target_model;
+        draft_model->dflash_io_target_tok_embd = target_model->tok_embd;
+        draft_model->dflash_io_target_output = target_model->output;
+        draft_model->dflash_io_target_output_mtp = target_model->output_mtp;
+    }
+    return llama_dflash_output_tensor(draft_model) != nullptr;
 }
 
 static bool llama_set_dflash_target_features_impl(
