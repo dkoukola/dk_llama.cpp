@@ -10719,6 +10719,7 @@ static ggml_backend_i ggml_backend_vk_interface = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .event_synchronize       = */ NULL,
+    /* .get_memory_info         = */ NULL,
 };
 
 static ggml_guid_t ggml_backend_vk_guid() {

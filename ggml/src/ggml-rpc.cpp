@@ -933,6 +933,7 @@ static ggml_backend_i ggml_backend_rpc_interface = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .event_synchronize       = */ NULL,
+    /* .get_memory_info         = */ NULL,
 };
 
 GGML_API GGML_CALL ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, uint32_t device) {

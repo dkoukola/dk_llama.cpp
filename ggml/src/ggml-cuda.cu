@@ -5224,6 +5224,7 @@ static ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .event_synchronize       = */ ggml_backend_cuda_event_synchronize,
+    /* .get_memory_info         = */ nullptr,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {

@@ -192,6 +192,21 @@ void ggml_backend_free(ggml_backend_t backend) {
     backend->iface.free(backend);
 }
 
+bool ggml_backend_get_memory_info(
+        ggml_backend_t backend,
+        struct ggml_backend_memory_info * info) {
+    if (backend == NULL || info == NULL || backend->iface.get_memory_info == NULL) {
+        return false;
+    }
+
+    struct ggml_backend_memory_info result = {};
+    if (!backend->iface.get_memory_info(backend, &result)) {
+        return false;
+    }
+    *info = result;
+    return true;
+}
+
 ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend) {
     return backend->iface.get_default_buffer_type(backend);
 }
@@ -930,6 +945,27 @@ GGML_CALL static bool ggml_backend_cpu_supports_buft(ggml_backend_t backend, ggm
     GGML_UNUSED(backend);
 }
 
+GGML_CALL static bool ggml_backend_cpu_get_memory_info(
+        ggml_backend_t backend,
+        struct ggml_backend_memory_info * info) {
+    if (backend == NULL || info == NULL || backend->context == NULL) {
+        return false;
+    }
+
+    const struct ggml_backend_cpu_context * cpu_ctx =
+            (const struct ggml_backend_cpu_context *) backend->context;
+    const uint64_t fixed_bytes = sizeof(*backend) + sizeof(*cpu_ctx);
+    if (cpu_ctx->work_size > UINT64_MAX - fixed_bytes) {
+        return false;
+    }
+
+    info->flags = GGML_BACKEND_MEMORY_INFO_FLAG_HOST_BYTES_VALID |
+                  GGML_BACKEND_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID;
+    info->host_bytes = fixed_bytes + cpu_ctx->work_size;
+    info->device_bytes = 0;
+    return true;
+}
+
 static struct ggml_backend_i cpu_backend_i = {
     /* .get_name                = */ ggml_backend_cpu_name,
     /* .free                    = */ ggml_backend_cpu_free,
@@ -951,6 +987,7 @@ static struct ggml_backend_i cpu_backend_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .event_synchronize       = */ NULL,
+    /* .get_memory_info         = */ ggml_backend_cpu_get_memory_info,
 };
 
 static ggml_guid_t ggml_backend_cpu_guid(void) {
@@ -1092,6 +1129,45 @@ GGML_CALL bool ggml_backend_buffer_is_multi_buffer(ggml_backend_buffer_t buffer)
     return buffer->iface.get_name == ggml_backend_multi_buffer_get_name;
 }
 
+static bool ggml_backend_buffer_metadata_add(size_t * total, size_t count, size_t item_size) {
+    if (count != 0 && item_size > SIZE_MAX/count) {
+        return false;
+    }
+    const size_t bytes = count*item_size;
+    if (*total > SIZE_MAX - bytes) {
+        return false;
+    }
+    *total += bytes;
+    return true;
+}
+
+bool ggml_backend_buffer_get_metadata_size(ggml_backend_buffer_t buffer, size_t * size) {
+    if (buffer == NULL || size == NULL) {
+        return false;
+    }
+
+    size_t total = sizeof(*buffer);
+    if (ggml_backend_buffer_is_multi_buffer(buffer)) {
+        const ggml_backend_multi_buffer_context_t ctx =
+                (ggml_backend_multi_buffer_context_t) buffer->context;
+        if (ctx == NULL ||
+            !ggml_backend_buffer_metadata_add(&total, 1, sizeof(*ctx)) ||
+            !ggml_backend_buffer_metadata_add(&total, ctx->n_buffers, sizeof(ctx->buffers[0]))) {
+            return false;
+        }
+        for (size_t i = 0; i < ctx->n_buffers; ++i) {
+            size_t child_size = 0;
+            if (!ggml_backend_buffer_get_metadata_size(ctx->buffers[i], &child_size) ||
+                !ggml_backend_buffer_metadata_add(&total, 1, child_size)) {
+                return false;
+            }
+        }
+    }
+
+    *size = total;
+    return true;
+}
+
 GGML_CALL void ggml_backend_multi_buffer_set_usage(ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage) {
     GGML_ASSERT(ggml_backend_buffer_is_multi_buffer(buffer));
     ggml_backend_multi_buffer_context_t ctx = (ggml_backend_multi_buffer_context_t) buffer->context;
@@ -1162,6 +1238,7 @@ struct ggml_backend_sched {
 
     int * prev_node_backend_ids; // [graph_size]
     int * prev_leaf_backend_ids; // [graph_size]
+    size_t nodes_capacity;
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
@@ -2553,7 +2630,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     GGML_ASSERT(n_backends <= GGML_SCHED_MAX_BACKENDS);
     GGML_ASSERT(ggml_backend_is_cpu(backends[n_backends - 1])); // last backend must be CPU
 
-    struct ggml_backend_sched * sched = (ggml_backend_sched *)calloc(1, sizeof(struct ggml_backend_sched));
+    struct ggml_backend_sched * sched = new ggml_backend_sched {};
 
     for (int i = 0; i < (GGML_OP_COUNT + 31)/32; ++i) sched->op_offload[i] = 0xffffffff;
 
@@ -2568,6 +2645,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hv_tensor_copies      = (ggml_tensor **)malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
 
     const size_t nodes_size = graph_size + GGML_SCHED_MAX_SPLITS*GGML_SCHED_MAX_SPLIT_INPUTS*2;
+    sched->nodes_capacity = nodes_size;
     sched->node_backend_ids = (int *)calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
     sched->leaf_backend_ids = (int *)calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
     sched->prev_node_backend_ids = (int *)calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
@@ -2629,7 +2707,7 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     free(sched->context_buffer);
     free(sched->graph.nodes);
     free(sched->graph.leafs);
-    free(sched);
+    delete sched;
 }
 
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
@@ -2822,6 +2900,115 @@ size_t ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(backend_index >= 0 && backend_index < sched->n_backends);
 
     return ggml_gallocr_get_buffer_size(sched->galloc, backend_index);
+}
+
+static bool ggml_backend_memory_info_add(uint64_t * total, size_t count, size_t item_size) {
+    if (count != 0 && item_size > UINT64_MAX/count) {
+        return false;
+    }
+    const uint64_t bytes = (uint64_t) count*item_size;
+    if (*total > UINT64_MAX - bytes) {
+        return false;
+    }
+    *total += bytes;
+    return true;
+}
+
+static bool ggml_backend_memory_info_multiply(size_t lhs, size_t rhs, size_t * product) {
+    if (lhs != 0 && rhs > SIZE_MAX/lhs) {
+        return false;
+    }
+    *product = lhs*rhs;
+    return true;
+}
+
+static bool ggml_backend_memory_info_add_buffer(
+        struct ggml_backend_memory_info * info,
+        ggml_backend_buffer_t buffer) {
+    if (buffer == NULL) {
+        return true;
+    }
+    size_t metadata_size = 0;
+    if (!ggml_backend_buffer_get_metadata_size(buffer, &metadata_size) ||
+        !ggml_backend_memory_info_add(&info->host_bytes, 1, metadata_size)) {
+        return false;
+    }
+    uint64_t * total = ggml_backend_buffer_is_host(buffer) ? &info->host_bytes : &info->device_bytes;
+    return ggml_backend_memory_info_add(total, 1, ggml_backend_buffer_get_size(buffer));
+}
+
+bool ggml_backend_sched_get_memory_info(
+        ggml_backend_sched_t sched,
+        struct ggml_backend_memory_info * info) {
+    if (sched == NULL || info == NULL || sched->n_backends < 0 || sched->n_copies < 0 ||
+            sched->splits_capacity < 0 || sched->graph.size < 0) {
+        return false;
+    }
+
+    struct ggml_backend_memory_info result = {};
+    result.flags = GGML_BACKEND_MEMORY_INFO_FLAG_HOST_BYTES_VALID |
+                   GGML_BACKEND_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID;
+
+    size_t galloc_metadata = 0;
+    size_t tensor_copies_per_hash = 0;
+    if (!ggml_backend_memory_info_multiply(
+                (size_t) sched->n_backends, (size_t) sched->n_copies, &tensor_copies_per_hash) ||
+        !ggml_backend_memory_info_multiply(
+                tensor_copies_per_hash, sizeof(sched->hv_tensor_copies[0]), &tensor_copies_per_hash) ||
+        !ggml_gallocr_get_metadata_size(sched->galloc, &galloc_metadata) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, 1, sizeof(*sched)) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, sched->hash_set.size, sizeof(sched->hash_set.keys[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, ggml_bitset_size(sched->hash_set.size), sizeof(sched->hash_set.used[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, sched->hash_set.size, sizeof(sched->hv_tensor_backend_ids[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes,
+                sched->hash_set.size,
+                tensor_copies_per_hash) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, sched->nodes_capacity, 4*sizeof(sched->node_backend_ids[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, 1, sched->context_buffer_size) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, (size_t) sched->splits_capacity, sizeof(sched->splits[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, (size_t) sched->graph.size, 2*sizeof(sched->graph.nodes[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, 1, galloc_metadata) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, sched->workers.capacity(), sizeof(sched->workers[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, sched->statuses.capacity(), sizeof(sched->statuses[0])) ||
+        !ggml_backend_memory_info_add(&result.host_bytes, sched->backend_splits.capacity(), sizeof(sched->backend_splits[0]))) {
+        return false;
+    }
+
+    for (const auto & splits : sched->backend_splits) {
+        if (!ggml_backend_memory_info_add(&result.host_bytes, splits.capacity(), sizeof(splits[0]))) {
+            return false;
+        }
+    }
+
+    for (int i = 0; i < sched->n_backends; ++i) {
+        const size_t buffer_size = ggml_gallocr_get_buffer_size(sched->galloc, i);
+        uint64_t * total = ggml_backend_buft_is_host(sched->bufts[i])
+                ? &result.host_bytes
+                : &result.device_bytes;
+        if (!ggml_backend_memory_info_add(total, 1, buffer_size)) {
+            return false;
+        }
+
+        ggml_backend_buffer_t input_buffer = sched->input_memory_bufs[i];
+        bool first = input_buffer != NULL;
+        for (int j = 0; first && j < i; ++j) {
+            first = input_buffer != sched->input_memory_bufs[j];
+        }
+        if (first && !ggml_backend_memory_info_add_buffer(&result, input_buffer)) {
+            return false;
+        }
+
+        // Backend events and other private scheduler resources are currently fully known only
+        // for the CPU backend. Keep the lower bounds above, but do not claim completeness for
+        // an accelerator scheduler until that backend provides scheduler-resource accounting.
+        if (!ggml_backend_is_cpu(sched->backends[i])) {
+            result.flags &= ~(GGML_BACKEND_MEMORY_INFO_FLAG_HOST_BYTES_VALID |
+                              GGML_BACKEND_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID);
+        }
+    }
+
+    *info = result;
+    return true;
 }
 
 void ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend) {

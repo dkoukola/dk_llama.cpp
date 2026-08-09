@@ -5038,6 +5038,10 @@ void ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor) {
     }
 }
 
+size_t ggml_numa_tensor_mirror_metadata_size(const struct ggml_tensor * tensor) {
+    return tensor != NULL && tensor->data_numa != NULL ? sizeof(struct ggml_numa_mirror) : 0;
+}
+
 // Cold path only (state restore, K-shift, cache clear): re-copy node 0's bytes into every
 // other node copy of a mirrored tensor, so writes that bypass the graph CPY replication don't
 // leave stale node-local data. No-op when the tensor isn't mirrored. Not on any per-token path.

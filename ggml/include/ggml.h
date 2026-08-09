@@ -956,6 +956,8 @@ extern "C" {
     // attach/detach per-node copies to a tensor. node_data must have ggml_numa_node_count() entries.
     GGML_API void     ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data);
     GGML_API void     ggml_numa_tensor_clear_mirror(struct ggml_tensor * tensor);
+    // persistent host metadata allocated by ggml_numa_tensor_set_mirror(), or zero
+    GGML_API size_t   ggml_numa_tensor_mirror_metadata_size(const struct ggml_tensor * tensor);
     // re-sync node copies after a write that bypassed graph-CPY replication (state restore, K-shift, clear)
     GGML_API void     ggml_numa_tensor_resync(struct ggml_tensor * tensor);
 

@@ -13,6 +13,20 @@ extern "C" {
     typedef struct ggml_backend * ggml_backend_t;
     typedef void * ggml_backend_graph_plan_t;
 
+    enum ggml_backend_memory_info_flags {
+        GGML_BACKEND_MEMORY_INFO_FLAG_HOST_BYTES_VALID   = 1u << 0,
+        GGML_BACKEND_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID = 1u << 1,
+    };
+
+    // Persistent allocations exclusively owned by a backend object or scheduler. Buffer
+    // payloads owned by a caller are not included in a backend object's result. On a successful
+    // query, a field is a best-known lower bound unless its corresponding validity flag is set.
+    struct ggml_backend_memory_info {
+        uint32_t flags;
+        uint64_t host_bytes;
+        uint64_t device_bytes;
+    };
+
     //
     // Backend buffer
     //
@@ -46,6 +60,10 @@ extern "C" {
     GGML_API           enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
     GGML_API           ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API           void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
+    // Generic host-side wrapper allocations, excluding the buffer payload returned by
+    // ggml_backend_buffer_get_size() and backend-private metadata.
+    GGML_API           bool                           ggml_backend_buffer_get_metadata_size(
+            ggml_backend_buffer_t buffer, size_t * size);
 
     //
     // Backend
@@ -54,6 +72,12 @@ extern "C" {
     GGML_API ggml_guid_t  ggml_backend_guid(ggml_backend_t backend);
     GGML_API const char * ggml_backend_name(ggml_backend_t backend);
     GGML_API void         ggml_backend_free(ggml_backend_t backend);
+
+    // Returns false, without producing a valid lower bound, when the callback is unsupported or
+    // the arguments/query fail. On true, inspect the validity flags before using either field.
+    GGML_API bool ggml_backend_get_memory_info(
+            ggml_backend_t backend,
+            struct ggml_backend_memory_info * info);
 
     GGML_API ggml_backend_buffer_type_t ggml_backend_get_default_buffer_type(ggml_backend_t backend);
     GGML_API ggml_backend_buffer_t      ggml_backend_alloc_buffer(ggml_backend_t backend, size_t size);
@@ -194,6 +218,9 @@ extern "C" {
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
 
     GGML_API size_t               ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
+    GGML_API bool                 ggml_backend_sched_get_memory_info(
+            ggml_backend_sched_t sched,
+            struct ggml_backend_memory_info * info);
 
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);

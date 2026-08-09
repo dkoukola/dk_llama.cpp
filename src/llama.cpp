@@ -8657,6 +8657,428 @@ void llama_free(struct llama_context * ctx) {
     delete ctx;
 }
 
+namespace {
+
+struct llama_context_memory_accumulator {
+    uint64_t host_bytes        = 0;
+    uint64_t device_bytes      = 0;
+    uint64_t numa_mirror_bytes = 0;
+    bool host_valid            = true;
+    bool device_valid          = true;
+
+    bool add_host(uint64_t bytes) {
+        return add_checked(host_bytes, bytes);
+    }
+
+    bool add_device(uint64_t bytes) {
+        return add_checked(device_bytes, bytes);
+    }
+
+    bool add_numa_mirror(uint64_t bytes) {
+        if (UINT64_MAX - numa_mirror_bytes < bytes || UINT64_MAX - host_bytes < bytes) {
+            return false;
+        }
+        numa_mirror_bytes += bytes;
+        host_bytes += bytes;
+        return true;
+    }
+
+    bool add_backend_buffer(ggml_backend_buffer_t buffer) {
+        if (buffer == nullptr || !backend_buffers.insert(buffer).second) {
+            return true;
+        }
+
+        size_t metadata_bytes = 0;
+        if (!ggml_backend_buffer_get_metadata_size(buffer, &metadata_bytes) ||
+            !add_host(metadata_bytes)) {
+            return false;
+        }
+        const uint64_t bytes = ggml_backend_buffer_get_size(buffer);
+        return ggml_backend_buffer_is_host(buffer) ? add_host(bytes) : add_device(bytes);
+    }
+
+    bool add_backend_buffers(const std::vector<ggml_backend_buffer_t> & buffers) {
+        for (ggml_backend_buffer_t buffer : buffers) {
+            if (!add_backend_buffer(buffer)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool add_ggml_context(const ggml_context * context) {
+        if (context == nullptr || !ggml_contexts.insert(context).second) {
+            return true;
+        }
+        if (!add_host(ggml_get_mem_size(context))) {
+            return false;
+        }
+        for (ggml_tensor * tensor = ggml_get_first_tensor(context);
+             tensor != nullptr;
+             tensor = ggml_get_next_tensor(context, tensor)) {
+            if (!add_host(ggml_numa_tensor_mirror_metadata_size(tensor))) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool add_ggml_contexts(const std::vector<ggml_context *> & contexts) {
+        for (const ggml_context * context : contexts) {
+            if (!add_ggml_context(context)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template<typename T>
+    bool add_host_vector(const std::vector<T> & values) {
+        if (values.capacity() > UINT64_MAX / sizeof(T)) {
+            return false;
+        }
+        return add_host((uint64_t) values.capacity() * sizeof(T));
+    }
+
+    template<typename T>
+    bool add_nested_host_vectors(const std::vector<std::vector<T>> & values) {
+        if (!add_host_vector(values)) {
+            return false;
+        }
+        for (const auto & value : values) {
+            if (!add_host_vector(value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool add_host_string(const std::string & value) {
+        if (value.capacity() == 0) {
+            return true;
+        }
+
+        const uintptr_t object_begin = reinterpret_cast<uintptr_t>(&value);
+        const uintptr_t object_end   = object_begin + sizeof(value);
+        const uintptr_t data         = reinterpret_cast<uintptr_t>(value.data());
+        if (data >= object_begin && data < object_end) {
+            return true;
+        }
+        if (value.capacity() >= UINT64_MAX) {
+            return false;
+        }
+        return add_host((uint64_t) value.capacity() + 1);
+    }
+
+    bool add_host_string_vector(const std::vector<std::string> & values) {
+        if (!add_host_vector(values)) {
+            return false;
+        }
+        for (const std::string & value : values) {
+            if (!add_host_string(value)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool add_split_tensors(const std::vector<llama_split_tensor> & tensors) {
+        if (!add_host_vector(tensors)) {
+            return false;
+        }
+        for (const llama_split_tensor & tensor : tensors) {
+            if (!add_host_vector(tensor.tensor_splits) ||
+                !add_nested_host_vectors(tensor.ranges)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool add_backend(ggml_backend_t backend) {
+        if (backend == nullptr || !backends.insert(backend).second) {
+            return true;
+        }
+
+        ggml_backend_memory_info info = {};
+        if (!ggml_backend_get_memory_info(backend, &info)) {
+            host_valid = false;
+            device_valid = false;
+            return true;
+        }
+        return add_backend_memory_info(info);
+    }
+
+    bool add_scheduler(ggml_backend_sched_t sched) {
+        if (sched == nullptr || !schedulers.insert(sched).second) {
+            return true;
+        }
+
+        ggml_backend_memory_info info = {};
+        if (!ggml_backend_sched_get_memory_info(sched, &info)) {
+            return false;
+        }
+        return add_backend_memory_info(info);
+    }
+
+private:
+    bool add_backend_memory_info(const ggml_backend_memory_info & info) {
+        host_valid = host_valid &&
+                (info.flags & GGML_BACKEND_MEMORY_INFO_FLAG_HOST_BYTES_VALID) != 0;
+        device_valid = device_valid &&
+                (info.flags & GGML_BACKEND_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID) != 0;
+        return add_host(info.host_bytes) && add_device(info.device_bytes);
+    }
+
+    static bool add_checked(uint64_t & total, uint64_t bytes) {
+        if (UINT64_MAX - total < bytes) {
+            return false;
+        }
+        total += bytes;
+        return true;
+    }
+
+    std::unordered_set<ggml_backend_buffer_t> backend_buffers;
+    std::unordered_set<const ggml_context *> ggml_contexts;
+    std::unordered_set<ggml_backend_t> backends;
+    std::unordered_set<ggml_backend_sched_t> schedulers;
+};
+
+static bool llama_context_accumulate_checkpoint_host_storage(
+        const llama_kv_cache::gpu_checkpoint & ckpt,
+        llama_context_memory_accumulator & memory) {
+    return memory.add_host_vector(ckpt.cells_snapshot) &&
+           memory.add_host_vector(ckpt.s_l_shadow) &&
+           memory.add_nested_host_vectors(ckpt.split_s_l_shadow) &&
+           memory.add_nested_host_vectors(ckpt.per_step_ssm) &&
+           memory.add_nested_host_vectors(ckpt.per_step_conv) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_state) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_state_shadow) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_delta) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_shadow_ctxs) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_shadow_bufs) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_csa_dst) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_hca_dst) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_lid_dst) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_csa_src) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_hca_src) &&
+           memory.add_host_vector(ckpt.dsv4_per_step_lid_src) &&
+           memory.add_host_vector(ckpt.cpu_state_data) &&
+           memory.add_nested_host_vectors(ckpt.dsv4_state_data) &&
+           memory.add_host_vector(ckpt.dsv4_state_shadow) &&
+           memory.add_host_vector(ckpt.dsv4_shadow_ctxs) &&
+           memory.add_host_vector(ckpt.dsv4_shadow_bufs) &&
+           memory.add_host_vector(ckpt.per_step_ctxs) &&
+           memory.add_host_vector(ckpt.per_step_bufs) &&
+           memory.add_host_vector(ckpt.shadow_ctxs) &&
+           memory.add_host_vector(ckpt.shadow_bufs);
+}
+
+static bool llama_context_accumulate_dflash_host_storage(
+        const llama_context::dflash_runtime & dflash,
+        llama_context_memory_accumulator & memory) {
+    if (!memory.add_host_vector(dflash.target.features_owned) ||
+        !memory.add_host_vector(dflash.target.append_features_owned) ||
+        !memory.add_host_vector(dflash.target.positions_owned) ||
+        !memory.add_host_vector(dflash.target.features_padded) ||
+        !memory.add_host_vector(dflash.target.pos_ctx_data) ||
+        !memory.add_host_vector(dflash.target.kq_mask_data) ||
+        !memory.add_host_vector(dflash.target.kq_mask_swa_data) ||
+        !memory.add_host_vector(dflash.kv.k_ctx_cache) ||
+        !memory.add_host_vector(dflash.kv.v_ctx_cache) ||
+        !memory.add_host_vector(dflash.kv.cache_bufs) ||
+        !memory.add_host_vector(dflash.kv.cache_pos) ||
+        !memory.add_host_vector(dflash.kv.cache_slot_valid) ||
+        !memory.add_host_vector(dflash.kv.cache_compute_meta) ||
+        !memory.add_host_vector(dflash.feature_view_buffer) ||
+        !memory.add_host_vector(dflash.draft_tokens) ||
+        !memory.add_host_vector(dflash.draft_confidence)) {
+        return false;
+    }
+
+    return dflash.capture == nullptr ||
+           (memory.add_host(sizeof(*dflash.capture)) &&
+            memory.add_host_vector(dflash.capture->layer_ids) &&
+            memory.add_nested_host_vectors(dflash.capture->layer_rows) &&
+            memory.add_host_vector(dflash.capture->layer_rows_written) &&
+            memory.add_host_vector(dflash.capture->layer_seen_batch_id));
+}
+
+static bool llama_context_accumulate_dsv4_host_storage(
+        const llama_context::dsv4_runtime & dsv4,
+        llama_context_memory_accumulator & memory) {
+    const auto add_slot_info = [&memory](const llama_context::dsv4_runtime::slot_info & info) {
+        return memory.add_host_vector(info.strm) && memory.add_nested_host_vectors(info.idxs);
+    };
+    const auto add_plan = [&memory](const llama_context::dsv4_runtime::comp_plan & plan) {
+        return memory.add_host_vector(plan.state_pos) &&
+               memory.add_host_vector(plan.state_delta_src_idxs) &&
+               memory.add_host_vector(plan.state_delta_dst_idxs) &&
+               memory.add_host_vector(plan.state_persist_src_idxs) &&
+               memory.add_host_vector(plan.state_persist_dst_idxs) &&
+               memory.add_host_vector(plan.state_read_idxs) &&
+               memory.add_host_vector(plan.state_write_idxs) &&
+               memory.add_host_vector(plan.state_write_pos) &&
+               memory.add_host_vector(plan.n_visible);
+    };
+
+    return memory.add_host_vector(dsv4.raw.write_src_idxs) &&
+           memory.add_host_vector(dsv4.raw.write_dst_idxs) &&
+           memory.add_host_vector(dsv4.raw.read_dst_idxs) &&
+           memory.add_host_vector(dsv4.raw.write_counts) &&
+           memory.add_host_vector(dsv4.raw.read_counts) &&
+           add_slot_info(dsv4.raw.sinfo_write) &&
+           add_slot_info(dsv4.raw.sinfo_read) &&
+           add_slot_info(dsv4.csa_ctx.sinfo) &&
+           add_slot_info(dsv4.hca_ctx.sinfo) &&
+           add_slot_info(dsv4.lid_ctx.sinfo) &&
+           add_plan(dsv4.csa_plan) &&
+           add_plan(dsv4.hca_plan) &&
+           add_plan(dsv4.lid_plan) &&
+           memory.add_host_vector(dsv4.cache.csa_k) &&
+           memory.add_host_vector(dsv4.cache.hca_k) &&
+           memory.add_host_vector(dsv4.cache.lid_k) &&
+           memory.add_host_vector(dsv4.cache.csa_state_kv) &&
+           memory.add_host_vector(dsv4.cache.csa_state_score) &&
+           memory.add_host_vector(dsv4.cache.hca_state_kv) &&
+           memory.add_host_vector(dsv4.cache.hca_state_score) &&
+           memory.add_host_vector(dsv4.cache.lid_state_kv) &&
+           memory.add_host_vector(dsv4.cache.lid_state_score) &&
+           memory.add_host_vector(dsv4.cache.cache_bufs) &&
+           memory.add_host_vector(dsv4.csa_mask_data) &&
+           memory.add_host_vector(dsv4.hca_mask_data);
+}
+
+static bool llama_context_accumulate_host_storage(
+        const llama_context & ctx,
+        llama_context_memory_accumulator & memory) {
+    const auto & kv = ctx.kv_self;
+
+    // Count requested capacities of context-owned contiguous host allocations. Node-based
+    // associative-container storage is outside this query's accounting scope.
+    if (!memory.add_host_string_vector(ctx.cparams.devices) ||
+        !memory.add_host_string_vector(ctx.cparams.devices_draft) ||
+        !memory.add_host_vector(kv.cells) ||
+        !memory.add_host_vector(kv.k_l) ||
+        !memory.add_host_vector(kv.v_l) ||
+        !memory.add_host_vector(kv.s_l) ||
+        !memory.add_host_vector(kv.kr_l) ||
+        !memory.add_split_tensors(kv.split_k_l) ||
+        !memory.add_split_tensors(kv.split_v_l) ||
+        !memory.add_split_tensors(kv.split_s_l) ||
+        !memory.add_split_tensors(kv.replicated_k_l) ||
+        !memory.add_host_vector(kv.ctxs) ||
+        !memory.add_host_vector(kv.bufs) ||
+        !memory.add_host_vector(kv.numa_mirror_bufs) ||
+        !llama_context_accumulate_checkpoint_host_storage(kv.ckpt, memory) ||
+        !memory.add_host_vector(ctx.cvec.tensors) ||
+        !memory.add_host_vector(ctx.cvec.ctxs) ||
+        !memory.add_host_vector(ctx.cvec.bufs) ||
+        !memory.add_host_vector(ctx.scale_data) ||
+        !memory.add_host_vector(ctx.backends) ||
+        !memory.add_host_vector(ctx.output_ids) ||
+        !memory.add_host_vector(ctx.embd_enc) ||
+        !memory.add_host_vector(ctx.seq_ids_enc) ||
+        !memory.add_host_vector(ctx.buf_compute_meta) ||
+        !memory.add_host_vector(ctx.draft_input_hidden_state_owned) ||
+        !llama_context_accumulate_dflash_host_storage(ctx.dflash, memory) ||
+        !llama_context_accumulate_dsv4_host_storage(ctx.dsv4, memory) ||
+        !memory.add_host_vector(ctx.mtp_carry) ||
+        !memory.add_host_vector(ctx.cache_copies) ||
+        !memory.add_host_vector(ctx.dsa_cache_copies) ||
+        !memory.add_host_vector(ctx.openpangu_cache_copies) ||
+        !memory.add_host_vector(ctx.openpangu_cache_copies_mtp)) {
+        return false;
+    }
+
+    for (const auto & entry : ctx.embd_seq) {
+        if (!memory.add_host_vector(entry.second)) {
+            return false;
+        }
+    }
+
+    return (ctx.prev == nullptr || memory.add_host(sizeof(*ctx.prev))) &&
+           (ctx.prev_mtp == nullptr || memory.add_host(sizeof(*ctx.prev_mtp)));
+}
+
+} // namespace
+
+bool llama_context_get_memory_info(
+        const struct llama_context * ctx,
+        struct llama_context_memory_info * info) {
+    static_assert(sizeof(llama_context_memory_info) == LLAMA_CONTEXT_MEMORY_INFO_STRUCT_SIZE_V1,
+            "update the versioned llama_context_memory_info size when extending the structure");
+
+    if (ctx == nullptr || info == nullptr ||
+        info->struct_size < LLAMA_CONTEXT_MEMORY_INFO_STRUCT_SIZE_V1) {
+        return false;
+    }
+
+    try {
+        llama_context_memory_accumulator memory;
+        const auto & kv = ctx->kv_self;
+        const auto & ckpt = kv.ckpt;
+
+        if (!memory.add_host(sizeof(*ctx)) ||
+            !memory.add_backend_buffers(kv.bufs) ||
+            !memory.add_backend_buffers(ckpt.shadow_bufs) ||
+            !memory.add_backend_buffers(ckpt.per_step_bufs) ||
+            !memory.add_backend_buffers(ckpt.dsv4_per_step_shadow_bufs) ||
+            !memory.add_backend_buffers(ckpt.dsv4_shadow_bufs) ||
+            !memory.add_backend_buffers(ctx->cvec.bufs) ||
+            !memory.add_backend_buffer(ctx->buf_output) ||
+            !memory.add_backend_buffers(ctx->dflash.kv.cache_bufs) ||
+            !memory.add_backend_buffers(ctx->dsv4.cache.cache_bufs) ||
+            !memory.add_scheduler(ctx->sched) ||
+            !memory.add_scheduler(ctx->dflash.kv.cache_sched)) {
+            return false;
+        }
+
+        if (!memory.add_ggml_contexts(kv.ctxs) ||
+            !memory.add_ggml_contexts(ckpt.shadow_ctxs) ||
+            !memory.add_ggml_contexts(ckpt.per_step_ctxs) ||
+            !memory.add_ggml_contexts(ckpt.dsv4_per_step_shadow_ctxs) ||
+            !memory.add_ggml_contexts(ckpt.dsv4_shadow_ctxs) ||
+            !memory.add_ggml_contexts(ctx->cvec.ctxs) ||
+            !memory.add_ggml_context(ctx->dflash.kv.cache_ctx) ||
+            !memory.add_ggml_context(ctx->dsv4.cache.cache_ctx) ||
+            !llama_context_accumulate_host_storage(*ctx, memory)) {
+            return false;
+        }
+
+        for (ggml_backend_t backend : ctx->backends) {
+            if (!memory.add_backend(backend)) {
+                return false;
+            }
+        }
+
+        for (const auto & mirror : kv.numa_mirror_bufs) {
+            for (int node = 1; node < GGML_NUMA_MAX_NODES; ++node) {
+                if (mirror.node_base[node] != nullptr && !memory.add_numa_mirror(mirror.size)) {
+                    return false;
+                }
+            }
+        }
+
+        uint32_t flags = LLAMA_CONTEXT_MEMORY_INFO_FLAG_NUMA_MIRROR_BYTES_VALID;
+        if (memory.host_valid) {
+            flags |= LLAMA_CONTEXT_MEMORY_INFO_FLAG_HOST_BYTES_VALID;
+        }
+        if (memory.device_valid) {
+            flags |= LLAMA_CONTEXT_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID;
+        }
+
+        info->struct_size       = LLAMA_CONTEXT_MEMORY_INFO_STRUCT_SIZE_V1;
+        info->flags             = flags;
+        info->host_bytes        = memory.host_bytes;
+        info->device_bytes      = memory.device_bytes;
+        info->numa_mirror_bytes = memory.numa_mirror_bytes;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 const struct llama_vocab* llama_model_get_vocab(const struct llama_model* model) {
     return &model->vocab;
 }

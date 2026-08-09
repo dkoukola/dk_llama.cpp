@@ -615,6 +615,52 @@ extern "C" {
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 
+    // Output flags for llama_context_get_memory_info(). Callers must ignore unknown bits.
+    enum llama_context_memory_info_flags {
+        LLAMA_CONTEXT_MEMORY_INFO_FLAG_HOST_BYTES_VALID        = 1u << 0,
+        LLAMA_CONTEXT_MEMORY_INFO_FLAG_DEVICE_BYTES_VALID      = 1u << 1,
+        LLAMA_CONTEXT_MEMORY_INFO_FLAG_NUMA_MIRROR_BYTES_VALID = 1u << 2,
+    };
+
+    struct llama_context_memory_info {
+        // Set to sizeof(struct llama_context_memory_info) before calling. On success this is
+        // set to the number of bytes understood and written by the library. Larger structures
+        // are accepted; fields beyond the returned struct_size are left untouched.
+        uint32_t struct_size;
+
+        // Output-only llama_context_memory_info_flags. Callers must ignore unknown bits.
+        uint32_t flags;
+
+        // Requested allocation capacity owned exclusively by the context. This includes the
+        // context object, contiguous container/string capacities, GGML metadata arenas,
+        // backend-buffer payloads and wrappers, scheduler allocations, and retained allocations
+        // reported by supported backend instances. Host-visible backend allocations are
+        // classified as host memory; all other backend allocations are classified as device
+        // memory. A field is a best-known lower bound unless its validity flag is set.
+        //
+        // Shared model allocations (including model NUMA mirrors), shared/runtime-global state,
+        // allocator implementation overhead such as malloc/slab headers, and non-contiguous
+        // standard-library node allocations are excluded.
+        uint64_t host_bytes;
+        uint64_t device_bytes;
+
+        // Context-owned extra NUMA KV copies. This is a subset of host_bytes; the original
+        // node's KV allocation is included in host_bytes but not here.
+        uint64_t numa_mirror_bytes;
+    };
+
+#define LLAMA_CONTEXT_MEMORY_INFO_STRUCT_SIZE_V1 32u
+
+    // Reports context-owned allocated capacity for admission accounting, not current RSS,
+    // serialized state size, or the process's complete memory footprint.
+    // The context must be quiescent: no decode, state, checkpoint, control-vector, or other
+    // mutating operation may overlap this call. This function does not synchronize backends;
+    // after asynchronous decode, call llama_synchronize(ctx) before querying.
+    // Returns false for a NULL argument, an undersized structure, or an accounting overflow.
+    LLAMA_API bool llama_context_get_memory_info(
+            const struct llama_context * ctx,
+            struct llama_context_memory_info * info);
+
     LLAMA_API int64_t llama_time_us(void);
 
     LLAMA_API size_t llama_max_devices(void);

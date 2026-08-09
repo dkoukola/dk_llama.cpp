@@ -127,6 +127,9 @@ extern "C" {
         void                 (*GGML_CALL event_wait)        (ggml_backend_t backend, ggml_backend_event_t event);
         // block until an event is recorded
         void                 (*GGML_CALL event_synchronize) (ggml_backend_event_t event);
+
+        // (optional) persistent allocations exclusively owned by this backend instance
+        bool (*GGML_CALL get_memory_info)(ggml_backend_t backend, struct ggml_backend_memory_info * info);
     };
 
     struct ggml_backend {

@@ -4482,6 +4482,7 @@ static struct ggml_backend_i ggml_backend_metal_i = {
     /* .event_record            = */ NULL,
     /* .event_wait              = */ NULL,
     /* .event_synchronize       = */ NULL,
+    /* .get_memory_info         = */ NULL,
 };
 
 void ggml_backend_metal_log_set_callback(ggml_log_callback log_callback, void * user_data) {

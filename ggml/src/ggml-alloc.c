@@ -365,9 +365,11 @@ struct ggml_gallocr {
 
     struct node_alloc * node_allocs; // [n_nodes]
     int n_nodes;
+    int node_allocs_capacity;
 
     struct leaf_alloc * leaf_allocs; // [n_leafs]
     int n_leafs;
+    int leaf_allocs_capacity;
 };
 
 ggml_gallocr_t ggml_gallocr_new_n(ggml_backend_buffer_type_t * bufts, int n_bufs) {
@@ -695,10 +697,11 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
     ggml_gallocr_alloc_graph_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids);
 
     // set the node_allocs from the hash table
-    if (galloc->n_nodes < graph->n_nodes) {
+    if (galloc->node_allocs_capacity < graph->n_nodes) {
         free(galloc->node_allocs);
         galloc->node_allocs = calloc(graph->n_nodes, sizeof(struct node_alloc));
         GGML_ASSERT(galloc->node_allocs != NULL);
+        galloc->node_allocs_capacity = graph->n_nodes;
     }
     galloc->n_nodes = graph->n_nodes;
     for (int i = 0; i < graph->n_nodes; i++) {
@@ -728,10 +731,11 @@ bool ggml_gallocr_reserve_n(ggml_gallocr_t galloc, struct ggml_cgraph * graph, c
             }
         }
     }
-    if (galloc->n_leafs < graph->n_leafs) {
+    if (galloc->leaf_allocs_capacity < graph->n_leafs) {
         free(galloc->leaf_allocs);
         galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
         GGML_ASSERT(galloc->leaf_allocs != NULL);
+        galloc->leaf_allocs_capacity = graph->n_leafs;
     }
     galloc->n_leafs = graph->n_leafs;
     for (int i = 0; i < graph->n_leafs; i++) {
@@ -932,6 +936,68 @@ size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id) {
     }
 
     return ggml_backend_buffer_get_size(galloc->buffers[buffer_id]);
+}
+
+static bool ggml_gallocr_metadata_add(size_t * total, size_t count, size_t item_size) {
+    if (count != 0 && item_size > SIZE_MAX/count) {
+        return false;
+    }
+    const size_t bytes = count*item_size;
+    if (*total > SIZE_MAX - bytes) {
+        return false;
+    }
+    *total += bytes;
+    return true;
+}
+
+bool ggml_gallocr_get_metadata_size(ggml_gallocr_t galloc, size_t * size) {
+    if (galloc == NULL || size == NULL || galloc->n_buffers < 0 ||
+            galloc->node_allocs_capacity < 0 || galloc->leaf_allocs_capacity < 0) {
+        return false;
+    }
+
+    size_t total = sizeof(*galloc);
+    if (!ggml_gallocr_metadata_add(&total, (size_t) galloc->n_buffers, sizeof(galloc->bufts[0])) ||
+        !ggml_gallocr_metadata_add(&total, (size_t) galloc->n_buffers, sizeof(galloc->buffers[0])) ||
+        !ggml_gallocr_metadata_add(&total, (size_t) galloc->n_buffers, sizeof(galloc->buf_tallocs[0])) ||
+        !ggml_gallocr_metadata_add(&total, galloc->hash_set.size, sizeof(galloc->hash_set.keys[0])) ||
+        !ggml_gallocr_metadata_add(&total, ggml_bitset_size(galloc->hash_set.size), sizeof(galloc->hash_set.used[0])) ||
+        !ggml_gallocr_metadata_add(&total, galloc->hash_set.size, sizeof(galloc->hash_values[0])) ||
+        !ggml_gallocr_metadata_add(&total, (size_t) galloc->node_allocs_capacity, sizeof(galloc->node_allocs[0])) ||
+        !ggml_gallocr_metadata_add(&total, (size_t) galloc->leaf_allocs_capacity, sizeof(galloc->leaf_allocs[0]))) {
+        return false;
+    }
+
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        bool first = true;
+        for (int j = 0; j < i; j++) {
+            if (galloc->buf_tallocs[j] == galloc->buf_tallocs[i]) {
+                first = false;
+                break;
+            }
+        }
+        if (first && galloc->buf_tallocs[i] != NULL &&
+                !ggml_gallocr_metadata_add(&total, 1, sizeof(*galloc->buf_tallocs[i]))) {
+            return false;
+        }
+    }
+
+    for (int i = 0; i < galloc->n_buffers; i++) {
+        bool first = galloc->buffers[i] != NULL;
+        for (int j = 0; first && j < i; j++) {
+            first = galloc->buffers[i] != galloc->buffers[j];
+        }
+        if (first) {
+            size_t buffer_metadata = 0;
+            if (!ggml_backend_buffer_get_metadata_size(galloc->buffers[i], &buffer_metadata) ||
+                !ggml_gallocr_metadata_add(&total, 1, buffer_metadata)) {
+                return false;
+            }
+        }
+    }
+
+    *size = total;
+    return true;
 }
 
 // utils
