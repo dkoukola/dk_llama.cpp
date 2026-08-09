@@ -204,6 +204,10 @@ llama_build_and_test(test-regex-partial.cpp)
 
 llama_build_and_test(test-iqk-mul-multi-add.cpp)
 target_include_directories(test-iqk-mul-multi-add PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+if (GGML_IQK_MUL_MAT AND GGML_IQK_FLASH_ATTENTION)
+    llama_build_and_test(test-iqk-fa-work-buffer.cpp)
+    target_include_directories(test-iqk-fa-work-buffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+endif()
 llama_build_and_test(test-rms-norm-parallel.cpp)
 llama_build_and_test(test-speculative-config.cpp)
 

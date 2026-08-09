@@ -27,6 +27,102 @@ inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     }
     return a;
 }
+inline size_t split_k_work_size(int nek1, int nek2, int rk2, int rv2, int Dv, int nth) {
+    if (nek1 < 1 || nek2 < 1 || rk2 < 1 || Dv < 1 || nth < 1) {
+        return 0;
+    }
+
+    if (nek2 == 1 && nek1/32 > 1) {
+        int nstep_k = nek1/32;
+        if (nstep_k >= 4*nth) {
+            return size_t(Dv + 16)*rk2*sizeof(float)*nth;
+        }
+        int gcd_k = simple_gcd(nstep_k, nth);
+        int nth_k = nth/gcd_k;
+        int nq_per_thread = (rk2 + nth_k - 1)/nth_k;
+        if (nq_per_thread > 1) {
+            return size_t(Dv + 16)*nq_per_thread*sizeof(float)*nth;
+        }
+    }
+
+    if (rk2 != rv2 || int64_t(nek2)*nek1 < 32LL*nth) {
+        return 0;
+    }
+
+    int gcd = simple_gcd(nek2, nth);
+    int nth_k = nth/gcd;
+    int nek2_k = nek2/gcd;
+    int nchunk = nek2_k*nek1/32;
+    int npt = (nchunk + nth_k - 1)/nth_k;
+    int nk;
+    if (npt*nth_k == nchunk) {
+        nk = 32 * (int64_t(nek1)*nek2/(32*nth));
+    } else {
+        int nm = 1;
+        while (nm*4 < npt) {
+            nm *= 2;
+        }
+        nk = 32*nm;
+    }
+    int nkk = (nek1 + nk - 1)/nk;
+    int nstep_k = nek2*nkk;
+    size_t result_size = size_t(Dv + 16)*rk2*sizeof(float);
+    return nstep_k*result_size;
+}
+
+inline int effective_k_rows(const ggml_tensor * dst, int nek1) {
+    const auto Q = dst->src[0];
+    const auto mask = dst->src[3];
+    const int n_swa = dst->op_params[4];
+    if (n_swa <= 0 || !mask) {
+        return nek1;
+    }
+
+    constexpr int kMinBatch = 256;
+    const int ntokens = std::max<int64_t>(kMinBatch, Q->ne[1]);
+    const int nblock = (ntokens + n_swa + kMinBatch - 1)/kMinBatch;
+    return std::min(nek1, nblock*kMinBatch);
+}
+
+inline size_t max_split_k_work_size(const ggml_tensor * dst, int nth) {
+    const auto Q = dst->src[0];
+    const auto K = dst->src[1];
+    const auto V = dst->src[2];
+    const auto mask = dst->src[3];
+    const int rk2 = Q->ne[2]/K->ne[2];
+    const int rv2 = Q->ne[2]/V->ne[2];
+    const int nek2 = K->ne[2];
+    const int nek1 = effective_k_rows(dst, K->ne[1]);
+
+    size_t result = split_k_work_size(nek1, nek2, rk2, rv2, V->ne[0], nth);
+    if (!mask || nek1 <= 256) {
+        return result;
+    }
+
+    // The runtime may narrow the key range after inspecting the mask. Its thread split can
+    // require more scratch than the split planned from the full tensor shape, so cover the
+    // 32-row ranges that can survive the 3/4-size narrowing threshold.
+    const int max_narrowed_chunks = int64_t(3)*nek1/4/32;
+    // Check every small split because gcd changes make its scratch size non-monotonic.
+    // The loop is bounded by four entries per worker, independent of context length.
+    const int first_chunk = nek2 == 1 ? 2 : 1;
+    const int last_chunk = std::min(max_narrowed_chunks, 4*nth);
+    for (int chunks = first_chunk; chunks <= last_chunk; ++chunks) {
+        result = std::max(result, split_k_work_size(32*chunks, nek2, rk2, rv2, V->ne[0], nth));
+    }
+    if (max_narrowed_chunks <= last_chunk || nek2 == 1) {
+        return result;
+    }
+
+    if (rk2 == rv2 && int64_t(nek2)*max_narrowed_chunks >= nth) {
+        // Beyond the exact-search range, nstep_k is a multiple of nek2 and is
+        // bounded by nek2*ceil(4*nth/nek2).
+        const int64_t max_steps = int64_t(nek2)*((int64_t(4)*nth + nek2 - 1)/nek2);
+        const size_t result_size = size_t(V->ne[0] + 16)*rk2*sizeof(float);
+        result = std::max(result, size_t(max_steps)*result_size);
+    }
+    return result;
+}
 inline void accumulate_qkv(int Dv, float& M, float& S, float Mj, float Sj, float * Racc, const float * R) {
     if (Mj == -INFINITY) return;
     if (Mj > M) {
@@ -62,57 +158,12 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         return result;
         //return work_size * nth;
     }
-    int rk2 = Q->ne[2]/K->ne[2];
     size_t size = 0;
     if (Q->ne[1] >= 8 && K->type == GGML_TYPE_Q8_0) {
         size = ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) * K->ne[1]*K->ne[2]*K->ne[3];
     }
-    if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1 && K->ne[1]/32 > 1) {
-        if (K->ne[2] > 1) {
-            int gcd = simple_gcd(K->ne[2], nth);
-            int nth_k  = nth/gcd;
-            int nek2_k = K->ne[2]/gcd;
-            int nchunk = nek2_k*K->ne[1]/32;
-            int npt = (nchunk + nth_k - 1)/nth_k;
-            int nk;
-            if (npt*nth_k == nchunk) {
-                nk = 32 * (K->ne[1]*K->ne[2]/(32*nth));
-            } else {
-                //int nm = std::max(1, npt/8);
-                int nm = 1;
-                while (true) {
-                    if (nm*4 >= npt) break;
-                    nm *= 2;
-                }
-                nk = 32*nm;
-            }
-            int nkk = (K->ne[1] + nk - 1)/nk;
-            int nstep_k = K->ne[2]*nkk;
-            size_t result_size = (V->ne[0] + 16)*Q->ne[2]/K->ne[2]*sizeof(float);
-            size += nstep_k*result_size;
-            return size;
-        }
-        int nstep_k = K->ne[1]/32;
-        if (nstep_k >= 4*nth) {
-            auto size_thread = (V->ne[0] + 16)*rk2*sizeof(float);
-            size += size_thread*nth;
-            return size;
-        }
-        int gcd_k   = simple_gcd(nstep_k, nth);
-        if (gcd_k >= 1) {
-            int nth_k = nth/gcd_k;
-            int nq_per_thread = (rk2 + nth_k - 1)/nth_k;
-            if (nq_per_thread > 1) {
-                auto size_thread = (V->ne[0] + 16)*nq_per_thread*sizeof(float);
-                size += size_thread*nth;
-                return size;
-            }
-        }
-        int rv2 = Q->ne[2] / V->ne[2];
-        if (Q->ne[1] == 1 && Q->ne[3] == 1 && rk2 > 1 && rk2 == rv2 && K->ne[1]*K->ne[2] >= 32*nth) {
-            auto result_size = (V->ne[0] + 16)*rk2*sizeof(float);
-            size += result_size*nth;
-        }
+    if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1) {
+        size += max_split_k_work_size(dst, nth);
         return size;
     }
     return size;
@@ -643,4 +694,3 @@ bool iqk_flash_attn_noalibi([[maybe_unused]] int type_q, [[maybe_unused]] int ty
 }
 
 #endif
-
