@@ -206,7 +206,8 @@ struct llama_speculative_engine {
     parsed_stage stage;
     std::vector<int32_t> target_layer_ids;
     int32_t feature_width = 0;
-    int32_t block_size = 0;
+    int32_t block_size = 0;   // trained model metadata; part of the canonical state layout
+    int32_t decode_tokens = 0; // prepared runtime query width; may exceed block_size for DSpark
     std::array<uint8_t, LLAMA_SPECULATIVE_STATE_LAYOUT_ID_SIZE> state_layout_id = {};
     llama_speculative_engine_capabilities capabilities = {};
     std::atomic<uint64_t> child_count{0};
@@ -852,8 +853,13 @@ bool fill_engine_metadata(llama_speculative_engine & engine, std::string & error
         error = "invalid DSpark block, layer, or feature dimensions";
         return false;
     }
-    if (engine.stage.n_max > engine.block_size) {
-        error = "n_max exceeds the DSpark block size";
+    const auto width = common_speculative_plan_dflash_width(
+        COMMON_SPECULATIVE_TYPE_DSPARK,
+        engine.block_size,
+        engine.stage.n_max);
+    engine.decode_tokens = width.decode_tokens;
+    if (width.effective_n_max != engine.stage.n_max || engine.decode_tokens <= 0) {
+        error = "invalid DSpark runtime draft width";
         return false;
     }
     engine.target_layer_ids.resize((size_t) layer_count);
@@ -879,16 +885,16 @@ bool fill_engine_metadata(llama_speculative_engine & engine, std::string & error
         return false;
     }
 
-    const uint64_t required_context = (uint64_t) engine.stage.cross_ctx + (uint64_t) engine.block_size;
-    if (required_context > std::numeric_limits<uint32_t>::max()) {
-        error = "derived draft context size overflows uint32_t";
+    uint32_t required_context = 0;
+    if (!common_speculative_dflash_context_size(engine.stage.cross_ctx, width, required_context)) {
+        error = "derived draft context size overflows int32_t";
         return false;
     }
     if (engine.draft_context_size != 0 && engine.draft_context_size < required_context) {
-        error = "draft context request is smaller than cross_ctx + block_size";
+        error = "draft context request is smaller than cross_ctx + runtime draft width";
         return false;
     }
-    engine.draft_context_size = (uint32_t) std::max<uint64_t>(engine.draft_context_size, required_context);
+    engine.draft_context_size = std::max(engine.draft_context_size, required_context);
 
     std::ostringstream layout;
     layout << "llama-speculative-state-layout" << '\0'
@@ -957,8 +963,8 @@ common_params_speculative make_common_params(const llama_speculative_engine & en
     params.model_dft = engine.draft_model;
     params.cparams_dft = llama_context_default_params();
     params.cparams_dft.n_ctx = engine.draft_context_size;
-    params.cparams_dft.n_batch = (uint32_t) engine.block_size;
-    params.cparams_dft.n_ubatch = (uint32_t) engine.block_size;
+    params.cparams_dft.n_batch = (uint32_t) engine.decode_tokens;
+    params.cparams_dft.n_ubatch = (uint32_t) engine.decode_tokens;
     if (engine.draft_threads > 0) {
         params.cparams_dft.n_threads = (uint32_t) engine.draft_threads;
     }

@@ -1,4 +1,5 @@
 #include "llama-spec-features.h"
+#include "llama-dflash.h"
 
 #include <algorithm>
 #include <cstdlib>
@@ -45,7 +46,10 @@ llama_dflash_kv_cache_transition llama_plan_dflash_kv_cache_transition_for_ctx(
 
     const int32_t cross_ctx = ctx->dflash.visible_cross_ctx > 0
             ? ctx->dflash.visible_cross_ctx
-            : std::max<int32_t>(1, (int32_t) ctx->cparams.n_ctx - (int32_t) ctx->model.hparams.dflash_block_size);
+            : (int32_t) llama_dflash_default_cross_context(
+                ctx->cparams.n_ctx,
+                ctx->model.hparams.dflash_block_size,
+                ctx->cparams.n_ubatch);
 
     return llama_plan_dflash_kv_cache_transition(
             cross_ctx,
@@ -447,44 +451,48 @@ static bool llama_set_dflash_target_features_impl(
     }
     ctx->dflash.target.append_features_n_floats = have_append_features ? window_update->append_floats : 0;
     ctx->dflash.target.append_features_n_rows = have_append_features ? window_update->append_rows : 0;
-        ctx->dflash.target.version = window_update != nullptr && window_update->version > 0
-            ? window_update->version
-            : ctx->dflash.target.version + 1;
-        ctx->dflash.target.keep_rows = window_update != nullptr
-            ? std::max<int32_t>(0, std::min(n_rows, window_update->keep_rows))
-            : 0;
-        ctx->dflash.target.append_rows = window_update != nullptr
-            ? std::max<int32_t>(0, std::min(n_rows, window_update->append_rows))
-            : n_rows;
-        ctx->dflash.target.replace = window_update != nullptr
-            ? window_update->replace
-            : true;
-        if (ctx->dflash.target.keep_rows + ctx->dflash.target.append_rows > n_rows) {
+    ctx->dflash.target.version = window_update != nullptr && window_update->version > 0
+        ? window_update->version
+        : ctx->dflash.target.version + 1;
+    ctx->dflash.target.keep_rows = window_update != nullptr
+        ? std::max<int32_t>(0, std::min(n_rows, window_update->keep_rows))
+        : 0;
+    ctx->dflash.target.append_rows = window_update != nullptr
+        ? std::max<int32_t>(0, std::min(n_rows, window_update->append_rows))
+        : n_rows;
+    ctx->dflash.target.replace = window_update != nullptr
+        ? window_update->replace
+        : true;
+    if (ctx->dflash.target.keep_rows + ctx->dflash.target.append_rows > n_rows) {
         ctx->dflash.target.keep_rows = std::max<int32_t>(0, n_rows - ctx->dflash.target.append_rows);
-        }
+    }
 
-            const int32_t cross_ctx = ctx->dflash.visible_cross_ctx > 0
-                ? ctx->dflash.visible_cross_ctx
-                : std::max<int32_t>(1, (int32_t) ctx->cparams.n_ctx - (int32_t) ctx->model.hparams.dflash_block_size);
-            const llama_dflash_window_update cache_window_update = {
-                ctx->dflash.target.version,
-                ctx->dflash.target.keep_rows,
-                ctx->dflash.target.append_rows,
-                ctx->dflash.target.replace,
-                ctx->dflash.target.append_features,
-                ctx->dflash.target.append_features_n_floats,
-            };
-            const llama_dflash_kv_cache_transition cache_plan = llama_plan_dflash_kv_cache_transition_for_ctx(ctx, cache_window_update, n_rows);
+    const int32_t cross_ctx = ctx->dflash.visible_cross_ctx > 0
+            ? ctx->dflash.visible_cross_ctx
+            : (int32_t) llama_dflash_default_cross_context(
+                ctx->cparams.n_ctx,
+                ctx->model.hparams.dflash_block_size,
+                ctx->cparams.n_ubatch);
+    const llama_dflash_window_update cache_window_update = {
+        ctx->dflash.target.version,
+        ctx->dflash.target.keep_rows,
+        ctx->dflash.target.append_rows,
+        ctx->dflash.target.replace,
+        ctx->dflash.target.append_features,
+        ctx->dflash.target.append_features_n_floats,
+    };
+    const llama_dflash_kv_cache_transition cache_plan =
+        llama_plan_dflash_kv_cache_transition_for_ctx(ctx, cache_window_update, n_rows);
 
-        if (cache_plan.cache_up_to_date) {
-            ctx->dflash.kv.cache_view_n_filled = ctx->dflash.kv.cache_n_filled;
-            ctx->dflash.kv.cache_view_write_pos = ctx->dflash.kv.cache_write_pos;
-            ctx->dflash.kv.cache_view_valid = ctx->dflash.kv.cache_valid;
-        } else if (cross_ctx > 0) {
-            ctx->dflash.kv.cache_view_n_filled = cache_plan.next_n_filled;
-            ctx->dflash.kv.cache_view_write_pos = cache_plan.next_write_pos;
-            ctx->dflash.kv.cache_view_valid = cache_plan.next_n_filled > 0;
-        }
+    if (cache_plan.cache_up_to_date) {
+        ctx->dflash.kv.cache_view_n_filled = ctx->dflash.kv.cache_n_filled;
+        ctx->dflash.kv.cache_view_write_pos = ctx->dflash.kv.cache_write_pos;
+        ctx->dflash.kv.cache_view_valid = ctx->dflash.kv.cache_valid;
+    } else if (cross_ctx > 0) {
+        ctx->dflash.kv.cache_view_n_filled = cache_plan.next_n_filled;
+        ctx->dflash.kv.cache_view_write_pos = cache_plan.next_write_pos;
+        ctx->dflash.kv.cache_view_valid = cache_plan.next_n_filled > 0;
+    }
 
     if (target_positions != nullptr) {
         if (copy_data) {

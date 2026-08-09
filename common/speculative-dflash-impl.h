@@ -84,6 +84,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
     llama_batch batch = {};
 
     int32_t block_size = 0;
+    int32_t prepared_n_max = 0;
+    int32_t decode_tokens = 0;
     int32_t mask_token_id = -1;
     int32_t n_target_features = 0;
     int32_t cross_ctx = 0;
@@ -114,10 +116,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
             enum common_speculative_type type,
             llama_context * ctx_tgt,
             llama_context * ctx_dft,
-            int32_t cross_ctx)
+            int32_t cross_ctx,
+            int32_t prepared_n_max)
         : common_speculative_state(type)
         , ctx_tgt(ctx_tgt)
         , ctx_dft(ctx_dft)
+        , prepared_n_max(std::max(0, prepared_n_max))
         , cross_ctx(std::max(1, cross_ctx))
         , is_dspark(type == COMMON_SPECULATIVE_TYPE_DSPARK)
     {
@@ -153,6 +157,17 @@ struct common_speculative_state_dflash : public common_speculative_state {
         if (block_size <= 0 || mask_token_id < 0 || n_target_features <= 0 || n_target_layers <= 0) {
             LOG_ERR("%s: invalid DFlash metadata (block_size=%d, mask_token_id=%d, n_target_features=%d, n_target_layers=%d)\n",
                     __func__, block_size, mask_token_id, n_target_features, n_target_layers);
+            return;
+        }
+
+        const auto width = common_speculative_plan_dflash_width(type, block_size, prepared_n_max);
+        prepared_n_max = width.effective_n_max;
+        decode_tokens = width.decode_tokens;
+        if (decode_tokens <= 0 || llama_n_batch(ctx_dft) < (uint32_t) decode_tokens ||
+                llama_n_ubatch(ctx_dft) < (uint32_t) decode_tokens) {
+            LOG_ERR("%s: DFlash context batch capacity is smaller than the prepared runtime width "
+                    "(n_batch=%u n_ubatch=%u decode_tokens=%d)\n",
+                    __func__, llama_n_batch(ctx_dft), llama_n_ubatch(ctx_dft), decode_tokens);
             return;
         }
 
@@ -225,7 +240,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        const int32_t draft_batch_size = std::max(1, block_size);
+        const int32_t draft_batch_size = decode_tokens;
         batch = llama_batch_init(draft_batch_size, 0, 1);
         bool have_seq_ids = batch.seq_id != nullptr;
         for (int32_t i = 0; have_seq_ids && i < draft_batch_size; ++i) {
@@ -244,9 +259,10 @@ struct common_speculative_state_dflash : public common_speculative_state {
         target_window_pos_stage.reserve((size_t) this->cross_ctx);
 
         llama_set_dflash_visible_cross_ctx(ctx_dft, this->cross_ctx);
-        LOG_INF("%s: %s context prepared (n_ctx=%d, block_size=%d, cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
+        LOG_INF("%s: %s context prepared (n_ctx=%d, block_size=%d, prepared_n_max=%d, decode_tokens=%d, "
+                "cross_ctx=%d, n_target_features=%d, n_target_layers=%d)\n",
                 __func__, common_speculative_type_to_str(type).c_str(), llama_n_ctx(ctx_dft), block_size,
-                this->cross_ctx, n_target_features, n_target_layers);
+                this->prepared_n_max, decode_tokens, this->cross_ctx, n_target_features, n_target_layers);
 
         // The target-global callback is the final externally visible initialization step.
         if (!llama_set_dflash_capture_layers(ctx_tgt, target_layer_ids.data(), (int32_t) target_layer_ids.size())) {
@@ -286,7 +302,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
             return;
         }
 
-        const int32_t n_draft_max = is_dspark ? block_size : block_size - 1;
+        const int32_t n_draft_max = is_dspark ? prepared_n_max : block_size - 1;
         const int32_t n_keep = std::min<int32_t>(params.n_max, n_draft_max);
         if (n_keep <= 0) {
             return;

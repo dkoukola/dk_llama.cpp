@@ -9,6 +9,22 @@ struct common_speculative;
 
 bool common_speculative_needs_checkpoint(const llama_model * model);
 
+struct common_speculative_dflash_width_plan {
+    // The trained block size is model/state metadata. DSpark may prepare a wider runtime query.
+    int32_t effective_n_max = 0;
+    int32_t decode_tokens = 0;
+};
+
+common_speculative_dflash_width_plan common_speculative_plan_dflash_width(
+        common_speculative_type type,
+        int32_t                 trained_block_size,
+        int32_t                 requested_n_max);
+
+bool common_speculative_dflash_context_size(
+        int32_t                                       cross_ctx,
+        const common_speculative_dflash_width_plan & width,
+        uint32_t                                    & context_size);
+
 enum common_speculative_init_status {
     COMMON_SPECULATIVE_INIT_SKIPPED,
     COMMON_SPECULATIVE_INIT_READY,

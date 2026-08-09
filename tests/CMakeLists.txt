@@ -210,6 +210,7 @@ if (GGML_IQK_MUL_MAT AND GGML_IQK_FLASH_ATTENTION)
 endif()
 llama_build_and_test(test-rms-norm-parallel.cpp)
 llama_build_and_test(test-speculative-config.cpp)
+target_include_directories(test-speculative-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 

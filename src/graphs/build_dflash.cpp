@@ -1,5 +1,6 @@
 #include "../llama-build-context.h"
 #include "../llama-context.h"
+#include "../llama-dflash.h"
 #include "../llama-model.h"
 
 #include <cmath>
@@ -52,7 +53,7 @@ static ggml_tensor * build_dspark_markov_head(
     const int64_t n_tok = base_logits->ne[1];
     const int64_t n_blocks = dflash_dspark_block_count(llm.batch);
     const int64_t block_drafts = n_tok / n_blocks;
-    GGML_ASSERT(block_drafts > 0 && block_drafts <= llm.hparams.dflash_block_size);
+    GGML_ASSERT(block_drafts > 0 && block_drafts <= (int64_t) llm.cparams.n_ubatch);
 
     const size_t token_stride = (size_t) block_drafts * lctx.inp_tokens->nb[0];
     const size_t logits_stride = (size_t) block_drafts * base_logits->nb[1];
@@ -113,7 +114,10 @@ ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
     const int64_t n_target_features = hparams.dflash_n_target_features;
     const int64_t ctx_len = lctx.dflash.visible_cross_ctx > 0
             ? (int64_t) lctx.dflash.visible_cross_ctx
-            : std::max<int64_t>(1, (int64_t) cparams.n_ctx - (int64_t) hparams.dflash_block_size);
+            : llama_dflash_default_cross_context(
+                cparams.n_ctx,
+                hparams.dflash_block_size,
+                cparams.n_ubatch);
     const int64_t update_rows = std::max<int64_t>(1, lctx.dflash.kv.cache_update_rows > 0 ? lctx.dflash.kv.cache_update_rows : ctx_len);
     const int32_t write_pos = lctx.dflash.kv.cache_write_pos;
 
@@ -326,7 +330,10 @@ ggml_cgraph * llm_build_context::build_dflash() {
     const int64_t n_target_features = hparams.dflash_n_target_features;
     const int64_t ctx_len = lctx.dflash.visible_cross_ctx > 0
             ? (int64_t) lctx.dflash.visible_cross_ctx
-            : std::max<int64_t>(1, (int64_t) cparams.n_ctx - (int64_t) hparams.dflash_block_size);
+            : llama_dflash_default_cross_context(
+                cparams.n_ctx,
+                hparams.dflash_block_size,
+                cparams.n_ubatch);
     const int64_t n_kv_total = GGML_PAD(ctx_len + n_tokens, (int64_t) llama_kv_cache::get_padding(flash_attn));
 
     GGML_ASSERT(n_embd_head_k == n_embd_head_v);
@@ -334,7 +341,8 @@ ggml_cgraph * llm_build_context::build_dflash() {
     GGML_ASSERT(lctx.ensure_dflash_kv_cache_tensors((int32_t) ctx_len));
 
     ggml_cgraph * gf = ggml_new_graph_custom(ctx0,
-            model.max_nodes((int) std::max<int64_t>(n_tokens, ctx_len)) + 96 * n_layer + 64 * hparams.dflash_block_size,
+            model.max_nodes((int) std::max<int64_t>(n_tokens, ctx_len)) + 96 * n_layer +
+                64 * std::max<int64_t>(hparams.dflash_block_size, n_tokens),
             false);
 
     lctx.dflash.draft_tokens_tensor = nullptr;

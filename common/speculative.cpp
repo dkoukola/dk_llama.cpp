@@ -81,12 +81,44 @@ struct common_speculative_config {
     common_speculative_stage_params stage;
     common_speculative_type type;
     common_params_speculative params;
+    int32_t prepared_n_max = -1;
 
     common_speculative_config(
             const common_speculative_stage_params & s,
             const common_params_speculative & p = common_params_speculative{})
         : stage(s), type(s.type), params(p) {}
 };
+
+common_speculative_dflash_width_plan common_speculative_plan_dflash_width(
+        common_speculative_type type,
+        int32_t                 trained_block_size,
+        int32_t                 requested_n_max) {
+    common_speculative_dflash_width_plan result;
+    if (!common_speculative_type_is_dflash_family(type) || trained_block_size <= 0) {
+        return result;
+    }
+
+    requested_n_max = std::max<int32_t>(0, requested_n_max);
+    result.effective_n_max = type == COMMON_SPECULATIVE_TYPE_DSPARK
+        ? requested_n_max
+        : std::min(requested_n_max, std::max<int32_t>(0, trained_block_size - 1));
+    result.decode_tokens = type == COMMON_SPECULATIVE_TYPE_DSPARK
+        ? std::max(trained_block_size, result.effective_n_max)
+        : trained_block_size;
+    return result;
+}
+
+bool common_speculative_dflash_context_size(
+        int32_t                                       cross_ctx,
+        const common_speculative_dflash_width_plan & width,
+        uint32_t                                    & context_size) {
+    if (cross_ctx <= 0 || width.decode_tokens <= 0 ||
+            cross_ctx > std::numeric_limits<int32_t>::max() - width.decode_tokens) {
+        return false;
+    }
+    context_size = (uint32_t) (cross_ctx + width.decode_tokens);
+    return true;
+}
 
 static int32_t common_speculative_effective_n_max(
         common_speculative_type type,
@@ -101,11 +133,10 @@ static int32_t common_speculative_effective_n_max(
         return 0;
     }
 
-    const int32_t block_size = llama_model_dflash_block_size(model_dft);
-    const int32_t n_max_cap = type == COMMON_SPECULATIVE_TYPE_DSPARK
-        ? block_size
-        : block_size - 1;
-    return std::min(requested_n_max, std::max<int32_t>(0, n_max_cap));
+    return common_speculative_plan_dflash_width(
+        type,
+        llama_model_dflash_block_size(model_dft),
+        requested_n_max).effective_n_max;
 }
 
 static bool common_speculative_are_compatible(
@@ -1161,6 +1192,9 @@ static common_params_speculative common_speculative_get_runtime_params(
     result.n_max = std::max(result.n_max, 0);
     result.n_min = std::max(0, std::min(result.n_min, result.n_max));
     result.n_max = common_speculative_effective_n_max(config.type, result.model_dft, result.n_max);
+    if (common_speculative_type_is_dflash_family(config.type) && config.prepared_n_max >= 0) {
+        result.n_max = std::min(result.n_max, config.prepared_n_max);
+    }
     result.n_min = std::min(result.n_min, result.n_max);
     result.mtp_heads = std::max(result.mtp_heads, 0);
     result.stages.clear();
@@ -1237,7 +1271,10 @@ static int32_t common_speculative_get_dflash_tuner_n_min(
             config.type,
             config.params.model_dft,
             requested_n_max);
-        return std::min(std::max<int32_t>(0, requested_n_min), effective_n_max);
+        const int32_t prepared_n_max = config.prepared_n_max >= 0
+            ? config.prepared_n_max
+            : effective_n_max;
+        return std::min(std::max<int32_t>(0, requested_n_min), std::min(effective_n_max, prepared_n_max));
     }
 
     return 0;
@@ -1430,31 +1467,44 @@ static common_speculative * common_speculative_init_internal(
             }
 
             int32_t max_cross_ctx = 0;
+            common_speculative_dflash_width_plan max_width;
             for (const auto & stage : stages) {
                 if (!common_speculative_type_is_dflash_family(stage.type)) {
                     continue;
                 }
 
-                max_cross_ctx = std::max(max_cross_ctx, params.with_stage_overrides(stage).dflash_cross_ctx);
+                const common_params_speculative stage_params = params.with_stage_overrides(stage);
+                int32_t prepared_n_max = stage_params.n_max;
+                if (params.autotune) {
+                    prepared_n_max = std::max<int32_t>(1, prepared_n_max);
+                }
+                const auto width = common_speculative_plan_dflash_width(
+                    stage.type,
+                    llama_model_dflash_block_size(params.model_dft),
+                    prepared_n_max);
+                max_cross_ctx = std::max(max_cross_ctx, stage_params.dflash_cross_ctx);
+                if (width.decode_tokens > max_width.decode_tokens) {
+                    max_width = width;
+                }
             }
 
             const int32_t block_size = llama_model_dflash_block_size(params.model_dft);
-            if (block_size <= 0) {
+            if (block_size <= 0 || max_width.decode_tokens <= 0) {
                 LOG_ERR("%s: invalid DFlash draft block size\n", __func__);
                 return nullptr;
             }
 
-            cparams_dft.n_batch = (uint32_t) block_size;
-            cparams_dft.n_ubatch = (uint32_t) block_size;
+            cparams_dft.n_batch = (uint32_t) max_width.decode_tokens;
+            cparams_dft.n_ubatch = (uint32_t) max_width.decode_tokens;
 
-            const int64_t required_n_ctx = (int64_t) max_cross_ctx + (int64_t) block_size;
-            if (required_n_ctx > std::numeric_limits<int32_t>::max()) {
-                LOG_ERR("%s: invalid DFlash draft context size cross_ctx=%d block_size=%d required_n_ctx=%lld\n",
-                        __func__, max_cross_ctx, block_size, (long long) required_n_ctx);
+            uint32_t required_n_ctx = 0;
+            if (!common_speculative_dflash_context_size(max_cross_ctx, max_width, required_n_ctx)) {
+                LOG_ERR("%s: invalid DFlash draft context size cross_ctx=%d decode_tokens=%d\n",
+                        __func__, max_cross_ctx, max_width.decode_tokens);
                 return nullptr;
             }
 
-            cparams_dft.n_ctx = (uint32_t) required_n_ctx;
+            cparams_dft.n_ctx = required_n_ctx;
         }
 
         ctx_dft.reset(llama_init_from_model(params.model_dft, cparams_dft));
@@ -1493,21 +1543,31 @@ static common_speculative * common_speculative_init_internal(
             }
         }
 
-        configs.push_back(common_speculative_config(stage, stage_params));
+        common_speculative_config config(stage, stage_params);
+        if (common_speculative_type_is_dflash_family(stage.type)) {
+            int32_t prepared_n_max = stage_params.n_max;
+            if (params.autotune) {
+                prepared_n_max = std::max<int32_t>(1, prepared_n_max);
+            }
+            config.prepared_n_max = common_speculative_effective_n_max(
+                stage.type,
+                stage_params.model_dft,
+                prepared_n_max);
+        }
+        configs.push_back(std::move(config));
     }
 
     const llama_model * target_model = llama_get_model(ctx_tgt);
     if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
         int32_t max_n_max = 0;
         for (const auto & config : configs) {
-            int32_t requested_n_max = config.params.n_max;
-            if (params.autotune && common_speculative_type_is_dflash_family(config.type)) {
-                requested_n_max = std::max<int32_t>(1, requested_n_max);
-            }
-            max_n_max = std::max(max_n_max, common_speculative_effective_n_max(
-                config.type,
-                config.params.model_dft,
-                requested_n_max));
+            const int32_t prepared_n_max = config.prepared_n_max >= 0
+                ? config.prepared_n_max
+                : common_speculative_effective_n_max(
+                    config.type,
+                    config.params.model_dft,
+                    config.params.n_max);
+            max_n_max = std::max(max_n_max, prepared_n_max);
         }
         const int ckpt_tokens = std::max(1, max_n_max + 1);
         const int actual_mode = llama_spec_ckpt_init(ctx_tgt, params.spec_ckpt_mode, ckpt_tokens);
@@ -1548,7 +1608,8 @@ static common_speculative * common_speculative_init_internal(
                     config.type,
                     ctx_tgt,
                     ctx_dft.get(),
-                    config.params.dflash_cross_ctx);
+                    config.params.dflash_cross_ctx,
+                    config.prepared_n_max);
                 ctx_dft.release();
                 if (!state->ready) {
                     LOG_ERR("%s: failed to initialize %s speculative state\n",

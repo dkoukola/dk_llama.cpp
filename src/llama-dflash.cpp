@@ -61,9 +61,9 @@ static ggml_backend_t llama_backend_for_tensor(const llama_context & lctx, const
 
 bool llama_context::ensure_dflash_kv_cache_tensors(int32_t cross_ctx) {
     const int32_t target_cross_ctx = std::max<int32_t>(1, cross_ctx);
-    const int32_t target_token_capacity = std::max<int32_t>(
-            1,
-            std::max<int32_t>((int32_t) model.hparams.dflash_block_size, (int32_t) cparams.n_ubatch));
+    const int32_t target_token_capacity = (int32_t) llama_dflash_runtime_token_capacity(
+        model.hparams.dflash_block_size,
+        cparams.n_ubatch);
     const int32_t target_cache_n_kv_total = GGML_PAD(target_cross_ctx + target_token_capacity, (int32_t) llama_kv_cache::get_padding(cparams.flash_attn));
     const ggml_type target_cache_type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
     const int32_t n_layer = model.hparams.n_layer;
@@ -391,7 +391,10 @@ bool llama_prepare_dflash_graph_inputs(
         uint32_t n_tokens) {
     const int32_t cross_ctx = lctx.dflash.visible_cross_ctx > 0
             ? lctx.dflash.visible_cross_ctx
-            : std::max<int32_t>(1, (int32_t) lctx.cparams.n_ctx - (int32_t) lctx.model.hparams.dflash_block_size);
+            : (int32_t) llama_dflash_default_cross_context(
+                lctx.cparams.n_ctx,
+                lctx.model.hparams.dflash_block_size,
+                lctx.cparams.n_ubatch);
     ggml_tensor * kq_mask = lctx.dflash.kv.kq_mask_tensor;
     ggml_tensor * kq_mask_swa = lctx.dflash.kv.kq_mask_swa_tensor;
 
