@@ -156,6 +156,8 @@ target_link_libraries     (${TARGET} PRIVATE ${LLAMA_COMMON_EXTRA_LIBS} PUBLIC l
 if (LLAMA_BUILD_SPECULATIVE)
     add_library(llama-speculative-bridge SHARED
         speculative-bridge.cpp
+        speculative-sampling.cpp
+        speculative-sampling.h
         ../include/llama-speculative.h
         )
     add_library(llama::speculative ALIAS llama-speculative-bridge)

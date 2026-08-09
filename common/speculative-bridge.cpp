@@ -5,6 +5,7 @@
 #include "llama-build-id.h"
 #include "llama-spec-features-dflash.h"
 #include "speculative.h"
+#include "speculative-sampling.h"
 
 #include <algorithm>
 #include <array>
@@ -1033,39 +1034,8 @@ llama_token sample_token(
     if (!std::isnan(sampler.params.min_p)) {
         llama_sample_min_p(context, &candidates, sampler.params.min_p, 1);
     }
-    if (!std::isnan(sampler.params.temperature)) {
-        llama_sample_temp(context, &candidates, sampler.params.temperature);
-    }
-    if (candidates.size == 0) {
-        return LLAMA_TOKEN_NULL;
-    }
-    if (candidates.size == 1) {
-        return candidates.data[0].id;
-    }
-
-    float * probabilities = sampler.probabilities.data();
-    probabilities[0] = candidates.data[0].logit;
-    float maximum = probabilities[0];
-    for (size_t i = 1; i < candidates.size; ++i) {
-        probabilities[i] = candidates.data[i].logit;
-        maximum = std::max(maximum, probabilities[i]);
-    }
-
-    float sum = 0.0f;
-    for (size_t i = 0; i < candidates.size; ++i) {
-        const float probability = std::exp(probabilities[i] - maximum);
-        sum += probability;
-        probabilities[i] = sum;
-    }
-    probabilities[candidates.size - 1] += sum;
-
-    const auto random = state.rng();
-    const auto point = sum * random / state.rng.max();
-    const float * selected = std::upper_bound(probabilities, probabilities + candidates.size, point);
-    if (selected == probabilities + candidates.size) {
-        return LLAMA_TOKEN_NULL;
-    }
-    return candidates.data[selected - probabilities].id;
+    return llama_speculative_internal::sample_candidates(
+        context, &candidates, sampler.params.temperature, state.rng, sampler.probabilities);
 }
 
 bool session_on_owner_thread(const llama_speculative_session * session) {

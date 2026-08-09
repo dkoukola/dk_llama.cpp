@@ -229,4 +229,11 @@ if (TARGET llama::speculative)
     add_executable(test-speculative-api test-speculative-api.c)
     target_link_libraries(test-speculative-api PRIVATE llama::speculative llama)
     add_test(NAME test-speculative-api COMMAND test-speculative-api)
+
+    add_executable(test-speculative-sampling
+        test-speculative-sampling.cpp
+        ../common/speculative-sampling.cpp)
+    target_include_directories(test-speculative-sampling PRIVATE ${PROJECT_SOURCE_DIR}/common)
+    target_link_libraries(test-speculative-sampling PRIVATE llama)
+    add_test(NAME test-speculative-sampling COMMAND test-speculative-sampling)
 endif()
