@@ -172,13 +172,11 @@ if (LLAMA_BUILD_SPECULATIVE)
             $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
             $<INSTALL_INTERFACE:${LLAMA_INCLUDE_INSTALL_DIR}>
         PRIVATE
-            ${LLAMA_BUILD_ID_INCLUDE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/../src
             ${CMAKE_CURRENT_SOURCE_DIR}/../vendor
         )
     target_link_libraries(llama-speculative-bridge PRIVATE common llama Threads::Threads)
-    add_dependencies(llama-speculative-bridge llama-build-id)
 
     set_target_properties(llama-speculative-bridge PROPERTIES
         CXX_VISIBILITY_PRESET hidden

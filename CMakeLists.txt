@@ -158,8 +158,6 @@ if (NOT TARGET ggml)
     # ... otherwise assume ggml is added by a parent CMakeLists.txt
 endif()
 
-include(llama-build-id)
-
 #
 # build the library
 #

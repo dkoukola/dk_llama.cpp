@@ -28,8 +28,6 @@
 extern "C" {
 #endif
 
-#define LLAMA_SPECULATIVE_ABI_VERSION 1u
-#define LLAMA_SPECULATIVE_BUILD_ID_SIZE 65u
 #define LLAMA_SPECULATIVE_STATE_LAYOUT_ID_SIZE 32u
 
 struct llama_speculative_engine;
@@ -46,7 +44,6 @@ enum {
     LLAMA_SPECULATIVE_STATE_INCOMPATIBLE = 2,
     LLAMA_SPECULATIVE_HISTORY_INSUFFICIENT = 3,
     LLAMA_SPECULATIVE_INVALID_ARGUMENT = -1,
-    LLAMA_SPECULATIVE_ABI_MISMATCH = -2,
     LLAMA_SPECULATIVE_UNSUPPORTED = -3,
     LLAMA_SPECULATIVE_OUT_OF_MEMORY = -4,
     LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE = -5,
@@ -305,12 +302,6 @@ struct llama_speculative_metrics {
     uint64_t recoverable_fallbacks;
     uint64_t poisoned_failures;
 };
-
-LLAMA_SPECULATIVE_API uint32_t llama_speculative_abi_version(void);
-LLAMA_SPECULATIVE_API const char * llama_speculative_build_id(void);
-LLAMA_SPECULATIVE_API const char * llama_speculative_compatible_llama_build_id(void);
-LLAMA_SPECULATIVE_API llama_speculative_status llama_speculative_validate_runtime(
-        struct llama_speculative_error ** error);
 
 LLAMA_SPECULATIVE_API llama_speculative_status llama_speculative_error_status(
         const struct llama_speculative_error * error);

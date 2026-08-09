@@ -65,11 +65,6 @@ extern "C" {
     // TODO: show sample usage
     //
 
-    // Returns the deterministic 64-character lowercase hexadecimal identity
-    // of this libllama build. The returned pointer remains valid for the
-    // lifetime of the process.
-    LLAMA_API const char * llama_build_id(void);
-
     struct llama_model;
     struct llama_context;
 

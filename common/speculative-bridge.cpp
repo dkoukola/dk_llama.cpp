@@ -2,7 +2,6 @@
 #include "llama-speculative.h"
 
 #include "common.h"
-#include "llama-build-id.h"
 #include "llama-spec-features-dflash.h"
 #include "speculative.h"
 #include "speculative-sampling.h"
@@ -40,9 +39,6 @@ constexpr size_t STATE_SECTION_ENTRY_SIZE = 32;
 constexpr size_t STATE_DSPARK_PREFIX_SIZE = 48;
 constexpr size_t STATE_QUALITY_KEY_SIZE = 17;
 constexpr std::array<uint8_t, 8> STATE_MAGIC = { 'L', 'L', 'S', 'P', 'S', 'T', 1, 0 };
-constexpr char COMPATIBLE_LLAMA_BUILD_ID[] = LLAMA_GENERATED_BUILD_ID;
-static_assert(sizeof(COMPATIBLE_LLAMA_BUILD_ID) == LLAMA_SPECULATIVE_BUILD_ID_SIZE,
-        "generated libllama build ID must contain 64 hexadecimal characters");
 
 struct sha256_context {
     uint32_t state[8];
@@ -1260,28 +1256,6 @@ void finish_round(llama_speculative_round ** round) {
 } // namespace
 
 extern "C" {
-
-uint32_t llama_speculative_abi_version(void) {
-    return LLAMA_SPECULATIVE_ABI_VERSION;
-}
-
-const char * llama_speculative_build_id(void) {
-    return COMPATIBLE_LLAMA_BUILD_ID;
-}
-
-const char * llama_speculative_compatible_llama_build_id(void) {
-    return COMPATIBLE_LLAMA_BUILD_ID;
-}
-
-llama_speculative_status llama_speculative_validate_runtime(llama_speculative_error ** error) {
-    clear_error(error);
-    const char * actual = llama_build_id();
-    const char * expected = llama_speculative_compatible_llama_build_id();
-    if (actual == nullptr || expected == nullptr || std::strlen(actual) != 64 || std::strcmp(actual, expected) != 0) {
-        return fail(error, LLAMA_SPECULATIVE_ABI_MISMATCH, "libllama and speculative bridge build IDs differ");
-    }
-    return LLAMA_SPECULATIVE_OK;
-}
 
 llama_speculative_status llama_speculative_error_status(const llama_speculative_error * error) {
     return error != nullptr ? error->status : LLAMA_SPECULATIVE_OK;

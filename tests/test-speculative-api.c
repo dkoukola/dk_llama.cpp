@@ -1,9 +1,7 @@
 #include "llama-speculative.h"
 
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -12,25 +10,8 @@
     } \
 } while (0)
 
-static void assert_build_id(const char *build_id) {
-    CHECK(build_id != NULL);
-    CHECK(strlen(build_id) == 64);
-    for (size_t i = 0; i < 64; ++i) {
-        CHECK((build_id[i] >= '0' && build_id[i] <= '9') ||
-              (build_id[i] >= 'a' && build_id[i] <= 'f'));
-    }
-}
-
 int main(void) {
-    CHECK(llama_speculative_abi_version() == LLAMA_SPECULATIVE_ABI_VERSION);
-    assert_build_id(llama_speculative_build_id());
-    assert_build_id(llama_speculative_compatible_llama_build_id());
-    CHECK(strcmp(llama_speculative_build_id(), llama_speculative_compatible_llama_build_id()) == 0);
-
     struct llama_speculative_error *error = NULL;
-    CHECK(llama_speculative_validate_runtime(&error) == LLAMA_SPECULATIVE_OK);
-    CHECK(error == NULL);
-
     struct llama_speculative_engine_params engine = llama_speculative_engine_default_params();
     CHECK(engine.target_model == NULL);
     CHECK(engine.auxiliary_models == NULL);
