@@ -14,6 +14,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #define CHECK(condition) do { \
     if (!(condition)) { \
@@ -60,7 +61,13 @@ int main() {
     CHECK(llama_supports_full_state_io(&ctx));
     model.arch = LLM_ARCH_OPENPANGU;
     CHECK(!llama_supports_full_state_io(&ctx));
+    ctx.kv_self.row_count.push_back(1);
+    model.arch = LLM_ARCH_DEEPSEEK4;
+    CHECK(llama_supports_full_state_io(&ctx));
     model.arch = LLM_ARCH_UNKNOWN;
+    CHECK(!llama_supports_full_state_io(&ctx));
+    // Release the test-only capacity so it does not affect the memory-accounting baseline below.
+    std::vector<uint32_t>().swap(ctx.kv_self.row_count);
 
     llama_model target_a = {};
     llama_model target_b = {};

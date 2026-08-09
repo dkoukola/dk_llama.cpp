@@ -2982,7 +2982,7 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
         if (!llama_supports_full_state_io(ctx)) {
-            send_error(task, "slot save is unsupported with --swa-compress because file-session state is not implemented for compacted contexts", ERROR_TYPE_NOT_SUPPORTED);
+            send_error(task, "slot save is unsupported for this context", ERROR_TYPE_NOT_SUPPORTED);
             break;
         }
 
@@ -3029,7 +3029,7 @@ void server_context::process_single_task(server_task&& task) {
             break;
         }
         if (!llama_supports_full_state_io(ctx)) {
-            send_error(task, "slot restore is unsupported with --swa-compress because file-session state is not implemented for compacted contexts", ERROR_TYPE_NOT_SUPPORTED);
+            send_error(task, "slot restore is unsupported for this context", ERROR_TYPE_NOT_SUPPORTED);
             break;
         }
         const int64_t t_start = ggml_time_us();

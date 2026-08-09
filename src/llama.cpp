@@ -1157,6 +1157,64 @@ static constexpr uint32_t LLAMA_OPENPANGU_PARTIAL_LAYOUT_MAGIC = 0x50414732u; //
 static constexpr uint32_t LLAMA_OPENPANGU_PARTIAL_STATE_MAGIC  = 0x50414731u; // "PAG1"
 static constexpr uint32_t LLAMA_SWA_COMPACT_LAYOUT_MAGIC       = 0x53574143u; // "SWAC"
 
+static bool llama_kv_cache_compact_header_valid(
+        const llama_kv_cache & cache,
+                      uint32_t cell_count,
+                      uint32_t size_swa,
+                      uint32_t live_swa,
+                     llama_pos pos_base_swa,
+                      uint32_t head_swa) {
+    return size_swa == cache.size_swa &&
+           cache.sink_rows <= size_swa &&
+           head_swa >= cache.sink_rows &&
+           head_swa <= size_swa &&
+           head_swa - cache.sink_rows == live_swa &&
+           cell_count <= cache.size &&
+           pos_base_swa >= 0 &&
+           (pos_base_swa == 0 || live_swa >= cache.window_swa) &&
+           (uint64_t) pos_base_swa + live_swa == (uint64_t) cell_count;
+}
+
+static bool llama_kv_cache_compact_contiguous_positions_valid(
+        const llama_kv_cache & cache,
+                      uint32_t cell_count,
+                  llama_seq_id seq_id) {
+    std::vector<bool> seen(cell_count, false);
+    uint32_t seen_count = 0;
+
+    for (const auto & cell : cache.cells) {
+        const bool selected = seq_id < 0 ? !cell.is_empty() : cell.has_seq_id(seq_id);
+        if (!selected) {
+            continue;
+        }
+        if (cell.pos < 0 || (uint64_t) cell.pos >= cell_count || seen[cell.pos]) {
+            return false;
+        }
+        seen[cell.pos] = true;
+        ++seen_count;
+    }
+
+    return seen_count == cell_count;
+}
+
+static bool llama_kv_cache_compact_state_valid(
+        const llama_kv_cache & cache,
+                      uint32_t cell_count,
+                  llama_seq_id seq_id) {
+    if (cache.head_swa < cache.sink_rows) {
+        return false;
+    }
+    const uint32_t live_swa = cache.head_swa - cache.sink_rows;
+    return llama_kv_cache_compact_header_valid(
+            cache,
+            cell_count,
+            cache.size_swa,
+            live_swa,
+            cache.pos_base_swa,
+            cache.head_swa) &&
+           llama_kv_cache_compact_contiguous_positions_valid(cache, cell_count, seq_id);
+}
+
 static inline bool llama_kv_qnext_seq_id_in_range(const llama_kv_cache & cache, llama_seq_id seq_id) {
     const uint32_t n_slots = llama_kv_qnext_state_slots(cache);
     return n_slots > 0 && seq_id >= 0 && (uint32_t) seq_id < n_slots;
@@ -9398,9 +9456,10 @@ bool llama_context_get_memory_info(
 }
 
 bool llama_supports_full_state_io(const struct llama_context * ctx) {
-    return ctx != nullptr &&
-           ctx->model.arch != LLM_ARCH_OPENPANGU &&
-           !ctx->kv_self.any_compacted();
+    if (ctx == nullptr || ctx->model.arch == LLM_ARCH_OPENPANGU) {
+        return false;
+    }
+    return !ctx->kv_self.any_compacted() || ctx->model.arch == LLM_ARCH_DEEPSEEK4;
 }
 
 const struct llama_vocab* llama_model_get_vocab(const struct llama_model* model) {
@@ -10785,7 +10844,10 @@ struct llama_data_write {
         GGML_ASSERT(cell_count == cell_count_check);
 
         if (kv_self.any_compacted()) {
-            const uint32_t live_rows = kv_self.live_swa();
+            if (!llama_kv_cache_compact_state_valid(kv_self, cell_count, seq_id)) {
+                throw std::runtime_error("failed to save kv cache: inconsistent compacted window state");
+            }
+            const uint32_t live_rows = kv_self.head_swa - kv_self.sink_rows;
             write(&LLAMA_SWA_COMPACT_LAYOUT_MAGIC, sizeof(LLAMA_SWA_COMPACT_LAYOUT_MAGIC));
             write(&kv_self.size_swa, sizeof(kv_self.size_swa));
             write(&live_rows, sizeof(live_rows));
@@ -11470,6 +11532,10 @@ struct llama_data_read {
 
             uint32_t dsv4_single_stream;
             read_to(&dsv4_single_stream, sizeof(dsv4_single_stream));
+            if (dsv4_single_stream > 1) {
+                LLAMA_LOG_ERROR("%s: invalid DSV4 stream mode %u\n", __func__, dsv4_single_stream);
+                return false;
+            }
 
             int32_t dsv4_stream_idx;
             read_to(&dsv4_stream_idx, sizeof(dsv4_stream_idx));
@@ -11478,6 +11544,13 @@ struct llama_data_read {
             read_to(&dsv4_n_stream, sizeof(dsv4_n_stream));
             if (dsv4_n_stream != cache.n_stream) {
                 LLAMA_LOG_ERROR("%s: DSV4 cache stream count mismatch (%u != %u)\n", __func__, dsv4_n_stream, cache.n_stream);
+                return false;
+            }
+            if ((dsv4_single_stream &&
+                 (dsv4_stream_idx < 0 || (uint32_t) dsv4_stream_idx >= dsv4_n_stream)) ||
+                (!dsv4_single_stream && dsv4_stream_idx != -1)) {
+                LLAMA_LOG_ERROR("%s: invalid DSV4 source stream %d for mode %u\n",
+                        __func__, dsv4_stream_idx, dsv4_single_stream);
                 return false;
             }
 
@@ -11498,9 +11571,24 @@ struct llama_data_read {
                 uint32_t layer_type;
                 read_to(&layer_type, sizeof(layer_type));
 
+                uint32_t expected_layer_type = 0;
+                if (il < cache.csa_k.size() && cache.csa_k[il] != nullptr) {
+                    expected_layer_type = 1;
+                } else if (il < cache.hca_k.size() && cache.hca_k[il] != nullptr) {
+                    expected_layer_type = 2;
+                }
+                if (layer_type != expected_layer_type) {
+                    LLAMA_LOG_ERROR("%s: DSV4 cache layer %u type mismatch (%u != %u)\n",
+                            __func__, il, layer_type, expected_layer_type);
+                    return false;
+                }
+
                 bool set_ok = true;
                 auto set_tensor_stream = [&](struct ggml_tensor * tensor) {
-                    if (!set_ok) return;
+                    if (!set_ok || tensor == nullptr) {
+                        set_ok = false;
+                        return;
+                    }
                     if (dsv4_single_stream) {
                         size_t dst_offset, stream_size;
                         if (!dsv4_stream_offset_size(tensor, cache.n_stream, dsv4_dst_stream, dst_offset, stream_size)) {
@@ -11578,17 +11666,15 @@ struct llama_data_read {
             read_to(&restore_live,     sizeof(restore_live));
             read_to(&restore_pos_base, sizeof(restore_pos_base));
             read_to(&restore_head_swa, sizeof(restore_head_swa));
-            if (restore_size_swa != kv_self.size_swa) {
-                throw std::runtime_error("failed to restore kv cache: compacted row count differs from this context");
-            }
-            if (restore_head_swa < kv_self.sink_rows || restore_head_swa > kv_self.size_swa ||
-                restore_head_swa - kv_self.sink_rows != restore_live) {
-                throw std::runtime_error("failed to restore kv cache: inconsistent compacted window state");
-            }
             read_to(&cell_count, sizeof(cell_count));
-            if (restore_pos_base < 0 ||
-                (uint64_t) restore_pos_base + restore_live != (uint64_t) cell_count) {
-                throw std::runtime_error("failed to restore kv cache: compacted window base inconsistent with cell count");
+            if (!llama_kv_cache_compact_header_valid(
+                        kv_self,
+                        cell_count,
+                        restore_size_swa,
+                        restore_live,
+                        restore_pos_base,
+                        restore_head_swa)) {
+                throw std::runtime_error("failed to restore kv cache: inconsistent compacted window state");
             }
         }
 
@@ -11597,6 +11683,7 @@ struct llama_data_read {
         if (res && compact_blob) {
             kv_self.pos_base_swa = restore_pos_base;
             kv_self.head_swa     = restore_head_swa;
+            res = llama_kv_cache_compact_contiguous_positions_valid(kv_self, cell_count, seq_id);
         }
         res = res && read_kv_cache_data(ctx, cell_count, seq_id, flags);
 
@@ -11879,8 +11966,8 @@ static bool llama_state_io_supported(
         LLAMA_LOG_ERROR("%s: only per-sequence state save/restore is supported for openPangu (whole-context and file-session state are not)\n", func);
         return false;
     }
-    if (ctx->kv_self.any_compacted() && seq_id < 0) {
-        LLAMA_LOG_ERROR("%s: whole-context state save/restore is not supported with --swa-compress; use per-sequence state\n", func);
+    if (seq_id < 0 && !llama_supports_full_state_io(ctx)) {
+        LLAMA_LOG_ERROR("%s: whole-context state save/restore is unsupported for this context\n", func);
         return false;
     }
     return true;

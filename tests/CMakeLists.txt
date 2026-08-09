@@ -230,6 +230,12 @@ target_include_directories(test-context-memory PRIVATE
 target_link_libraries(test-context-memory PRIVATE llama)
 add_test(NAME test-context-memory COMMAND test-context-memory)
 
+add_executable(test-swa-state test-swa-state.cpp)
+target_include_directories(test-swa-state PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-swa-state PRIVATE llama)
+add_test(NAME test-swa-state COMMAND test-swa-state)
+set_property(TEST test-swa-state PROPERTY LABELS model)
+
 if (TARGET llama::speculative)
     add_executable(test-speculative-api test-speculative-api.c)
     target_link_libraries(test-speculative-api PRIVATE llama::speculative llama)
