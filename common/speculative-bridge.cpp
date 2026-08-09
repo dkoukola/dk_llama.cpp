@@ -241,6 +241,7 @@ struct llama_speculative_session {
     bool poisoned = false;
     std::vector<float> authoritative_logits;
     bool has_authoritative_logits = false;
+    llama_speculative_internal::sampler_token_carry private_carry;
 
     ~llama_speculative_session() {
         if (speculative != nullptr) {
@@ -262,6 +263,7 @@ struct llama_speculative_round {
     std::vector<float> hidden_rows;
     std::vector<int32_t> output_indices;
     std::vector<float> previous_logits;
+    llama_speculative_internal::sampler_token_carry outgoing_carry;
     bool checkpoint_saved = false;
 
     ~llama_speculative_round() {
@@ -1793,8 +1795,8 @@ llama_speculative_status llama_speculative_session_generation_begin(
         return fail_call(result, error, LLAMA_SPECULATIVE_INVALID_ARGUMENT,
                 "generation begin params and sampler are required", session->next_position);
     }
-    if (session->generation_open || session->round_open || params->sampler->bound || params->sampler->probe_open ||
-            params->sampler->engine != session->engine) {
+    if (session->generation_open || session->round_open || session->private_carry.ready ||
+            params->sampler->bound || params->sampler->probe_open || params->sampler->engine != session->engine) {
         return fail_call(result, error, LLAMA_SPECULATIVE_BUSY,
                 "session or sampler already has an open transaction", session->next_position);
     }
@@ -1842,6 +1844,7 @@ llama_speculative_status llama_speculative_session_generation_synchronize(
         return fail_call(result, error, LLAMA_SPECULATIVE_BUSY,
                 "generation is not open or has an open round", session->next_position);
     }
+    llama_speculative_internal::sampler_token_carry_discard(session->private_carry);
     return finish_call(result, LLAMA_SPECULATIVE_OK, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
             LLAMA_SPECULATIVE_BOUNDARY_POST_CALL_COMMITTED, 0, session->next_position);
 }
@@ -1858,6 +1861,7 @@ llama_speculative_status llama_speculative_session_generation_end(
         return fail_call(result, error, LLAMA_SPECULATIVE_BUSY,
                 "generation is not open or has an open round", session->next_position);
     }
+    llama_speculative_internal::sampler_token_carry_discard(session->private_carry);
     session->sampler->bound = false;
     session->sampler = nullptr;
     session->generation_open = false;
@@ -2105,8 +2109,14 @@ llama_speculative_status llama_speculative_round_begin(
         prepared->prefix_rng.reserve(maximum_outputs + 1);
         prepared->prefix_rng.push_back(session->sampler->canonical.rng);
 
-        const llama_token first = sample_token(
-            *session->sampler, prepared->provisional, session->target_context, -1, boundary_logits);
+        llama_token first = LLAMA_TOKEN_NULL;
+        // A carry stores the post-sample RNG; its one-token accepted-history delta is
+        // reconstructed by the unconditional accepted push below.
+        if (!llama_speculative_internal::sampler_token_carry_apply(
+                    session->private_carry, first, prepared->provisional.rng)) {
+            first = sample_token(
+                *session->sampler, prepared->provisional, session->target_context, -1, boundary_logits);
+        }
         if (first == LLAMA_TOKEN_NULL) {
             return fail_pre_call(LLAMA_SPECULATIVE_INTERNAL_ERROR, "could not sample target boundary logits");
         }
@@ -2214,12 +2224,6 @@ llama_speculative_status llama_speculative_round_begin(
         uint32_t accepted_drafts = 0;
         for (size_t row = 0; row < output_count; ++row) {
             const uint64_t prefix_count = prepared->committable_tokens.size();
-            const bool terminal_probe_needed = prefix_count >= params->generation_token_allowance ||
-                    prefix_count >= params->context_token_allowance;
-            if (prefix_count >= params->cooperative_token_allowance && !terminal_probe_needed) {
-                break;
-            }
-
             const float * logits = prepared->prefix_logits.data() + row * vocabulary_size;
             const llama_token sampled = sample_token(
                 *session->sampler, prepared->provisional, session->target_context, (int32_t) row, logits);
@@ -2232,7 +2236,12 @@ llama_speculative_status llama_speculative_round_begin(
             }
 
             prepared->view.terminal = candidate_terminal(*prepared, sampled, prefix_count);
-            if (prepared->view.terminal != LLAMA_SPECULATIVE_TERMINAL_NONE || row >= draft.size() || sampled != draft[row]) {
+            if (prepared->view.terminal != LLAMA_SPECULATIVE_TERMINAL_NONE) {
+                break;
+            }
+            if (row >= draft.size() || sampled != draft[row]) {
+                llama_speculative_internal::sampler_token_carry_capture(
+                    prepared->outgoing_carry, sampled, prepared->provisional.rng);
                 break;
             }
             prepared->provisional.accepted.push_back(sampled);
@@ -2415,7 +2424,13 @@ llama_speculative_status llama_speculative_round_commit(
         effect = LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID;
     }
 
-    result->terminal = prefix_count == round.committable_tokens.size()
+    const bool full_prefix_committed = prefix_count == round.committable_tokens.size();
+    llama_speculative_internal::sampler_token_carry_commit(
+        session.private_carry,
+        round.outgoing_carry,
+        full_prefix_committed && round.view.terminal == LLAMA_SPECULATIVE_TERMINAL_NONE);
+
+    result->terminal = full_prefix_committed
         ? round.view.terminal
         : LLAMA_SPECULATIVE_TERMINAL_NONE;
     finish_call(&result->call, LLAMA_SPECULATIVE_OK, effect,
@@ -2466,7 +2481,7 @@ llama_speculative_status llama_speculative_session_state_size(
     }
     if (const_session == nullptr || required_size == nullptr || info == nullptr ||
             !session_on_owner_thread(const_session) || !const_session->attached || const_session->poisoned ||
-            const_session->round_open) {
+            const_session->round_open || const_session->private_carry.ready) {
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "quiescent attached session and state outputs are required");
     }
     auto & session = *const_cast<llama_speculative_session *>(const_session);
@@ -2495,7 +2510,7 @@ llama_speculative_status llama_speculative_session_state_save(
     }
     if (const_session == nullptr || written_size == nullptr || info == nullptr ||
             !session_on_owner_thread(const_session) || !const_session->attached || const_session->poisoned ||
-            const_session->round_open) {
+            const_session->round_open || const_session->private_carry.ready) {
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "quiescent attached session and state outputs are required");
     }
     auto & session = *const_cast<llama_speculative_session *>(const_session);

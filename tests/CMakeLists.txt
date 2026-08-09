@@ -240,4 +240,11 @@ if (TARGET llama::speculative)
     target_include_directories(test-speculative-sampling PRIVATE ${PROJECT_SOURCE_DIR}/common)
     target_link_libraries(test-speculative-sampling PRIVATE llama)
     add_test(NAME test-speculative-sampling COMMAND test-speculative-sampling)
+
+    add_executable(test-speculative-carry
+        test-speculative-carry.cpp
+        ../common/speculative-sampling.cpp)
+    target_include_directories(test-speculative-carry PRIVATE ${PROJECT_SOURCE_DIR}/common)
+    target_link_libraries(test-speculative-carry PRIVATE llama)
+    add_test(NAME test-speculative-carry COMMAND test-speculative-carry)
 endif()

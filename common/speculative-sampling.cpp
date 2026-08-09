@@ -2,8 +2,49 @@
 
 #include <algorithm>
 #include <cmath>
+#include <type_traits>
 
 namespace llama_speculative_internal {
+
+static_assert(std::is_nothrow_copy_assignable_v<std::mt19937>);
+static_assert(std::is_nothrow_copy_assignable_v<sampler_token_carry>);
+
+bool sampler_token_carry_apply(
+        const sampler_token_carry & carry,
+        llama_token & token,
+        std::mt19937 & rng) noexcept {
+    if (!carry.ready) {
+        return false;
+    }
+    token = carry.token;
+    rng = carry.rng;
+    return true;
+}
+
+void sampler_token_carry_capture(
+        sampler_token_carry & carry,
+        llama_token token,
+        const std::mt19937 & rng) noexcept {
+    carry.token = token;
+    carry.rng = rng;
+    carry.ready = token != LLAMA_TOKEN_NULL;
+}
+
+void sampler_token_carry_discard(sampler_token_carry & carry) noexcept {
+    carry.token = LLAMA_TOKEN_NULL;
+    carry.ready = false;
+}
+
+void sampler_token_carry_commit(
+        sampler_token_carry & current,
+        const sampler_token_carry & outgoing,
+        bool keep_outgoing) noexcept {
+    if (keep_outgoing && outgoing.ready) {
+        current = outgoing;
+        return;
+    }
+    sampler_token_carry_discard(current);
+}
 
 llama_token sample_candidates(
         llama_context * context,
