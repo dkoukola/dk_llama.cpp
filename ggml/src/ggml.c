@@ -21571,9 +21571,6 @@ static void ggml_compute_forward_rope_f32(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    // row index used to determine which thread to use
-    int ir = 0;
-
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
 
     float corr_dims[2];
@@ -21610,13 +21607,23 @@ static void ggml_compute_forward_rope_f32(
     const bool is_flipped = dst->op_params[15] == 1 && !is_vision && !is_mrope;
     const int  rope_offset = is_flipped ? ne0 - n_dims : 0;
 
+    if (ir0 >= ir1) {
+        return;
+    }
+
     for (int64_t i3 = 0; i3 < ne3; i3++) { // batch
         for (int64_t i2 = 0; i2 < ne2; i2++) { // seq-len
+            const int64_t row0 = (i3*ne2 + i2)*ne1;
+            const int64_t i1_begin = MAX((int64_t) ir0 - row0, 0);
+            const int64_t i1_end = MIN((int64_t) ir1 - row0, ne1);
+            if (i1_begin >= i1_end) {
+                continue;
+            }
 
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
-                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, n_dims, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
             else {
                 const int64_t p_t = pos[i2];
@@ -21628,10 +21635,7 @@ static void ggml_compute_forward_rope_f32(
                     freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
 
-            for (int64_t i1 = 0; i1 < ne1; i1++) { // attn-heads
-                if (ir++ < ir0) continue;
-                if (ir   > ir1) break;
-
+            for (int64_t i1 = i1_begin; i1 < i1_end; i1++) { // attn-heads
                 if (is_neox || is_mrope) {
                     if (is_vision){
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
@@ -21779,9 +21783,6 @@ static void ggml_compute_forward_rope_f16(
     const int ir0 = dr*ith;
     const int ir1 = MIN(ir0 + dr, nr);
 
-    // row index used to determine which thread to use
-    int ir = 0;
-
     const float theta_scale = powf(freq_base, -2.0f/n_dims);
 
     float corr_dims[2];
@@ -21814,13 +21815,23 @@ static void ggml_compute_forward_rope_f16(
 
     const int32_t * pos = (const int32_t *) src1->data;
 
+    if (ir0 >= ir1) {
+        return;
+    }
+
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
+            const int64_t row0 = (i3*ne2 + i2)*ne1;
+            const int64_t i1_begin = MAX((int64_t) ir0 - row0, 0);
+            const int64_t i1_end = MIN((int64_t) ir1 - row0, ne1);
+            if (i1_begin >= i1_end) {
+                continue;
+            }
 
             float * cache = (float *) params->wdata + (ne0 + CACHE_LINE_SIZE_F32)*ith;
             if (!is_mrope) {
                 const int64_t p = pos[i2];
-                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
+                ggml_rope_cache_init(p, freq_scale, freq_factors, corr_dims, n_dims, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
             else {
                 const int64_t p_t = pos[i2];
@@ -21832,10 +21843,7 @@ static void ggml_compute_forward_rope_f16(
                     freq_scale, freq_factors, corr_dims, ne0, ext_factor, attn_factor, cache, sin_sign, theta_scale);
             }
 
-            for (int64_t i1 = 0; i1 < ne1; i1++) {
-                if (ir++ < ir0) continue;
-                if (ir   > ir1) break;
-
+            for (int64_t i1 = i1_begin; i1 < i1_end; i1++) {
                 if (is_neox || is_mrope) {
                     if (is_vision) {
                         for (int64_t i0 = 0; i0 < n_dims; i0 += 2) {
