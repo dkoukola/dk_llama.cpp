@@ -19,6 +19,7 @@
 #include "ggml-impl.h"
 #include "ggml-quants.h"
 #include "iqk_mul_mat.h"
+#include "iqk_mul_mat_internal.h"
 #include "iqk_quantize.h"
 #include "iqk_flash_impl.h"
 #include "iqk_gemm_floats.h"
@@ -516,6 +517,45 @@ extern "C" IQK_API bool iqk_mul_mat(long Nx, long Ny, long ne00,
         if (!MulMat::prepare(typeA, typeB, ne00, mm, Ny)) {
             return false;
         }
+
+        // The DeepSeek-V4 hyper-connection projection is a 24 x 16384 by
+        // 16384 x 8 F32 multiplication. The generic 16-row tiling below gives
+        // it only two workers. Partition the independent outputs into exact
+        // 5/5/5/1 + 5/3 row and 4 + 4 column groups. Keeping the same
+        // four-column kernel preserves each output element's floating-point
+        // operation order.
+        constexpr int k_hc_nx = 24;
+        constexpr int k_hc_ny = 8;
+        constexpr int k_hc_ne00 = 16384;
+        constexpr int k_hc_x_tiles = 6;
+        constexpr int k_hc_y_tiles = 2;
+        constexpr int k_hc_tasks = k_hc_x_tiles*k_hc_y_tiles;
+        constexpr int k_hc_x_offsets[k_hc_x_tiles] = { 0, 5, 10, 15, 16, 21 };
+        constexpr int k_hc_x_sizes[k_hc_x_tiles] = { 5, 5, 5, 1, 5, 3 };
+        if (typeA == GGML_TYPE_F32 && typeB == GGML_TYPE_F32 &&
+                Nx == k_hc_nx && Ny == k_hc_ny && ne00 == k_hc_ne00 &&
+                nth >= k_hc_tasks) {
+            GGML_ASSERT(mm.funcs[3] != nullptr);
+            for (int task = 0; task < k_hc_tasks; ++task) {
+                // Spread the twelve tasks over the full worker range. Under
+                // NUMA mirroring this assigns one four-column half to each of
+                // the two worker blocks instead of using node 0 exclusively.
+                const int owner = ((2*task + 1)*nth)/(2*k_hc_tasks);
+                if (ith != owner) {
+                    continue;
+                }
+                const int x_tile = task % k_hc_x_tiles;
+                const int y_tile = task / k_hc_x_tiles;
+                const int ix = k_hc_x_offsets[x_tile];
+                const int iy = 4*y_tile;
+                DataInfo info{C + ix, (const char *) B, (size_t) stride_C,
+                    row_size_qy, iy, 1, nullptr, 0};
+                mm.funcs[3](ne00, (const char *) A + ix*row_size_qx,
+                    row_size_qx, info, k_hc_x_sizes[x_tile]);
+            }
+            return true;
+        }
+
         const int min_step = Ny <= 16 ? 16 : 32;
         int ntile_x = (Nx + min_step - 1)/min_step;
         int ntile_y = (Ny + min_step - 1)/min_step;
@@ -692,6 +732,29 @@ extern "C" IQK_API bool iqk_mul_mat_4d(long Nx, long Ny, long ne00,
             }
         }
         return true;
+    }
+
+    // DeepSeek-V4 output-attention projection during an eight-token target
+    // decode. Its eight independent groups saturate at eight workers each;
+    // larger teams only split the same 1024 output rows more finely. Keep the
+    // 64-worker partition measured on the two-node mirror path and scatter it
+    // evenly across the full physical team so both weight copies are used.
+    // Check the exact tensor shape first so unrelated grouped matmuls and
+    // teams of at most 64 workers do not pay for NUMA state queries.
+    const bool use_dsv4_attn_wo_a_partition =
+        iqk_dsv4_attn_wo_a_shape_matches(
+                Nx, Ny, ne00, ne02, ne03, ne12, ne13,
+                typeA, typeB, nth) &&
+        iqk_dsv4_attn_wo_a_numa_matches(
+                ggml_numa_mirror_active(), ggml_numa_node_count(),
+                ggml_numa_get_mirror());
+    if (use_dsv4_attn_wo_a_partition) {
+        MulMat mm;
+        const bool kernel_available =
+            MulMat::prepare(typeA, typeB, ne00, mm, Ny);
+        return iqk_dsv4_attn_wo_a_mul(
+                A, strideA, nb02, B, strideB, nb12,
+                C, stride_C, nb2, ith, nth, kernel_available);
     }
 
     int gcd = simple_gcd(ne12*ne13, nth);

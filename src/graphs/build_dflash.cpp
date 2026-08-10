@@ -42,7 +42,6 @@ static ggml_tensor * build_dspark_markov_head(
     ggml_context * ctx0 = llm.ctx0;
     const llama_model & model = llm.model;
     llama_context & lctx = llm.lctx;
-    const llm_build_cb & cb = llm.cb;
 
     GGML_ASSERT(model.dflash_markov_w1 != nullptr);
     GGML_ASSERT(model.dflash_markov_w2 != nullptr);
@@ -60,7 +59,7 @@ static ggml_tensor * build_dspark_markov_head(
     ggml_tensor * previous = ggml_view_2d(ctx0, lctx.inp_tokens, 1, n_blocks, token_stride, 0);
     previous = ggml_cont_1d(ctx0, previous, n_blocks);
 
-    ggml_tensor * biased_columns = nullptr;
+    ggml_tensor * token_columns = nullptr;
     ggml_tensor * confidence_columns = nullptr;
     for (int64_t i = 0; i < block_drafts; ++i) {
         ggml_tensor * markov_feature = ggml_get_rows(ctx0, model.dflash_markov_w1, previous);
@@ -68,9 +67,10 @@ static ggml_tensor * build_dspark_markov_head(
         ggml_tensor * base_column = ggml_view_2d(ctx0, base_logits, n_vocab, n_blocks,
                 logits_stride, i * base_logits->nb[1]);
         ggml_tensor * biased = ggml_add(ctx0, base_column, bias);
-        biased_columns = biased_columns == nullptr
-                ? biased
-                : ggml_concat(ctx0, biased_columns, biased, 1);
+        ggml_tensor * token = ggml_argmax(ctx0, biased);
+        token_columns = token_columns == nullptr
+                ? token
+                : ggml_concat(ctx0, token_columns, token, 0);
 
         ggml_tensor * hidden_column = ggml_view_2d(ctx0, confidence_hidden,
                 confidence_hidden->ne[0], n_blocks,
@@ -87,16 +87,16 @@ static ggml_tensor * build_dspark_markov_head(
                 ? confidence
                 : ggml_concat(ctx0, confidence_columns, confidence, 1);
 
-        if (i + 1 < block_drafts) {
-            previous = ggml_argmax(ctx0, biased);
-        }
+        previous = token;
     }
 
-    ggml_tensor * result = ggml_reshape_3d(ctx0, biased_columns, n_vocab, n_blocks, block_drafts);
-    result = ggml_cont(ctx0, ggml_permute(ctx0, result, 0, 2, 1, 3));
-    result = ggml_reshape_2d(ctx0, result, n_vocab, n_tok);
-    cb(result, "result_output", -1);
-    ggml_build_forward_expand(gf, result);
+    // The autoregressive loop collects one token for every block at each draft position. Transpose
+    // that position-major layout back to the block-major order of the input batch.
+    ggml_tensor * tokens = ggml_reshape_2d(ctx0, token_columns, n_blocks, block_drafts);
+    tokens = ggml_cont(ctx0, ggml_permute(ctx0, tokens, 1, 0, 2, 3));
+    tokens = ggml_reshape_1d(ctx0, tokens, n_tok);
+    ggml_set_name(tokens, "draft_argmax");
+    ggml_build_forward_expand(gf, tokens);
 
     ggml_tensor * confidence = ggml_reshape_3d(ctx0, confidence_columns, 1, n_blocks, block_drafts);
     confidence = ggml_cont(ctx0, ggml_permute(ctx0, confidence, 0, 2, 1, 3));
@@ -105,7 +105,7 @@ static ggml_tensor * build_dspark_markov_head(
     ggml_build_forward_expand(gf, confidence);
     lctx.dflash.draft_confidence_tensor = confidence;
 
-    return result;
+    return tokens;
 }
 
 ggml_cgraph * llm_build_context::build_dflash_kv_cache() {
@@ -570,17 +570,18 @@ ggml_cgraph * llm_build_context::build_dflash() {
 
     GGML_ASSERT(model.output_mtp != nullptr);
     ggml_tensor * result = build_output(lctx, ctx0, inpL, model.output_mtp, model.output_norm, cb);
+    ggml_tensor * draft_tokens = nullptr;
     if (model.dflash_markov_w1 != nullptr) {
         cb(result, "dspark_base_logits", -1);
-        result = build_dspark_markov_head(*this, gf, result, inpL);
+        draft_tokens = build_dspark_markov_head(*this, gf, result, inpL);
     } else {
         cb(result, "result_output", -1);
         ggml_build_forward_expand(gf, result);
+        draft_tokens = ggml_argmax(ctx0, result);
+        ggml_set_name(draft_tokens, "draft_argmax");
+        ggml_build_forward_expand(gf, draft_tokens);
     }
 
-    ggml_tensor * draft_tokens = ggml_argmax(ctx0, result);
-    ggml_set_name(draft_tokens, "draft_argmax");
-    ggml_build_forward_expand(gf, draft_tokens);
     lctx.dflash.draft_tokens_tensor = draft_tokens;
 
     return gf;

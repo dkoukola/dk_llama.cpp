@@ -6257,6 +6257,7 @@ static int llama_decode_internal(
     n_outputs_embd = has_mtp && cparams.mtp_op_type == MTP_OP_NONE ? n_tokens_all : n_outputs;
     const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
     const bool is_dflash_decode = lctx.model.arch == LLM_ARCH_DFLASH_DRAFT;
+    const bool is_dspark_decode = is_dflash_decode && lctx.model.dflash_markov_w1 != nullptr;
     const size_t reserved_outputs = llama_output_reserve(lctx, required_outputs);
     if (reserved_outputs < required_outputs) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %zu outputs\n", __func__, required_outputs);
@@ -6541,8 +6542,12 @@ static int llama_decode_internal(
         struct ggml_tensor * res  = gf->nodes[gf->n_nodes - 1];
         struct ggml_tensor * embd = nullptr;
 
-        // DFlash GPU argmax draft_argmax node
-        if (lctx.dflash.draft_tokens_tensor != nullptr &&
+        // DFlash GPU argmax draft_argmax node. DSpark exposes tokens and confidence directly and
+        // intentionally does not retain its full biased logits as a graph output.
+        if (is_dspark_decode) {
+            GGML_ASSERT(lctx.dflash.draft_tokens_tensor != nullptr);
+            res = nullptr;
+        } else if (lctx.dflash.draft_tokens_tensor != nullptr &&
             strcmp(res->name, "result_output") != 0) {
             for (int i = gf->n_nodes - 2; i >= 0; --i) {
                 if (strcmp(gf->nodes[i]->name, "result_output") == 0) {
@@ -6583,7 +6588,7 @@ static int llama_decode_internal(
             if (cparams.embeddings && lctx.model.hparams.nextn_predict_layers == 0 && !has_mtp) {
                 res = nullptr; // do not extract logits for embedding case
             } else {
-                if (!embd) { // do not extract embeddings when not needed
+                if (!embd && !is_dspark_decode) { // do not extract embeddings when not needed
                     GGML_ASSERT(strcmp(res->name, "result_output") == 0 && "missing result_output tensor");
                 }
             }

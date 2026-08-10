@@ -378,8 +378,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
 
             llama_token id = llama_get_dflash_draft_token_ith(ctx_dft, i);
             if (id == LLAMA_TOKEN_NULL) {
-                const int32_t output_index = is_dspark ? i : i + 1;
-                id = common_sampler_sample_speculative(nullptr, ctx_dft, output_index, nullptr);
+                if (is_dspark) {
+                    LOG_ERR("%s: DSpark token output is unavailable at position %d\n", __func__, i);
+                    result.clear();
+                    break;
+                }
+                id = common_sampler_sample_speculative(nullptr, ctx_dft, i + 1, nullptr);
             }
             result.push_back(id);
         }

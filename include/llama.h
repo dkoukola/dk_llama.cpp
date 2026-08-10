@@ -1196,7 +1196,8 @@ extern "C" {
             size_t                 logits_count);
 
     // Get the argmax token ID for DFlash draft position i without materializing full logits.
-    // Returns LLAMA_TOKEN_NULL if argmax is not available (falls back to logits path).
+    // Returns LLAMA_TOKEN_NULL if argmax is not available. Plain DFlash callers may fall back to logits;
+    // DSpark does not retain its full biased logits.
     LLAMA_API llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i);
     LLAMA_API float llama_get_dflash_draft_confidence_ith(struct llama_context * ctx, int32_t i);
 
