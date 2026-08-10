@@ -12,6 +12,9 @@ enum {
     IQK_DSV4_ATTN_WO_A_GROUPS = 8,
     IQK_DSV4_ATTN_WO_A_WORKERS = 64,
     IQK_DSV4_ATTN_WO_A_GROUP_WORKERS = 8,
+    IQK_NUMA_MIRROR_SMALL_TILE = 16,
+    IQK_NUMA_MIRROR_SMALL_NY = 8,
+    IQK_NUMA_MIRROR_SMALL_K = 4096,
 };
 
 static inline bool iqk_dsv4_attn_wo_a_shape_matches(
@@ -91,4 +94,68 @@ static inline bool iqk_dsv4_attn_wo_a_mul(
             C + group*nb2, stride_C,
             active_rank/IQK_DSV4_ATTN_WO_A_GROUPS,
             IQK_DSV4_ATTN_WO_A_GROUP_WORKERS);
+}
+
+static inline int iqk_numa_mirror_small_tile_count(
+        long Nx, long Ny, long ne00,
+        long ne02, long ne03, long ne12, long ne13,
+        int typeA, int typeB, int nth) {
+    if (nth != 128 ||
+            typeA != GGML_TYPE_BF16 || typeB != GGML_TYPE_F32 ||
+            Ny != IQK_NUMA_MIRROR_SMALL_NY ||
+            ne00 != IQK_NUMA_MIRROR_SMALL_K ||
+            ne02 != 1 || ne03 != 1 || ne12 != 1 || ne13 != 1) {
+        return 0;
+    }
+    return Nx == 1024 ?
+        (int) Nx/IQK_NUMA_MIRROR_SMALL_TILE : 0;
+}
+
+static inline int iqk_numa_mirror_small_use_partition(
+        bool tensor_mirrored, bool mirror_active, int n_nodes,
+        uint32_t mirror_flags,
+        long Nx, long Ny, long ne00,
+        long ne02, long ne03, long ne12, long ne13,
+        int typeA, int typeB, int nth) {
+    if (!tensor_mirrored ||
+            !iqk_dsv4_attn_wo_a_numa_matches(
+                    mirror_active, n_nodes, mirror_flags)) {
+        return 0;
+    }
+    return iqk_numa_mirror_small_tile_count(
+            Nx, Ny, ne00, ne02, ne03, ne12, ne13,
+            typeA, typeB, nth);
+}
+
+// Map an interval-center physical owner back to its logical tile rank.
+// This preserves the existing 16-row tiles while selecting half of their
+// owners from each contiguous block of a two-node NUMA mirror team.
+static inline int iqk_numa_mirror_small_active_rank(
+        int ith, int nth, int n_active) {
+    if (ith < 0 || ith >= nth || n_active <= 0 || nth < n_active) {
+        return -1;
+    }
+    const int rank = (int) (((2*(int64_t) ith + 1)*n_active)/(2*(int64_t) nth));
+    const int owner =
+        (int) (((2*(int64_t) rank + 1)*nth)/(2*(int64_t) n_active));
+    if (owner == ith) {
+        return rank;
+    }
+    return -1;
+}
+
+static inline void iqk_numa_mirror_small_team(
+        int ith, int nth, int n_active,
+        int * logical_ith, int * logical_nth) {
+    if (n_active <= 0) {
+        *logical_ith = ith;
+        *logical_nth = nth;
+        return;
+    }
+    const int rank =
+        iqk_numa_mirror_small_active_rank(ith, nth, n_active);
+    *logical_ith = rank >= 0 ? rank : n_active;
+    // Reserve one valid, idle logical rank so inactive physical workers still
+    // satisfy ith < nth while running the same IQK capability check.
+    *logical_nth = n_active + 1;
 }

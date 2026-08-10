@@ -17,6 +17,7 @@
 #include "iqk/iqk_cpu_ops.h"
 #if GGML_USE_IQK_MULMAT
 #include "iqk/iqk_mul_mat.h"
+#include "iqk/iqk_mul_mat_internal.h"
 #include "iqk/iqk_config.h"
 #endif
 
@@ -18332,6 +18333,33 @@ static inline uint32_t simple_gcd(uint32_t a, uint32_t b) {
     return a;
 }
 
+#if GGML_USE_IQK_MULMAT
+static bool ggml_iqk_mul_mat_team(
+        const struct ggml_tensor * src0,
+        const struct ggml_tensor * src1,
+        enum ggml_type typeB,
+        int ith, int nth,
+        int * iqk_ith, int * iqk_nth) {
+    int n_active = iqk_numa_mirror_small_tile_count(
+            src0->ne[1], src1->ne[1], src0->ne[0],
+            src0->ne[2], src0->ne[3], src1->ne[2], src1->ne[3],
+            src0->type, typeB, nth);
+    if (n_active == 0 || src0->data_numa == NULL) {
+        iqk_numa_mirror_small_team(
+                ith, nth, 0, iqk_ith, iqk_nth);
+        return false;
+    }
+    if (!iqk_dsv4_attn_wo_a_numa_matches(
+                ggml_numa_mirror_active(), ggml_numa_node_count(),
+                ggml_numa_get_mirror())) {
+        n_active = 0;
+    }
+    iqk_numa_mirror_small_team(
+            ith, nth, n_active, iqk_ith, iqk_nth);
+    return n_active > 0;
+}
+#endif
+
 static int ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst,
@@ -18384,11 +18412,25 @@ static int ggml_compute_forward_mul_mat(
 
 #if GGML_USE_IQK_MULMAT
     if (dst->type == GGML_TYPE_F32) {
-        if (iqk_mul_mat_4d(ne01, ne11, ne00,
+        int iqk_ith;
+        int iqk_nth;
+        const bool use_iqk_small_partition = ggml_iqk_mul_mat_team(
+                src0, src1, src1->type, ith, nth, &iqk_ith, &iqk_nth);
+        const bool iqk_handled = use_iqk_small_partition ?
+            iqk_mul_mat(
+                    ne01, ne11, ne00,
+                    src0->type, src0_data, nb01,
+                    src1->type, src1->data, nb11,
+                    (float *)dst->data, nb1/sizeof(float),
+                    iqk_ith, iqk_nth) :
+            iqk_mul_mat_4d(
+                    ne01, ne11, ne00,
                     ne02, ne03, ne12, ne13, nb02, nb03, nb12, nb13, nb2/sizeof(float), nb3/sizeof(float),
                     src0->type, src0_data, nb01,
                     src1->type, src1->data, nb11,
-                    (float *)dst->data, nb1/sizeof(float), ith, nth)) return node_n;
+                    (float *)dst->data, nb1/sizeof(float),
+                    ith, nth);
+        if (iqk_handled) return node_n;
     }
 #endif
 

@@ -214,6 +214,11 @@ if (GGML_IQK_MUL_MAT)
     target_link_libraries(test-iqk-dsv4-attn PRIVATE ggml)
     llama_test(test-iqk-dsv4-attn)
 
+    add_executable(test-iqk-numa-mirror-small test-iqk-numa-mirror-small.cpp)
+    target_include_directories(test-iqk-numa-mirror-small PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+    target_link_libraries(test-iqk-numa-mirror-small PRIVATE ggml)
+    llama_test(test-iqk-numa-mirror-small)
+
     add_executable(test-iqk-hc-f32 test-iqk-hc-f32.cpp)
     target_include_directories(test-iqk-hc-f32 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
     target_link_libraries(test-iqk-hc-f32 PRIVATE ggml)
