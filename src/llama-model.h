@@ -198,6 +198,12 @@ struct llama_layer {
     struct ggml_tensor * wo_enc = nullptr;
     struct ggml_tensor * attn_sinks = nullptr;
 
+    // DFlash2 dynamic grouped-convolution parameters.
+    struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_base = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_proj = nullptr;
+
     // attention bias
     struct ggml_tensor * bq = nullptr;
     struct ggml_tensor * bk = nullptr;
@@ -243,11 +249,16 @@ struct llama_layer {
     llama_split_tensor split_ssm_wqkv_gate;
     llama_split_tensor split_ssm_in;
     llama_split_tensor split_ssm_conv1d;
+    llama_split_tensor split_ssm_conv1d_q;
+    llama_split_tensor split_ssm_conv1d_k;
+    llama_split_tensor split_ssm_conv1d_v;
     llama_split_tensor split_ssm_dt;
     llama_split_tensor split_ssm_a;
     llama_split_tensor split_ssm_beta_alpha;
     llama_split_tensor split_ssm_beta;
     llama_split_tensor split_ssm_alpha;
+    llama_split_tensor split_ssm_f_a;
+    llama_split_tensor split_ssm_g_a;
     llama_split_tensor split_ssm_norm;
     llama_split_tensor split_ssm_out;
 
@@ -354,9 +365,14 @@ struct llama_layer {
     struct ggml_tensor * ssm_beta_alpha = nullptr;
     struct ggml_tensor * ssm_alpha = nullptr;
     struct ggml_tensor * ssm_beta = nullptr;
+    struct ggml_tensor * ssm_f_a = nullptr;
+    struct ggml_tensor * ssm_g_a = nullptr;
 
     // mamba
     struct ggml_tensor * ssm_conv1d = nullptr;
+    struct ggml_tensor * ssm_conv1d_q = nullptr;
+    struct ggml_tensor * ssm_conv1d_k = nullptr;
+    struct ggml_tensor * ssm_conv1d_v = nullptr;
     struct ggml_tensor * ssm_a = nullptr;
     struct ggml_tensor * ssm_d = nullptr;
 
@@ -473,6 +489,9 @@ struct llama_model {
     struct ggml_tensor * mtp_centroids = nullptr;
     struct ggml_tensor * dflash_fc = nullptr;
     struct ggml_tensor * dflash_hidden_norm = nullptr;
+    struct ggml_tensor * dflash_selector_prev = nullptr;
+    struct ggml_tensor * dflash_selector_next = nullptr;
+    struct ggml_tensor * dflash_selector_hidden = nullptr;
     std::vector<struct ggml_tensor *> dflash_aux_hidden_norms;
     struct ggml_tensor * dflash_markov_w1 = nullptr;
     struct ggml_tensor * dflash_markov_w2 = nullptr;
@@ -595,14 +614,22 @@ struct llama_model {
     }
 
     bool is_mla_model() const {
-        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4;
+        return arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_GLM_DSA || arch == LLM_ARCH_MISTRAL4 || arch == LLM_ARCH_BAILINGMOE3;
+    }
+
+    float swiglu_limit(uint32_t il, bool shared) const {
+        const bool is_dsv4_draft = arch == LLM_ARCH_DFLASH_DRAFT && hparams.dsv4_hc_mult > 0;
+        if (arch != LLM_ARCH_STEP35 && arch != LLM_ARCH_BAILINGMOE3 && arch != LLM_ARCH_DEEPSEEK4 &&
+                !is_dsv4_draft) {
+            return 0.0f;
+        }
+        return shared ? hparams.swiglu_limits_shared[il] : hparams.swiglu_limits[il];
     }
 
     // a compacted sliding-window cache needs the graph to build its KQ mask over the compacted
-    // layout, and the compacted mask keys on position alone, so it also requires K-only cache
-    // rows and a single sequence
+    // layout, and the compacted mask keys on position alone, so it requires a single sequence
     bool supports_swa_compress() const {
-        return arch == LLM_ARCH_OPENPANGU || arch == LLM_ARCH_DEEPSEEK4;
+        return arch == LLM_ARCH_OPENPANGU || arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_LAGUNA;
     }
 
     static inline int hadamard_size(int head_size) {

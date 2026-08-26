@@ -564,7 +564,8 @@ bool llama_prepare_dflash_graph_inputs(
             gf_kv = lctx.dflash.kv.cache_graph;
         } else {
             gf_kv = llm_build_context::llama_build_graph_dflash_kv_cache(lctx);
-            if (gf_kv == nullptr || lctx.dflash.kv.cache_input_target_features == nullptr || lctx.dflash.kv.cache_input_pos_ctx == nullptr) {
+            if (gf_kv == nullptr || lctx.dflash.kv.cache_input_target_features == nullptr ||
+                    lctx.dflash.kv.cache_input_pos_ctx == nullptr) {
                 LLAMA_LOG_ERROR("%s: failed to build DFlash K/V cache graph\n", __func__);
                 return false;
             }
@@ -668,8 +669,12 @@ bool llama_prepare_dflash_graph_inputs(
 
     if (kq_mask_swa != nullptr) {
         const int32_t swa_window = (int32_t) lctx.model.hparams.n_swa;
+        const bool is_dflash2 = lctx.model.arch == LLM_ARCH_DFLASH2;
         const int32_t draft_pos_base = (int32_t) last_target_pos +
-                (lctx.model.dflash_markov_w1 != nullptr ? 1 : 0);
+                ((lctx.model.dflash_markov_w1 != nullptr || is_dflash2) ? 1 : 0);
+        const bool causal_attn = is_dflash2
+                ? lctx.cparams.causal_attn
+                : lctx.model.hparams.causal_attn;
 
         if (kq_mask_swa->type == GGML_TYPE_F16) {
             const ggml_fp16_t h_inf = ggml_fp32_to_fp16(-INFINITY);
@@ -691,9 +696,7 @@ bool llama_prepare_dflash_graph_inputs(
 
                 for (int32_t k = cross_ctx; k < cross_ctx + (int32_t) n_tokens; ++k) {
                     const int32_t block_k = k - cross_ctx;
-                    // Non-causal DFlash/DSpark blocks expose all future noise tokens;
-                    // causal variants retain the ordinary lower-triangular restriction.
-                    if ((!lctx.model.hparams.causal_attn || block_k <= (int32_t) j) &&
+                    if ((!causal_attn || block_k <= (int32_t) j) &&
                             ((int32_t) j - block_k) < swa_window) {
                         row[k] = h_zero;
                     }
@@ -718,7 +721,7 @@ bool llama_prepare_dflash_graph_inputs(
 
                 for (int32_t k = cross_ctx; k < cross_ctx + (int32_t) n_tokens; ++k) {
                     const int32_t block_k = k - cross_ctx;
-                    if ((!lctx.model.hparams.causal_attn || block_k <= (int32_t) j) &&
+                    if ((!causal_attn || block_k <= (int32_t) j) &&
                             ((int32_t) j - block_k) < swa_window) {
                         row[k] = 0.0f;
                     }

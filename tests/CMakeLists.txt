@@ -230,6 +230,8 @@ target_link_libraries(test-rope-parallel PRIVATE ggml)
 llama_test(test-rope-parallel)
 llama_build_and_test(test-speculative-config.cpp)
 target_include_directories(test-speculative-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
+llama_build_and_test(test-iq4-ks-kt-decode.cpp)
+target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 

@@ -165,8 +165,9 @@ enum common_speculative_type {
 std::string common_speculative_type_name_str();
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
 std::string common_speculative_type_to_str(enum common_speculative_type type);
-bool common_speculative_type_is_self_spec(enum common_speculative_type type);
 bool common_speculative_type_is_dflash_family(enum common_speculative_type type);
+bool common_speculative_type_uses_target_features(enum common_speculative_type type);
+bool common_speculative_type_is_self_spec(enum common_speculative_type type);
 
 struct common_speculative_stage_params {
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
@@ -225,6 +226,10 @@ struct common_params_speculative {
     int32_t mtp_heads = 1; // MTP heads to use; 1 is the default, while >1 and 0 (all model heads) are experimental
     int32_t dflash_cross_ctx = 512; // target-feature context window for DFlash
 
+    // Samplers for DFlash2
+    float    draft_temperature = 0.0f;
+    uint32_t draft_seed = LLAMA_DEFAULT_SEED;
+
     float   p_split = 0.1f; // speculative decoding split probability
     float   p_min = 0.75f; // minimum speculative decoding probability (greedy)
 
@@ -270,6 +275,8 @@ struct common_params_speculative {
     common_params_speculative with_stage_overrides(const common_speculative_stage_params & stage) const;
     bool has_stage_chain() const;
     bool has_stage_type(common_speculative_type stage_type) const;
+    bool has_dflash_family_stage() const;
+    bool uses_target_features() const;
     void remove_stage_type(common_speculative_type stage_type);
     bool has_composite_stage_chain() const;
     bool needs_dft_model() const;
@@ -419,7 +426,7 @@ struct gpt_params {
     bool cont_batching     = true;  // insert new sequences for decoding on-the-fly
     bool flash_attn        = true;  // flash attention
     int  mla_attn          = 3;     // MLA 0: standard, 1: MLA with K and V^T cache, 2: MLA with just K cache, 3: the best of both worlds
-    int  attn_max_batch    = 0;     // Max batch size to use when computing attention (only applicable if flash_attn = false)
+    int  attn_max_batch    = 256;   // Max batch size to use when computing attention (only applicable if flash_attn = false)
     bool fused_moe_up_gate = true;  // fused up*unary(gate) op for MoE models
     bool fused_up_gate     = true;  // fused up*unary(gate) op
     bool fused_mmad        = true;  // fused mul+multi_add op

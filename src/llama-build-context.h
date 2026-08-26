@@ -37,6 +37,12 @@ enum llm_norm_type {
     LLM_NORM_RMS,
 };
 
+struct post_norm_data {
+    std::vector<ggml_tensor *> next_input;
+    ggml_tensor * norm;
+    float         f_rms_eps;
+};
+
 struct llm_build_context {
     const llama_model    & model;
           llama_context  & lctx;
@@ -153,7 +159,7 @@ struct llm_build_context {
 
     ggml_tensor * build_inp_KQ_mask_swa_win(int64_t n_kv_win, bool causal = true);
 
-    ggml_tensor * build_swa_mask_for_graph(uint32_t window, bool compacted, bool * windowed);
+    ggml_tensor * build_swa_mask_for_graph(uint32_t window, bool compacted, bool * windowed = nullptr);
 
     ggml_tensor * build_inp_mean();
 
@@ -193,6 +199,8 @@ struct llm_build_context {
             ggml_tensor * wq, ggml_tensor * wk, ggml_tensor * wv, ggml_tensor * q_norm, ggml_tensor * k_norm, int il) const;
 
     ggml_cgraph * build_llama();
+
+    ggml_cgraph * build_muse_glimmer();
 
     ggml_cgraph * build_mistral3();
 
@@ -425,6 +433,7 @@ struct llm_build_context {
     ggml_cgraph * build_openai_moe();
 
     ggml_cgraph * build_bailingmoe2();
+    ggml_cgraph * build_bailingmoe3();
 
     ggml_cgraph * build_minimaxm2();
     ggml_cgraph * build_minimaxm3();
@@ -451,6 +460,10 @@ struct llm_build_context {
     //
     static ggml_tensor * llm_build_lora_mm(llama_context & lctx, ggml_context * ctx0,
             ggml_tensor * w, ggml_tensor * cur);
+
+    static ggml_tensor * build_mla_output_gate(llama_context & lctx, ggml_context * ctx0,
+            ggml_tensor * output, ggml_tensor * input, ggml_tensor * gate_w,
+            int64_t head_dim, int64_t n_head, int il, const llm_build_cb & cb);
 
     static ggml_tensor * llm_build_lora_mm_id(llama_context & lctx, ggml_context * ctx0,
           ggml_tensor * w, ggml_tensor * cur, ggml_tensor * ids);
@@ -492,7 +505,8 @@ struct llm_build_context {
                     int32_t   n_kv,
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
-         ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr);
+         ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
+                    int32_t   swa_head = -1);
 
     static ggml_tensor * llm_build_ffn(ggml_context * ctx, llama_context & lctx, ggml_tensor * ffn_norm,
          ggml_tensor * cur,
@@ -509,7 +523,9 @@ struct llm_build_context {
             llm_ffn_op_type   type_op,
           llm_ffn_gate_type   type_gate,
          const llm_build_cb & cb, int il, ggml_cgraph * graph = nullptr, bool add_input = false,
-         bool is_norm = false, ggml_tensor * add_extra = nullptr, ggml_tensor * post_norm = nullptr);
+         bool is_norm = false, ggml_tensor * add_extra = nullptr,
+         ggml_tensor * post_norm = nullptr, float post_norm_eps = 0.0f,
+         post_norm_data * pnd = nullptr);
 
     static ggml_tensor * llm_build_moe_ffn(ggml_context * ctx, llama_context & lctx,
          ggml_tensor * cur,
@@ -596,7 +612,8 @@ llm_expert_gating_func_type   gating_op,
             ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors,
             ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
             int n_swa, int il, bool do_rope = true, bool add_graph_split = false, bool add_input = false, bool is_norm = false,
-            bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1);
+            bool is_multi = false, ggml_tensor * post_norm = nullptr, int kv_il = -1, float post_norm_eps = 0.0f,
+            post_norm_data * pnd = nullptr);
 
     static ggml_tensor * build_output(llama_context & lctx, ggml_context * ctx, ggml_tensor * cur, ggml_tensor * output, const llm_build_cb & cb);
 

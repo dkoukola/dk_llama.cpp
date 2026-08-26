@@ -63,12 +63,15 @@ add_library(llama
             llama-hparams.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            llama-kda.h
+            llama-kda.cpp
             unicode.h
             unicode.cpp
             unicode-data.cpp
             unicode-script-data.cpp
             # graphs
             graphs/build_llama.cpp
+            graphs/build_muse_glimmer.cpp
             graphs/build_mistral3.cpp
             graphs/build_deci.cpp
             graphs/build_baichuan.cpp
@@ -127,6 +130,7 @@ add_library(llama
             graphs/build_mimo2.cpp
             graphs/build_openai.cpp
             graphs/build_bailingmoe2.cpp
+            graphs/build_bailingmoe3.cpp
             graphs/build_minimaxm2.cpp
             graphs/build_minimaxm3.cpp
             graphs/build_smollm3.cpp

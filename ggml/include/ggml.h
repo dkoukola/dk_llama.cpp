@@ -868,6 +868,7 @@ extern "C" {
 
     // computation graph
     struct ggml_cgraph {
+        uint64_t uid;
         int size;
         int n_nodes;
         int n_leafs;
@@ -2519,7 +2520,11 @@ extern "C" {
             int                   nk,
             int                   topk_experts);
 
+#if GGML_USE_VULKAN
+#define GGML_KQ_MASK_PAD 64
+#else
 #define GGML_KQ_MASK_PAD 16
+#endif
 
     // q:    [n_embd, n_batch,     n_head,    1]
     // k:    [n_embd, n_kv,        n_head_kv, 1]

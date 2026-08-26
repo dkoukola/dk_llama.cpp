@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <sstream>
 #include <unordered_map>
 
 #define SPEC_VOCAB_MAX_SIZE_DIFFERENCE  128
@@ -152,18 +153,17 @@ static bool common_speculative_are_compatible(
     LOG_DBG("%s: vocab_type dft: %d\n", __func__, vocab_type_dft);
 
     if (vocab_type_tgt != vocab_type_dft) {
-        LOG_DBG("%s: draft model vocab type must match target model to use speculation but ", __func__);
-        LOG_DBG("vocab_type_dft = %d while vocab_type_tgt = %d\n", vocab_type_dft, vocab_type_tgt);
+        LOG_WRN("%s: draft model vocab type must match target model to use speculation but ", __func__);
+        LOG_WRN("vocab_type_dft = %d while vocab_type_tgt = %d\n", vocab_type_dft, vocab_type_tgt);
         return false;
     }
 
-    if (
-        llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
+    if (!llama_model_is_gemma4_mtp_assistant(model_dft) &&
+       (llama_vocab_get_add_bos(vocab_tgt) != llama_vocab_get_add_bos(vocab_dft) ||
         llama_vocab_get_add_eos(vocab_tgt) != llama_vocab_get_add_eos(vocab_dft) ||
         llama_vocab_bos(vocab_tgt) != llama_vocab_bos(vocab_dft) ||
-        llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft)
-    ) {
-        LOG_DBG("%s: draft model special tokens must match target model to use speculation\n", __func__);
+        llama_vocab_eos(vocab_tgt) != llama_vocab_eos(vocab_dft))) {
+        LOG_WRN("%s: draft model special tokens must match target model to use speculation\n", __func__);
         return false;
     }
 
@@ -175,8 +175,8 @@ static bool common_speculative_are_compatible(
             : n_vocab_dft - n_vocab_tgt;
 
         if (vocab_diff > SPEC_VOCAB_MAX_SIZE_DIFFERENCE) {
-            LOG_DBG("%s: draft model vocab must closely match target model to use speculation but ", __func__);
-            LOG_DBG("target vocab size %d does not match draft vocab size %d - difference %d, max allowed %d\n",
+            LOG_WRN("%s: draft model vocab must closely match target model to use speculation but ", __func__);
+            LOG_WRN("target vocab size %d does not match draft vocab size %d - difference %d, max allowed %d\n",
                     n_vocab_tgt, llama_vocab_n_tokens(vocab_dft), vocab_diff, SPEC_VOCAB_MAX_SIZE_DIFFERENCE);
             return false;
         }
@@ -186,8 +186,8 @@ static bool common_speculative_are_compatible(
             const char * token_text_dft = llama_vocab_get_text(vocab_dft, i);
 
             if (std::strcmp(token_text_tgt, token_text_dft) != 0) {
-                LOG_DBG("%s: draft model vocab must match target model to use speculation but ", __func__);
-                LOG_DBG("token %d content differs - target '%s', draft '%s'\n", i,
+                LOG_WRN("%s: draft model vocab must match target model to use speculation but ", __func__);
+                LOG_WRN("token %d content differs - target '%s', draft '%s'\n", i,
                         common_token_to_piece(vocab_tgt, i).c_str(),
                         common_token_to_piece(vocab_dft, i).c_str());
                 return false;
@@ -199,7 +199,8 @@ static bool common_speculative_are_compatible(
 }
 
 static bool common_speculative_target_has_appended_mtp_contract(const llama_model * model) {
-    return llama_model_is_step35(model) || llama_model_is_deepseek4(model);
+    return llama_model_is_step35(model) || llama_model_is_deepseek4(model) ||
+           llama_model_is_qwen35_family(model);
 }
 
 static bool common_speculative_has_recognized_mtp_companion(
@@ -1151,6 +1152,8 @@ struct common_speculative {
     int last_n_drafted = 0;
     int64_t t_step_start_us = 0;
     bool last_step_target_only = false;
+    float draft_temperature = 0.0f;
+    uint32_t draft_seed = LLAMA_DEFAULT_SEED;
 };
 
 static bool common_speculative_stage_chain_matches(
@@ -1182,6 +1185,8 @@ static common_params_speculative common_speculative_get_runtime_params(
         ? stage.p_min
         : (config.type == COMMON_SPECULATIVE_TYPE_DSPARK ? 0.0f : params.p_min);
     result.mtp_heads = stage.has_mtp_heads_override() ? stage.mtp_heads : params.mtp_heads;
+    result.draft_temperature = params.draft_temperature;
+    result.draft_seed = params.draft_seed;
 
     if (config.type == COMMON_SPECULATIVE_TYPE_SUFFIX) {
         result.suffix_min_match_len = stage.has_suffix_min_match_len_override()
@@ -1307,6 +1312,8 @@ void common_speculative_prepare_request(common_speculative * spec, common_params
 
         const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
+        impl_params.draft_temperature = spec->draft_temperature;
+        impl_params.draft_seed = spec->draft_seed;
         mtp_state->mtp_heads_active = std::max<int32_t>(0, impl_params.mtp_heads);
     }
 }
@@ -1423,6 +1430,7 @@ static common_speculative * common_speculative_init_internal(
     }
 
     const auto stages = params.get_resolved_stages();
+    const llama_model * target_model = llama_get_model(ctx_tgt);
     if (params.model_dft && llama_model_is_gemma4_mtp_assistant(params.model_dft)) {
         const bool has_draft_stage = std::any_of(stages.begin(), stages.end(), [](const common_speculative_stage_params & stage) {
             return stage.type == COMMON_SPECULATIVE_TYPE_DRAFT;
@@ -1557,7 +1565,6 @@ static common_speculative * common_speculative_init_internal(
         configs.push_back(std::move(config));
     }
 
-    const llama_model * target_model = llama_get_model(ctx_tgt);
     if (!configs.empty() && common_speculative_needs_checkpoint(target_model)) {
         int32_t max_n_max = 0;
         for (const auto & config : configs) {
@@ -1792,6 +1799,8 @@ llama_tokens common_speculative_draft(
         auto & impl = spec->impls[i];
         const auto & runtime_stage = use_runtime_stage_overrides ? runtime_stages[i] : spec->configs[i].stage;
         common_params_speculative impl_params = common_speculative_get_runtime_params(spec->configs[i], params, runtime_stage);
+        impl_params.draft_temperature = spec->draft_temperature;
+        impl_params.draft_seed = spec->draft_seed;
         if (spec->tuner && spec->tuner->enabled && common_speculative_type_is_dflash_family(impl->type)) {
             impl_params.n_max = params.n_max;
         }
@@ -2118,8 +2127,14 @@ common_speculative_draft_result common_speculative_draft_ex(
         const llama_tokens & prompt_tgt,
         llama_token id_last,
         llama_pos draft_base_pos,
-        llama_seq_id draft_seq_id) {
+        llama_seq_id draft_seq_id,
+        const common_params_sampling * sampling) {
     common_speculative_draft_result result = {};
+
+    if (spec != nullptr) {
+        spec->draft_temperature = sampling != nullptr ? sampling->temp : 0.0f;
+        spec->draft_seed = sampling != nullptr ? sampling->seed : LLAMA_DEFAULT_SEED;
+    }
 
     if (common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP)) {
         if (!common_speculative_ensure_sequence_hidden(spec, ctx, draft_seq_id, draft_base_pos - 1)) {
@@ -2140,6 +2155,13 @@ common_speculative_draft_result common_speculative_draft_ex(
         ? spec->curr_impl->type
         : COMMON_SPECULATIVE_TYPE_NONE;
     result.target_only = spec != nullptr && spec->last_step_target_only;
+
+    if (spec != nullptr && spec->curr_impl != nullptr &&
+            spec->curr_impl->type == COMMON_SPECULATIVE_TYPE_DFLASH) {
+        if (auto * dflash_state = common_speculative_get_dflash_state(spec); dflash_state != nullptr) {
+            result.proposal_dists = dflash_state->proposal_dists;
+        }
+    }
 
     return result;
 }
@@ -2162,8 +2184,13 @@ int common_speculative_get_configured_n_max(const common_speculative * spec) {
 }
 
 static bool common_speculative_has_target_features(const common_speculative * spec) {
-    return common_speculative_has_type(spec, COMMON_SPECULATIVE_TYPE_MTP) ||
-        common_speculative_has_dflash_family(spec);
+    if (spec == nullptr) {
+        return false;
+    }
+
+    return std::any_of(spec->configs.begin(), spec->configs.end(), [](const common_speculative_config & config) {
+        return common_speculative_type_uses_target_features(config.type);
+    });
 }
 
 bool common_speculative_load_draft_model(
@@ -2214,9 +2241,7 @@ bool common_speculative_load_draft_model(
     if (params_dft.n_ctx == 0) {
         params_dft.n_ctx = params.n_ctx;
     }
-    const bool has_dflash_family = params.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
-        params.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
-    if (has_dflash_family && params_dft.n_gpu_layers < 0) {
+    if (params.has_dflash_family_stage() && params_dft.n_gpu_layers < 0) {
         params_dft.n_gpu_layers = params_base.n_gpu_layers;
     }
     params_dft.n_ctx = params_dft.n_ctx == 0 ? params_base.n_ctx / params_base.n_parallel : params_dft.n_ctx;
@@ -2397,6 +2422,20 @@ bool common_speculative_finalize_startup(
                 const int32_t n_heads = llama_model_n_nextn_layer(companion);
                 if (n_heads != 1) {
                     LOG_ERR("%s: DeepSeek-V4 MTP companion requires exactly one predictor layer, got %d\n",
+                            __func__, n_heads);
+                    return false;
+                }
+            } else if (llama_model_is_qwen35_family(model)) {
+                // dense and MoE are separate architectures, so compare the arch itself
+                if (std::strcmp(llama_model_arch_string(model), llama_model_arch_string(companion)) != 0) {
+                    LOG_ERR("%s: Qwen3.5 MTP requires a companion of the same architecture, target is %s and companion is %s\n",
+                            __func__, llama_model_arch_string(model), llama_model_arch_string(companion));
+                    return false;
+                }
+
+                const int32_t n_heads = llama_model_n_nextn_layer(companion);
+                if (n_heads != 1) {
+                    LOG_ERR("%s: Qwen3.5 MTP companion requires exactly one predictor layer, got %d\n",
                             __func__, n_heads);
                     return false;
                 }
@@ -3755,6 +3794,7 @@ int32_t mtp_update_kv_cache(struct llama_context * ctx, const llama_batch& batch
     llama_set_mtp_op_type(ctx, MTP_OP_NONE);
     return ret;
 }
+
 common_speculative_round_result common_speculative_run_round(
         common_speculative * spec,
         llama_model * model,
@@ -3828,11 +3868,18 @@ common_speculative_round_result common_speculative_run_round(
         draft_history,
         result.sampled_before,
         n_past,
-        seq_id);
+        seq_id,
+        &sparams);
     auto & draft = draft_result.tokens;
-
+    auto & proposal_dists = draft_result.proposal_dists;
     const int min_usable_draft = common_speculative_get_runtime_n_min(spec, params);
     if ((int) draft.size() < min_usable_draft || (draft.empty() && !draft_result.target_only)) {
+        return result;
+    }
+
+    if (!proposal_dists.empty() && proposal_dists.size() != draft.size()) {
+        result.failed = true;
+        result.error = "DFlash2 proposal distribution count does not match draft";
         return result;
     }
 
@@ -3873,10 +3920,11 @@ common_speculative_round_result common_speculative_run_round(
         result.error = "speculative verify decode failed";
         return result;
     }
-
     std::vector<llama_token> ids;
     try {
-        ids = common_sampler_sample_and_accept_n(sampler, ctx, verify_indices, draft);
+        ids = proposal_dists.empty()
+            ? common_sampler_sample_and_accept_n(sampler, ctx, verify_indices, draft)
+            : common_sampler_sample_and_accept_n(sampler, ctx, verify_indices, draft, proposal_dists);
     } catch (const std::exception & e) {
         llama_batch_free(verify_batch);
         result.failed = true;

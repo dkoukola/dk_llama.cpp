@@ -759,6 +759,8 @@ extern "C" {
 
     LLAMA_API bool llama_model_is_step35(const struct llama_model * model);
 
+    LLAMA_API bool llama_model_is_qwen35_family(const struct llama_model * model);
+
     LLAMA_API bool llama_is_gemma4_mtp_file(const char * path);
 
     LLAMA_API bool llama_model_is_split_mode_graph(const struct llama_model * model);
@@ -773,6 +775,10 @@ extern "C" {
     // False when the context cannot serialize whole-context or file-session state.
     // Compacted DeepSeek4 contexts support whole-context state; openPangu contexts do not.
     LLAMA_API bool llama_supports_full_state_io(const struct llama_context * ctx);
+
+    // The complete answer for a context: the model-level query above, plus the context options it
+    // cannot see (--swa-compress). Matches the gate the engine applies before a K-shift.
+    LLAMA_API bool llama_supports_ctx_shift(const struct llama_context * ctx);
 
     LLAMA_API const char * llama_model_arch_string(const struct llama_model * model);
 
@@ -1201,6 +1207,15 @@ extern "C" {
     LLAMA_API llama_token llama_get_dflash_draft_token_ith(struct llama_context * ctx, int32_t i);
     LLAMA_API float llama_get_dflash_draft_confidence_ith(struct llama_context * ctx, int32_t i);
 
+    // Copy DFlash2 selector lattice after a draft decode with top_k*top_k scores
+    // and top_k candidate IDs per position.
+    LLAMA_API int32_t llama_get_dflash_draft_lattice_top_k(struct llama_context * ctx);
+    LLAMA_API int32_t llama_get_dflash_draft_lattice_n_positions(struct llama_context * ctx);
+    LLAMA_API bool llama_copy_dflash_draft_lattice(
+            struct llama_context * ctx,
+            float * scores, size_t score_count,
+            int32_t * ids, size_t id_count);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously
@@ -1577,7 +1592,7 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     /// @details Adaptive p sampler initializer
     /// @param target Select tokens near this probability (valid range 0.0 to 1.0; <0 = disabled)
     /// @param decay Decay rate for target adaptation over time. lower values -> faster but less stable adaptation. (valid range 0.0 to 1.0; ≤0 = no adaptation)
-    LLAMA_API struct llama_sampler_adaptive_p * llama_init_adaptive_p(int n_vocab,
+    LLAMA_API struct llama_sampler_adaptive_p * llama_init_adaptive_p(
            const float target,
            const float decay,
             const bool updt_w_cur,
@@ -1631,12 +1646,6 @@ LLAMA_API struct llama_grammar* llama_sampler_init_grammar_lazy_patterns(
     LLAMA_API llama_token llama_sample_token(
             struct llama_context * ctx,
           llama_token_data_array * candidates);
-
-    /// @details Randomly selects a token from the candidates following adaptive p sampler.
-    llama_token llama_sample_token_adaptive_p(
-            struct llama_context * ctx,
-          llama_token_data_array * candidates,
- struct llama_sampler_adaptive_p * adapt_p_ctx);
 
     //
     // Model split
@@ -1715,6 +1724,9 @@ const std::vector<std::pair<std::string, struct ggml_tensor *>> & llama_internal
 // Randomly selects a token from the candidates based on their probabilities using given std::mt19937.
 // This is a temporary workaround in order to fix race conditions when sampling with multiple sequences.
 llama_token llama_sample_token_with_rng(struct llama_context * ctx, llama_token_data_array * candidates, std::mt19937 & rng);
+
+// Randomly selects a token from the candidates following adaptive p sampler.
+llama_token llama_sample_token_adaptive_p(struct llama_context * ctx, llama_token_data_array * candidates, struct llama_sampler_adaptive_p * adapt_p_ctx, std::mt19937 & rng);
 
 #endif // LLAMA_API_INTERNAL
 

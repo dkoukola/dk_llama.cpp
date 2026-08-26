@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <iterator>
 #include <limits>
+#include <random>
 #include <vector>
 
 static bool common_speculative_are_dflash_compatible(
@@ -78,6 +80,8 @@ static bool dflash_conditioning_ready(const common_speculative_state_dflash & st
 
 // DFlash runtime state and draft path.
 struct common_speculative_state_dflash : public common_speculative_state {
+    // Keep DFlash 2 selector sampling independent from target sampling.
+    static constexpr uint32_t SELECTOR_SEED_XOR = 0x85ebca6bU;
     llama_context * ctx_tgt;
     llama_context * ctx_dft;
 
@@ -90,8 +94,14 @@ struct common_speculative_state_dflash : public common_speculative_state {
     int32_t n_target_features = 0;
     int32_t cross_ctx = 0;
     bool is_dspark = false;
+    bool is_dflash2 = false;
     bool capture_installed = false;
     bool ready = false;
+
+    std::vector<common_speculative_token_dist> proposal_dists;
+    std::mt19937 selector_rng;
+    uint32_t selector_seed = LLAMA_DEFAULT_SEED;
+    bool selector_rng_initialized = false;
 
     std::vector<int32_t> target_layer_ids;
     std::vector<float> target_window;
@@ -135,6 +145,12 @@ struct common_speculative_state_dflash : public common_speculative_state {
     void initialize(enum common_speculative_type type) {
         const llama_model * model_tgt = llama_get_model(ctx_tgt);
         const llama_model * model_dft = llama_get_model(ctx_dft);
+
+        char selector_top_k[32] = {};
+        if (!is_dspark &&
+                llama_model_meta_val_str(model_dft, "dflash.selector_top_k", selector_top_k, sizeof(selector_top_k)) >= 0) {
+            is_dflash2 = std::atoi(selector_top_k) > 0;
+        }
 
         if (!common_speculative_are_dflash_compatible(model_tgt, model_dft)) {
             LOG_ERR("%s: DFlash draft model vocab/tokenizer is incompatible with the target model\n", __func__);
@@ -288,6 +304,8 @@ struct common_speculative_state_dflash : public common_speculative_state {
         GGML_UNUSED(prompt);
         llama_kv_cache_clear(ctx_dft);
         llama_reset_dflash_kv_cache_state(ctx_dft);
+        proposal_dists.clear();
+        selector_rng_initialized = false;
     }
 
     void draft(
@@ -298,6 +316,7 @@ struct common_speculative_state_dflash : public common_speculative_state {
         GGML_UNUSED(prompt_tgt);
 
         result.clear();
+        proposal_dists.clear();
         if (!ready || target_window_rows <= 0 || (is_dspark && !dflash_conditioning_ready(*this))) {
             return;
         }
@@ -345,6 +364,11 @@ struct common_speculative_state_dflash : public common_speculative_state {
             for (int32_t i = 1; i < batch_len; ++i) {
                 common_batch_add(batch, mask_token_id, draft_pos_base + i, { 0 }, true);
             }
+        } else if (is_dflash2) {
+            common_batch_add(batch, id_last, draft_pos_base, { 0 }, false);
+            for (int32_t i = 1; i < batch_len; ++i) {
+                common_batch_add(batch, mask_token_id, draft_pos_base + i, { 0 }, false);
+            }
         } else {
             common_batch_add(batch, id_last, seed_pos, { 0 }, false);
             for (int32_t i = 1; i < batch_len; ++i) {
@@ -357,6 +381,77 @@ struct common_speculative_state_dflash : public common_speculative_state {
             batch.n_tokens = 0;
             return;
         }
+        if (is_dflash2) {
+            const int32_t selector_top_k = llama_get_dflash_draft_lattice_top_k(ctx_dft);
+            if (selector_top_k <= 0) {
+                LOG_ERR("%s: DFlash2 selector lattice is unavailable\n", __func__);
+                batch.n_tokens = 0;
+                return;
+            }
+
+            const int32_t n_positions = llama_get_dflash_draft_lattice_n_positions(ctx_dft);
+            const int32_t n_positions_used = std::min(n_positions, n_keep + 1);
+            if (n_positions_used <= 1) {
+                batch.n_tokens = 0;
+                return;
+            }
+
+            std::vector<float> scores((size_t) selector_top_k * selector_top_k * n_positions_used);
+            std::vector<int32_t> ids((size_t) selector_top_k * n_positions_used);
+            if (!llama_copy_dflash_draft_lattice(ctx_dft, scores.data(), scores.size(), ids.data(), ids.size())) {
+                LOG_ERR("%s: failed to copy DFlash2 selector lattice\n", __func__);
+                batch.n_tokens = 0;
+                return;
+            }
+            const float temperature = params.draft_temperature;
+            if (!selector_rng_initialized || selector_seed != params.draft_seed) {
+                selector_seed = params.draft_seed == LLAMA_DEFAULT_SEED
+                    ? std::random_device{}()
+                    : params.draft_seed;
+                selector_rng.seed(selector_seed ^ SELECTOR_SEED_XOR);
+                selector_rng_initialized = true;
+            }
+
+            int32_t predecessor = 0;
+            for (int32_t pos = 1; pos < n_positions_used; ++pos) {
+                const float * row = scores.data() + (size_t) pos * selector_top_k * selector_top_k;
+                const float * path = row + (size_t) predecessor * selector_top_k;
+
+                common_speculative_token_dist dist;
+                if (temperature > 0.0f) {
+                    dist.ids.resize(selector_top_k);
+                    dist.probs.resize(selector_top_k);
+                    const float max_score = *std::max_element(path, path + selector_top_k);
+                    float sum = 0.0f;
+                    for (int32_t k = 0; k < selector_top_k; ++k) {
+                        dist.ids[(size_t) k] = (llama_token) ids[(size_t) pos * selector_top_k + k];
+                        dist.probs[(size_t) k] = std::exp((path[k] - max_score) / temperature);
+                        sum += dist.probs[(size_t) k];
+                    }
+                    if (!(sum > 0.0f) || !std::isfinite(sum)) {
+                        result.clear();
+                        proposal_dists.clear();
+                        batch.n_tokens = 0;
+                        return;
+                    }
+                    for (float & probability : dist.probs) {
+                        probability /= sum;
+                    }
+                    std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
+                    predecessor = sample(selector_rng);
+                    result.push_back(dist.ids[(size_t) predecessor]);
+                    proposal_dists.push_back(std::move(dist));
+                } else {
+                    predecessor = (int32_t) std::distance(path,
+                            std::max_element(path, path + selector_top_k));
+                    result.push_back((llama_token) ids[(size_t) pos * selector_top_k + predecessor]);
+                }
+            }
+
+            batch.n_tokens = 0;
+            return;
+        }
+
         // The compact argmax and confidence buffers are copied to host asynchronously.
         // Complete both transfers once before consuming either buffer.
         llama_synchronize(ctx_dft);

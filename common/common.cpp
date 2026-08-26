@@ -97,6 +97,14 @@ common_time_meas::~common_time_meas() {
     }
 }
 
+bool common_speculative_type_is_dflash_family(enum common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK;
+}
+
+bool common_speculative_type_uses_target_features(enum common_speculative_type type) {
+    return type == COMMON_SPECULATIVE_TYPE_MTP || common_speculative_type_is_dflash_family(type);
+}
+
 bool common_speculative_type_is_self_spec(enum common_speculative_type type) {
     switch (type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:
@@ -109,10 +117,6 @@ bool common_speculative_type_is_self_spec(enum common_speculative_type type) {
         default:
             return false;
     }
-}
-
-bool common_speculative_type_is_dflash_family(enum common_speculative_type type) {
-    return type == COMMON_SPECULATIVE_TYPE_DFLASH || type == COMMON_SPECULATIVE_TYPE_DSPARK;
 }
 
 static int32_t common_speculative_stage_effective_n_max(
@@ -210,6 +214,20 @@ bool common_params_speculative::has_stage_type(common_speculative_type stage_typ
     });
 }
 
+bool common_params_speculative::has_dflash_family_stage() const {
+    const auto resolved = get_resolved_stages();
+    return std::any_of(resolved.begin(), resolved.end(), [](const common_speculative_stage_params & stage) {
+        return common_speculative_type_is_dflash_family(stage.type);
+    });
+}
+
+bool common_params_speculative::uses_target_features() const {
+    const auto resolved = get_resolved_stages();
+    return std::any_of(resolved.begin(), resolved.end(), [](const common_speculative_stage_params & stage) {
+        return common_speculative_type_uses_target_features(stage.type);
+    });
+}
+
 void common_params_speculative::remove_stage_type(common_speculative_type stage_type) {
     stages.erase(std::remove_if(stages.begin(), stages.end(), [stage_type](const common_speculative_stage_params & stage) {
         return stage.type == stage_type;
@@ -227,8 +245,7 @@ bool common_params_speculative::has_composite_stage_chain() const {
 
 bool common_params_speculative::needs_dft_model() const {
     return has_stage_type(COMMON_SPECULATIVE_TYPE_DRAFT) ||
-        has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
-        has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK) ||
+        has_dflash_family_stage() ||
         (has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) && has_dft());
 }
 
@@ -4088,6 +4105,14 @@ struct llama_init_result llama_init_from_gpt_params(gpt_params & params) {
 
     if (model == NULL) {
         fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, params.model.c_str());
+        return iparams;
+    }
+
+    // a predictor-only MTP GGUF has no main blocks, so it cannot be the target model
+    if (llama_model_mtp_package(model) == LLAMA_MTP_PACKAGE_COMPANION) {
+        fprintf(stderr, "%s: error: '%s' is an MTP companion, pass it with -md instead\n",
+                __func__, params.model.c_str());
+        llama_free_model(model);
         return iparams;
     }
 

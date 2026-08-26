@@ -94,6 +94,8 @@ struct llama_hparams {
     uint32_t ssm_d_state = 0;
     uint32_t ssm_dt_rank = 0;
     uint32_t ssm_n_group = 0;
+    bool     kda_safe_gate = false;
+    float    kda_gate_lower_bound = 0.0f;
 
     // for hybrid state-space models (e.g. qwen3next)
     std::array<bool, LLAMA_MAX_LAYERS> recurrent_layer_arr;
@@ -168,6 +170,10 @@ struct llama_hparams {
     uint32_t dflash_n_target_features = 0;
     uint32_t dflash_n_target_layers = 0;
     uint32_t dflash_target_layer_ids[8] = {};
+    uint32_t dflash_conv_kernel_size = 0;
+    uint32_t dflash_conv_group_size = 0;
+    uint32_t dflash_selector_rank = 0;
+    uint32_t dflash_selector_top_k = 0;
     float    dflash_backbone_rotary_base = 0.0f;
     bool     dflash_laguna = false;
 
@@ -194,6 +200,10 @@ struct llama_hparams {
         if (this->dflash_mask_token_id != other.dflash_mask_token_id) return true;
         if (this->dflash_n_target_features != other.dflash_n_target_features) return true;
         if (this->dflash_n_target_layers != other.dflash_n_target_layers) return true;
+        if (this->dflash_conv_kernel_size != other.dflash_conv_kernel_size) return true;
+        if (this->dflash_conv_group_size != other.dflash_conv_group_size) return true;
+        if (this->dflash_selector_rank != other.dflash_selector_rank) return true;
+        if (this->dflash_selector_top_k != other.dflash_selector_top_k) return true;
         if (this->dflash_laguna != other.dflash_laguna) return true;
         if (this->n_layer       != other.n_layer)       return true;
         if (this->n_rot         != other.n_rot)         return true;
@@ -224,6 +234,7 @@ struct llama_hparams {
         if (this->ssm_d_state != other.ssm_d_state) return true;
         if (this->ssm_dt_rank != other.ssm_dt_rank) return true;
         if (this->ssm_n_group != other.ssm_n_group) return true;
+        if (this->kda_safe_gate != other.kda_safe_gate) return true;
         if (this->recurrent_layer_arr != other.recurrent_layer_arr) return true;
         for (int i = 0; i < 8; ++i) {
             if (this->dflash_target_layer_ids[i] != other.dflash_target_layer_ids[i]) return true;
@@ -235,6 +246,7 @@ struct llama_hparams {
 
         if (!is_float_close(this->f_norm_eps,            other.f_norm_eps,            EPSILON)) return true;
         if (!is_float_close(this->f_norm_rms_eps,        other.f_norm_rms_eps,        EPSILON)) return true;
+        if (!is_float_close(this->kda_gate_lower_bound,  other.kda_gate_lower_bound,  EPSILON)) return true;
         if (!is_float_close(this->rope_attn_factor,      other.rope_attn_factor,      EPSILON)) return true;
         if (!is_float_close(this->rope_freq_base_train,  other.rope_freq_base_train,  EPSILON)) return true;
         if (!is_float_close(this->rope_freq_scale_train, other.rope_freq_scale_train, EPSILON)) return true;

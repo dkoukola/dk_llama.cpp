@@ -73,9 +73,7 @@ static bool server_response_needs_chat_parse(oaicompat_type oaicompat) {
 }
 
 static bool server_speculative_uses_target_features(const common_params_speculative & spec) {
-    return spec.has_stage_type(COMMON_SPECULATIVE_TYPE_MTP) ||
-           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DFLASH) ||
-           spec.has_stage_type(COMMON_SPECULATIVE_TYPE_DSPARK);
+    return spec.uses_target_features();
 }
 
 static bool server_speculative_needs_target_feature_state(
@@ -331,8 +329,15 @@ void server_context::init() {
             {"n_ctx_slot", slot.n_ctx}
             });
 
-        const int ga_n = params_base.grp_attn_n;
-        const int ga_w = params_base.grp_attn_w;
+        int ga_n = params_base.grp_attn_n;
+        int ga_w = params_base.grp_attn_w;
+
+        if (ga_n != 1 && !llama_supports_ctx_shift(slot.ctx)) {
+            // self-extend re-positions cached rows, which a compacted layer cannot represent
+            LOG_WARNING("%s\n", "self-extend is not supported by this context's KV cache, it will be disabled");
+            ga_n = 1;
+            ga_w = 512;
+        }
 
         if (ga_n != 1) {
             GGML_ASSERT(ga_n > 0 && "ga_n must be positive");                       // NOLINT
@@ -507,6 +512,7 @@ void server_slot::reset() {
     prompt_batch_i1 = -1;
     n_sent_text = 0;
     drafted.clear();
+    draft_proposal_dists.clear();
     spec_target_only = false;
     i_batch_dft.clear();
     spec_prompt_warmup_failed = false;
@@ -1133,7 +1139,7 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
     auto stream_opt = json_value(data, "stream_options", json::object());
     slot.params.include_usage = json_value(stream_opt, "include_usage", false);
     slot.params.cache_prompt = json_value(data, "cache_prompt", true);
-    slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", defaults.n_predict));
+    slot.params.n_predict = json_value(data, "n_predict", json_value(data, "max_tokens", json_value(data, "max_completion_tokens", defaults.n_predict)));
     slot.saturate_predict = json_value(data, "saturate_predict", false);
     slot.sparams.top_k = json_value(data, "top_k", default_sparams.top_k);
     slot.sparams.top_p = json_value(data, "top_p", default_sparams.top_p);
@@ -1848,10 +1854,10 @@ bool server_context::launch_slot_with_task(server_slot& slot, server_task& task)
             LOG_WARNING("%s\n", "ctx_shift is not implemented for split mode graph, it will be disabled");
         }
     }
-    if (!llama_model_supports_ctx_shift(llama_get_model(slot.ctx))) {
+    if (!llama_supports_ctx_shift(slot.ctx)) {
         if (params_base.ctx_shift) {
             params_base.ctx_shift = false;
-            LOG_WARNING("%s\n", "ctx_shift is not supported by this model's KV cache, it will be disabled");
+            LOG_WARNING("%s\n", "ctx_shift is not supported by this context's KV cache, it will be disabled");
         }
     }
     {
@@ -3573,8 +3579,10 @@ void server_context::add_sampled_tokens() {
                 cached_text_tokens,
                 slot.sampled,
                 draft_base_pos,
-                slot.id);
+                slot.id,
+                &slot.sparams);
             llama_tokens & draft = draft_result.tokens;
+            auto & proposal_dists = draft_result.proposal_dists;
             slot.spec_target_only = draft_result.target_only;
 
             const int n_draft_max = slot.get_n_draft_max();
@@ -3587,6 +3595,15 @@ void server_context::add_sampled_tokens() {
                     SLT_WRN(slot, "draft size %d exceeds max %d, truncating\n", (int)draft.size(), n_draft_max);
                 }
                 draft.resize(n_draft_max);
+                if (!proposal_dists.empty()) {
+                    proposal_dists.resize(n_draft_max);
+                }
+            }
+
+            if (!proposal_dists.empty() && proposal_dists.size() != draft.size()) {
+                SLT_WRN(slot, "discarding mismatched DFlash2 proposal distributions (%d != %d)\n",
+                        (int) proposal_dists.size(), (int) draft.size());
+                proposal_dists.clear();
             }
 
             // add the sampled token to the batch
@@ -3602,6 +3619,7 @@ void server_context::add_sampled_tokens() {
                 // fallback to normal decoding
                 slot.i_batch = slot.i_batch_dft[0];
                 slot.drafted.clear();
+                slot.draft_proposal_dists.clear();
                 slot.i_batch_dft.clear();
             } else {
                 if (slot.spec_target_only) {
@@ -3623,6 +3641,7 @@ void server_context::add_sampled_tokens() {
                     slot.cache_tokens.push_back(draft[i]);
                 }
                 slot.drafted = std::move(draft);
+                slot.draft_proposal_dists = std::move(proposal_dists);
             }
         }
         else {
@@ -4356,7 +4375,9 @@ void server_context::speculative_decoding_accept() {
         // the accepted tokens from the speculation
         std::vector<llama_token> ids;
         try {
-            ids = common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted);
+            ids = slot.draft_proposal_dists.empty()
+                ? common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted)
+                : common_sampler_sample_and_accept_n(slot.ctx_sampling, ctx, slot.i_batch_dft, slot.drafted, slot.draft_proposal_dists);
         } catch (const std::exception & e) {
             LOG_ERROR("speculative sampling failed, releasing slot", {
                 {"id_slot", slot.id},
@@ -4368,6 +4389,7 @@ void server_context::speculative_decoding_accept() {
             slot.i_batch = -1;
             slot.i_batch_dft.clear();
             slot.drafted.clear();
+            slot.draft_proposal_dists.clear();
             continue;
         }
 
@@ -4380,9 +4402,9 @@ void server_context::speculative_decoding_accept() {
 
         slot.i_batch_dft.clear();
         slot.drafted.clear();
+        slot.draft_proposal_dists.clear();
 
         slot.n_past += ids.size();
-        slot.n_decoded += ids.size();
         const int64_t t_current = ggml_time_us();
         slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
@@ -4426,12 +4448,15 @@ void server_context::speculative_decoding_accept() {
             slot.i_batch = -1;
             slot.i_batch_dft.clear();
             slot.drafted.clear();
+            slot.draft_proposal_dists.clear();
             continue;
         }
         slot.spec_target_only = false;
 
         for (size_t i = 0; i < ids.size(); ++i) {
             completion_token_output result;
+
+            slot.n_decoded += 1;
 
             result.tok = ids[i];
             result.text_to_send = common_token_to_piece(ctx, result.tok, accept_special_token(slot, result.tok));
@@ -5059,6 +5084,7 @@ void server_context::update_slots() {
             }
             slot.cache_tokens.keep_first(slot.cache_tokens.n_tokens() - (int32_t) slot.drafted.size());
             slot.drafted.clear();
+            slot.draft_proposal_dists.clear();
             slot.i_batch_dft.clear();
             slot.n_past = slot.cache_tokens.n_tokens();
             slot.spec_target_only = false;
