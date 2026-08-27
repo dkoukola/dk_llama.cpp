@@ -608,6 +608,12 @@ struct llama_model {
     // model memory mapped files
     llama_mmaps mappings;
 
+    // The Qwen4Exp PLE n-gram table is the only tensor retained in model.mappings while
+    // NUMA weight mirroring otherwise uses owned buffers. ple_numa_buf remembers its
+    // original buffer so a later tensor reload cannot make that storage mirrorable.
+    bool                  ple_mmap     = false;
+    ggml_backend_buffer_t ple_numa_buf = nullptr;
+
     // objects representing data potentially being locked in memory
     llama_mlocks mlock_bufs;
     llama_mlocks mlock_mmaps;

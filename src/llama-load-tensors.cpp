@@ -1708,8 +1708,13 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
                 throw std::runtime_error("qwen4exp: a PLE head reaches past the n-gram table");
             }
         }
-        model.tok_embd_per_layer = create_tensor(ctx_input, tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                {hparams.ple_head_dim, ple_rows});
+        // In NUMA mirror mode the PLE n-gram table is isolated in the input context and
+        // must not follow a user buffer override. Preserve normal override behavior otherwise.
+        model.tok_embd_per_layer = ml.mmap_ple
+                ? ml.create_tensor(ctx_input, tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                        {hparams.ple_head_dim, ple_rows})
+                : create_tensor(ctx_input, tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
+                        {hparams.ple_head_dim, ple_rows});
     }
 
     const bool has_moe_hparams = n_expert > 0 && n_expert_used > 0;

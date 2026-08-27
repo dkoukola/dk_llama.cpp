@@ -194,6 +194,12 @@ static const char * hotswap_unsupported_reason(const llama_model & model, const 
 // ------------------------------------------------------------------
 static bool tensor_data_in_mmap(const llama_model & model, const void * data) {
     if (!data) return false;
+    if (model.ple_mmap) {
+        GGML_ASSERT(model.arch == LLM_ARCH_QWEN4EXP && model.ple_numa_buf != nullptr);
+        const char * first = (const char *) ggml_backend_buffer_get_base(model.ple_numa_buf);
+        const char * last  = first + ggml_backend_buffer_get_size(model.ple_numa_buf);
+        return (const char *) data >= first && (const char *) data < last;
+    }
     for (const auto & mapping : model.mappings) {
         if (!mapping) continue;
         const char * base = (const char *) mapping->addr();

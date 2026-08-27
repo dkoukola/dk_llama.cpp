@@ -4835,6 +4835,13 @@ static bool llm_load_tensors(
 
     ml.done_getting_tensors();
 
+    if (ml.mmap_ple) {
+        GGML_ASSERT(model.arch == LLM_ARCH_QWEN4EXP && model.tok_embd_per_layer != nullptr);
+        const auto * weight = ml.get_weight(ggml_get_name(model.tok_embd_per_layer));
+        GGML_ASSERT(weight != nullptr);
+        ml.mmap_ple_file = weight->idx;
+    }
+
     // --dry-run skips MAP_POPULATE/WILLNEED — tensor data is never read.
     ml.init_mappings(!defer_expert_mmap && !dry_run, use_mlock ? &model.mlock_mmaps : nullptr, ml.use_thp);
     model.mappings.reserve(ml.mappings.size());
@@ -4845,7 +4852,36 @@ static bool llm_load_tensors(
 
     // Ensure we have enough capacity for the maximum backend buffer we will potentially create
     size_t n_max_backend_buffer = ctx_map.size() * ml.files.size();
-    model.bufs.reserve(n_max_backend_buffer);
+    model.bufs.reserve(n_max_backend_buffer + (ml.mmap_ple ? 1 : 0));
+
+    if (ml.mmap_ple && model.tok_embd_per_layer != nullptr) {
+        GGML_ASSERT(model.arch == LLM_ARCH_QWEN4EXP);
+        ggml_tensor * ple = model.tok_embd_per_layer;
+        const auto * weight = ml.get_weight(ggml_get_name(ple));
+        GGML_ASSERT(weight != nullptr);
+
+        auto & mapping = ml.mappings.at(weight->idx);
+        void * data = (uint8_t *) mapping->addr() + weight->offs;
+        const size_t size = ggml_nbytes(ple);
+        ggml_backend_buffer_t buf = ggml_backend_cpu_buffer_from_ptr(data, size);
+        if (buf == nullptr) {
+            throw std::runtime_error("unable to allocate backend CPU buffer for the Qwen4Exp PLE n-gram table");
+        }
+
+        ggml_backend_tensor_alloc(buf, ple, data);
+        ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        model.bufs.push_back(buf);
+        model.ple_mmap = true;
+
+        auto & mmap_used = ml.mmaps_used.at(weight->idx);
+        mmap_used.first  = std::min(mmap_used.first, weight->offs);
+        mmap_used.second = std::max(mmap_used.second, weight->offs + size);
+
+        GGML_ASSERT(ggml_backend_buffer_get_base(buf) == ple->data);
+        GGML_ASSERT(ggml_backend_buffer_get_size(buf) == size);
+        LLAMA_LOG_INFO("%s: keeping Qwen4Exp PLE n-gram table file-backed (%.2f GiB); NUMA mirroring disabled for this tensor\n",
+                __func__, size / 1024.0 / 1024.0 / 1024.0);
+    }
 
     for (auto & it : ctx_map) {
         ggml_backend_buffer_type_t buft = it.first;
@@ -4900,11 +4936,15 @@ static bool llm_load_tensors(
         }
 #endif
         else {
-            int ntensor = 0;
+            int n_unallocated = 0;
+            bool has_ple = false;
             for (auto t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-                ++ntensor;
+                if (t->data == nullptr && t->view_src == nullptr) {
+                    ++n_unallocated;
+                }
+                has_ple = has_ple || t == model.tok_embd_per_layer;
             }
-            if (ntensor > 0) {
+            if (n_unallocated > 0) {
                 ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft);
                 if (buf == nullptr) {
                     LLAMA_LOG_ERROR("Failed to allocate buffer type %s\n", ggml_backend_buft_name(buft));
@@ -4920,6 +4960,11 @@ static bool llm_load_tensors(
                 for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                     bufs.emplace(idx, buf);
                 }
+            } else if (ml.mmap_ple && has_ple && model.tok_embd_per_layer != nullptr &&
+                    model.tok_embd_per_layer->buffer != nullptr) {
+                const auto * weight = ml.get_weight(ggml_get_name(model.tok_embd_per_layer));
+                GGML_ASSERT(weight != nullptr);
+                bufs.emplace(weight->idx, model.tok_embd_per_layer->buffer);
             }
         }
 
@@ -4936,6 +4981,11 @@ static bool llm_load_tensors(
         }
 
         ctx_bufs.emplace_back(ctx, bufs);
+    }
+
+    if (model.arch == LLM_ARCH_QWEN4EXP && model.tok_embd_per_layer != nullptr) {
+        GGML_ASSERT(model.tok_embd_per_layer->buffer != nullptr);
+        model.ple_numa_buf = model.tok_embd_per_layer->buffer;
     }
 
     if (llama_supports_gpu_offload()) {
@@ -4997,7 +5047,11 @@ static bool llm_load_tensors(
         llm_requantize_output_tensor(model, extra_output_type);
     }
 
-    if (use_mmap_buffer) {
+    if (ml.mmap_ple) {
+        const auto * weight = ml.get_weight(ggml_get_name(model.tok_embd_per_layer));
+        GGML_ASSERT(weight != nullptr);
+        model.mappings.emplace_back(std::move(ml.mappings.at(weight->idx)));
+    } else if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             model.mappings.emplace_back(std::move(mapping));
         }
@@ -5006,6 +5060,7 @@ static bool llm_load_tensors(
     if (!ml.use_mmap) {
         int n_modified = 0;
         for (auto& it : model.tensors_by_name) {
+            if (ml.mmap_ple && it.second == model.tok_embd_per_layer) continue;
             if (ggml_backend_buffer_is_host(it.second->buffer)) {
                 if (iqk_modify_tensor(it.second)) ++n_modified;
             }
@@ -5037,6 +5092,7 @@ static bool llm_load_tensors(
     if (!ml.use_mmap && ml.repack_tensors) {
         int n_repacked = 0;
         for (auto& it : model.tensors_by_name) {
+            if (ml.mmap_ple && it.second == model.tok_embd_per_layer) continue;
             if (ggml_backend_buffer_is_host(it.second->buffer)) {
                 auto orig_type = it.second->type;
                 if (it.second->view_src) continue;
@@ -5089,9 +5145,11 @@ static bool llm_load_tensors(
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     try {
+        const bool mirror_weights = ggml_numa_mirror_active() &&
+                (ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS);
         // NUMA weight mirroring needs writable, owned (non-mmap) weight buffers: the per-node
         // copies are made from the repacked bytes, and repacking only runs for non-mmap loads.
-        if (params.use_mmap && ggml_numa_mirror_active() && (ggml_numa_get_mirror() & GGML_NUMA_MIRROR_WEIGHTS)) {
+        if (params.use_mmap && mirror_weights) {
             LLAMA_LOG_INFO("%s: NUMA mirror: forcing --no-mmap so weights can be duplicated per node\n", __func__);
             params.use_mmap = false;
         }
@@ -5113,6 +5171,16 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
             llm_load_hparams(ml, model);
         } catch(const std::exception & e) {
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
+        }
+        if (mirror_weights && model.arch == LLM_ARCH_QWEN4EXP && model.hparams.ple_n_heads > 0) {
+            if (llama_mmap::SUPPORTED) {
+                // The PLE n-gram table is intentionally excluded from NUMA mirroring. Map only
+                // that tensor; all other weights remain owned so they can still be repacked and mirrored.
+                ml.mmap_ple = true;
+            } else {
+                LLAMA_LOG_WARN("%s: mmap is unavailable; the Qwen4Exp PLE buffer will remain single-copy and will not be NUMA-mirrored\n",
+                        __func__);
+            }
         }
         if (model.arch == LLM_ARCH_OPENPANGU) {
             std::string error_msg;
@@ -8357,11 +8425,30 @@ static void llama_mirror_model_weights(const llama_model & model) {
         return;
     }
 
+    ggml_backend_buffer_t ple_buf = nullptr;
+    if (model.arch == LLM_ARCH_QWEN4EXP && model.tok_embd_per_layer != nullptr) {
+        ple_buf = model.tok_embd_per_layer->buffer;
+        if (model.ple_mmap) {
+            GGML_ASSERT(model.ple_numa_buf != nullptr);
+        }
+    }
+
+    const auto is_ple_buf = [&model, ple_buf](ggml_backend_buffer_t buf) {
+        return buf != nullptr && (buf == ple_buf || buf == model.ple_numa_buf);
+    };
+
     size_t total_host = 0;
     for (auto buf : model.bufs) {
-        if (buf && ggml_backend_buffer_is_host(buf)) {
+        if (buf && !is_ple_buf(buf) && ggml_backend_buffer_is_host(buf)) {
             total_host += ggml_backend_buffer_get_size(buf);
         }
+    }
+    if (model.ple_mmap && model.ple_numa_buf != nullptr) {
+        LLAMA_LOG_INFO("%s: NUMA mirror: excluding the Qwen4Exp PLE n-gram table buffer (%.2f GiB)\n",
+                __func__, ggml_backend_buffer_get_size(model.ple_numa_buf) / 1073741824.0);
+    } else if (model.ple_numa_buf != nullptr) {
+        LLAMA_LOG_INFO("%s: NUMA mirror: excluding the buffer containing the Qwen4Exp PLE n-gram table (%.2f GiB)\n",
+                __func__, ggml_backend_buffer_get_size(model.ple_numa_buf) / 1073741824.0);
     }
     if (total_host == 0) {
         return;
@@ -8379,7 +8466,7 @@ static void llama_mirror_model_weights(const llama_model & model) {
 
     // allocate per-node copies of each host weight buffer
     for (auto buf : model.bufs) {
-        if (!buf || !ggml_backend_buffer_is_host(buf)) {
+        if (!buf || is_ple_buf(buf) || !ggml_backend_buffer_is_host(buf)) {
             continue;
         }
         llama_model::numa_mirror_buffer mb;
@@ -8418,6 +8505,9 @@ static void llama_mirror_model_weights(const llama_model & model) {
     int n_mirrored = 0;
     for (struct ggml_context * ctx : model.ctxs) {
         for (struct ggml_tensor * t = ggml_get_first_tensor(ctx); t; t = ggml_get_next_tensor(ctx, t)) {
+            if (t == model.tok_embd_per_layer && model.arch == LLM_ARCH_QWEN4EXP) {
+                continue;
+            }
             if (!t->data || t->view_src || !t->buffer || !ggml_backend_buffer_is_host(t->buffer)) {
                 continue;
             }
@@ -9365,8 +9455,14 @@ struct llama_context * llama_init_from_model(
     if (params.prefetch_experts) {
         LLAMA_LOG_INFO("%s: enabling MoE expert read-ahead (prefetch_experts), %s\n", __func__,
                 ggml_backend_prefetch_init(params.prefetch_experts_threads) ? "threaded populate engine" : "madvise fallback");
-        for (const auto & mapping : model->mappings) {
-            ggml_backend_prefetch_register_mapping(mapping->addr(), mapping->size());
+        if (model->ple_mmap) {
+            // In NUMA mirror mode the only retained mapping is the sparse PLE table;
+            // registering its full GGUF mapping would fault unrelated file ranges back in.
+            LLAMA_LOG_INFO("%s: leaving the Qwen4Exp PLE n-gram table out of expert read-ahead\n", __func__);
+        } else {
+            for (const auto & mapping : model->mappings) {
+                ggml_backend_prefetch_register_mapping(mapping->addr(), mapping->size());
+            }
         }
     }
     if (model->split_mode == LLAMA_SPLIT_MODE_GRAPH && (!model->has_tensor_overrides() || cparams.split_mode_graph_scheduling)) {

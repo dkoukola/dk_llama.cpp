@@ -1014,7 +1014,8 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
         for (const auto & file : files) {
-            std::unique_ptr<llama_mmap> mapping(new llama_mmap(file.get(), prefetch ? -1 : 0, ggml_is_numa(), use_thp));
+            std::unique_ptr<llama_mmap> mapping(new llama_mmap(
+                    file.get(), prefetch ? -1 : 0, ggml_is_numa(), use_thp));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1022,6 +1023,23 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+        }
+    } else if (mmap_ple) {
+        GGML_ASSERT(mmap_ple_file >= 0 && mmap_ple_file < (int) files.size());
+        mappings.resize(files.size());
+        mmaps_used.resize(files.size());
+        try {
+            auto mapping = std::make_unique<llama_mmap>(
+                    files.at(mmap_ple_file).get(), 0, ggml_is_numa(), false);
+            mmaps_used.at(mmap_ple_file) = { mapping->size(), 0 };
+            mappings.at(mmap_ple_file) = std::move(mapping);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_WARN("%s: unable to mmap the Qwen4Exp PLE n-gram table; "
+                    "using a single owned, non-mirrored buffer instead: %s\n", __func__, e.what());
+            mappings.clear();
+            mmaps_used.clear();
+            mmap_ple = false;
+            mmap_ple_file = -1;
         }
     }
 
@@ -1082,7 +1100,7 @@ void llama_model_loader::load_data_for(struct ggml_tensor * cur) const {
 // Returns false if cancelled by progress_callback
 bool llama_model_loader::load_all_data(
             struct ggml_context * ctx,
-            [[maybe_unused]] llama_model * model,
+            llama_model * model,
             llama_buf_map & bufs_mmap,
             llama_mlocks * lmlocks,
             llama_progress_callback progress_callback,
@@ -1154,6 +1172,19 @@ bool llama_model_loader::load_all_data(
         GGML_ASSERT(weight != nullptr);
         GGML_ASSERT(weight->idx < files.size());
         const size_t n_size = ggml_nbytes(cur);
+
+        // The Qwen4Exp PLE n-gram table is already attached directly to its read-only
+        // mapping. Do not copy or repack it into the ordinary host weight buffer.
+        if (mmap_ple && model != nullptr && cur == model->tok_embd_per_layer) {
+            const auto & mapping = mappings.at(weight->idx);
+            const void * data = (const uint8_t *) mapping->addr() + weight->offs;
+            GGML_ASSERT(cur->data == data);
+            if (check_tensors && !ggml_validate_row_data(cur->type, cur->data, n_size)) {
+                throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+            }
+            return n_size;
+        }
+
         const auto file = files.at(weight->idx)->clone();
 
         // mmap. Serialized.
@@ -1375,10 +1406,13 @@ bool llama_model_loader::load_all_data(
     // check if this is the last call and do final cleanup
     if (size_done >= size_data) {
         // unmap offloaded tensors and metadata
-        if (use_mmap) {
+        if (use_mmap || mmap_ple) {
             for (uint32_t idx = 0; idx < mappings.size(); idx++) {
                 const auto & mmap_used = mmaps_used.at(idx);
                 auto & mapping = mappings.at(idx);
+                if (!mapping) {
+                    continue;
+                }
                 mapping->unmap_fragment(0, mmap_used.first);
                 if (mmap_used.second != 0) {
                     mapping->unmap_fragment(mmap_used.second, mapping->size());

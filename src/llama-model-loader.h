@@ -45,6 +45,8 @@ struct llama_model_loader {
     int     ncmoe      = 0;
 
     bool use_mmap = false;
+    bool mmap_ple = false;
+    int  mmap_ple_file = -1;
     bool check_tensors;
     bool repack_tensors = false;
     bool use_thp = false;
