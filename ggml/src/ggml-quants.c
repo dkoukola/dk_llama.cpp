@@ -912,7 +912,7 @@ void quantize_row_q8_0_ref(const float * restrict x, block_q8_0 * restrict y, in
     assert(k % QK8_0 == 0);
     const int nb = k / QK8_0;
 
-    const float fudge = ggml_get_quantize_fudge_factor(GGML_TYPE_Q6_0);
+    const float fudge = ggml_get_quantize_fudge_factor(GGML_TYPE_Q8_0);
 
     for (int i = 0; i < nb; i++) {
         float amax = 0.0f; // absolute max
