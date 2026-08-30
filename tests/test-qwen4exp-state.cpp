@@ -2,10 +2,12 @@
 
 #include "llama-context.h"
 #include "llama-model.h"
+#include "llama-qwen4exp.h"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -30,8 +32,9 @@ static constexpr uint32_t TEST_CONTEXT_SIZE = 128;
 static constexpr uint32_t TEST_BATCH_SIZE   = 32;
 static constexpr uint32_t TEST_N_SEQ        = 4;
 static constexpr size_t   TEST_PROMPT_SIZE  = 16;
-static constexpr size_t   TEST_NEXT_SIZE    = 4;
-static constexpr int      TEST_SPEC_SIZE    = 3;
+static constexpr size_t   TEST_NEXT_SIZE    = 6;
+// n_max=4 drafts produce five target verification rows.
+static constexpr int      TEST_SPEC_SIZE    = 5;
 
 using model_ptr = std::unique_ptr<llama_model, decltype(&llama_free_model)>;
 using context_ptr = std::unique_ptr<llama_context, decltype(&llama_free)>;
@@ -85,19 +88,7 @@ static context_ptr make_mtp_context(llama_model * model, bool embeddings) {
     return context_ptr(llama_init_from_model(model, params), llama_free);
 }
 
-static std::vector<llama_token> tokenize(llama_model * model, const std::string & text) {
-    const int32_t required = llama_tokenize(
-            model, text.data(), (int32_t) text.size(), nullptr, 0, true, false);
-    CHECK(required < 0);
-
-    std::vector<llama_token> result((size_t) -required);
-    const int32_t written = llama_tokenize(
-            model, text.data(), (int32_t) text.size(), result.data(), (int32_t) result.size(), true, false);
-    CHECK(written == (int32_t) result.size());
-    return result;
-}
-
-static void decode_tokens(
+static int32_t try_decode_tokens(
         llama_context * ctx,
         const std::vector<llama_token> & tokens,
         llama_pos pos,
@@ -119,7 +110,16 @@ static void decode_tokens(
 
     const int32_t status = llama_decode(ctx, batch);
     llama_batch_free(batch);
-    CHECK(status == 0);
+    return status;
+}
+
+static void decode_tokens(
+        llama_context * ctx,
+        const std::vector<llama_token> & tokens,
+        llama_pos pos,
+        llama_seq_id seq_id,
+        bool logits_all) {
+    CHECK(try_decode_tokens(ctx, tokens, pos, seq_id, logits_all) == 0);
 }
 
 static void decode_image_grid(
@@ -200,6 +200,20 @@ static void check_logits_equal(const std::vector<float> & expected, const std::v
     std::fprintf(stderr, "logits differ at index %zu: expected %.9g, got %.9g\n",
             first, (double) expected[first], (double) actual[first]);
     std::abort();
+}
+
+static void check_logits_close(
+        const std::vector<float> & expected,
+        const std::vector<float> & actual,
+        float tolerance) {
+    CHECK(expected.size() == actual.size());
+    for (size_t i = 0; i < expected.size(); ++i) {
+        if (std::fabs(expected[i] - actual[i]) > tolerance) {
+            std::fprintf(stderr, "logits differ at index %zu: expected %.9g, got %.9g\n",
+                    i, (double) expected[i], (double) actual[i]);
+            std::abort();
+        }
+    }
 }
 
 static std::vector<float> copy_embeddings(
@@ -380,39 +394,138 @@ static void check_lifecycle(llama_context * ctx, const std::vector<llama_token> 
     check_empty_cells_have_no_tokens(ctx);
 }
 
-static void check_speculative_rollback(
+static void check_speculative_direct_restore(
         llama_model * model,
         const std::vector<uint8_t> & seq_state,
         const std::vector<llama_token> & prompt,
         const std::vector<llama_token> & continuation,
         const std::vector<std::vector<float>> & expected_logits,
         int32_t n_vocab,
-        int accepted) {
+        int accepted,
+        llama_seq_id seq_id) {
+    CHECK(accepted >= 0 && accepted <= TEST_SPEC_SIZE);
     context_ptr ctx = make_context(model);
     CHECK(ctx != nullptr);
-    CHECK(llama_state_seq_set_data(ctx.get(), seq_state.data(), seq_state.size(), 0, 0) == seq_state.size());
-    CHECK(tokens_for_seq(ctx.get(), 0) == expected_tokens(prompt));
+    CHECK(llama_state_seq_set_data(
+            ctx.get(), seq_state.data(), seq_state.size(), seq_id, 0) == seq_state.size());
+    CHECK(tokens_for_seq(ctx.get(), seq_id) == expected_tokens(prompt));
 
-    const int mode = llama_spec_ckpt_init(ctx.get(), LLAMA_SPEC_CKPT_AUTO, TEST_SPEC_SIZE);
-    CHECK(mode != LLAMA_SPEC_CKPT_NONE);
-    CHECK(mode != LLAMA_SPEC_CKPT_PER_STEP);
-    CHECK(llama_spec_ckpt_save(ctx.get(), 0));
+    const int mode = llama_spec_ckpt_init(ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, TEST_SPEC_SIZE);
+    CHECK(mode == LLAMA_SPEC_CKPT_PER_STEP);
+    CHECK(llama_spec_ckpt_save(ctx.get(), seq_id));
+    const std::vector<uint8_t> saved_state = save_seq_state(ctx.get(), seq_id);
+    CHECK(llama_spec_ckpt_restore_ex(
+            ctx.get(), seq_id, (llama_pos) prompt.size(), -1) ==
+            LLAMA_SPEC_CKPT_RESTORE_FAILED);
+    CHECK(save_seq_state(ctx.get(), seq_id) == saved_state);
 
     const std::vector<llama_token> speculation(
             continuation.begin(), continuation.begin() + TEST_SPEC_SIZE);
-    decode_tokens(ctx.get(), speculation, (llama_pos) prompt.size(), 0, true);
+    decode_tokens(ctx.get(), speculation, (llama_pos) prompt.size(), seq_id, true);
+
+    // Boundary failures must leave the completed capture usable by a later valid
+    // direct restore.
+    const std::vector<uint8_t> captured_state = save_seq_state(ctx.get(), seq_id);
+    CHECK(!ctx->qsa_pooled_stale);
+    CHECK(try_decode_tokens(
+            ctx.get(), { continuation[TEST_SPEC_SIZE] },
+            (llama_pos) prompt.size() + TEST_SPEC_SIZE, seq_id, false) != 0);
+    CHECK(save_seq_state(ctx.get(), seq_id) == captured_state);
+    CHECK(llama_spec_ckpt_restore_ex(
+            ctx.get(), seq_id, (llama_pos) prompt.size() + 1, accepted - 1) ==
+            LLAMA_SPEC_CKPT_RESTORE_FAILED);
+    CHECK(save_seq_state(ctx.get(), seq_id) == captured_state);
+    CHECK(llama_spec_ckpt_restore_ex(
+            ctx.get(), seq_id, (llama_pos) prompt.size(), TEST_SPEC_SIZE) ==
+            LLAMA_SPEC_CKPT_RESTORE_FAILED);
+    CHECK(save_seq_state(ctx.get(), seq_id) == captured_state);
 
     const llama_spec_ckpt_restore_result restored = llama_spec_ckpt_restore_ex(
-            ctx.get(), 0, (llama_pos) prompt.size(), accepted - 1);
-    CHECK(restored == LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED);
-    CHECK(tokens_for_seq(ctx.get(), 0) == expected_tokens(prompt));
+            ctx.get(), seq_id, (llama_pos) prompt.size(), accepted - 1);
+    CHECK(restored == LLAMA_SPEC_CKPT_RESTORE_DIRECT);
+    CHECK(!ctx->qsa_pooled_stale);
 
-    check_continuation(
-            ctx.get(), 0, (llama_pos) prompt.size(), continuation, expected_logits, n_vocab, 0, (size_t) accepted);
-    check_continuation(
-            ctx.get(), 0, (llama_pos) prompt.size(), continuation, expected_logits, n_vocab,
-            (size_t) accepted, (size_t) accepted + 1);
+    std::vector<llama_token> committed = prompt;
+    committed.insert(committed.end(), speculation.begin(), speculation.begin() + accepted);
+    CHECK(tokens_for_seq(ctx.get(), seq_id) == expected_tokens(committed));
+
+    // Decode only new tokens. If the accepted prefix had to be replayed, the
+    // recurrent/PLE state here would not match the sequential reference. The
+    // abort case crosses the ratio-2 boundary so its lazily stale pooled block
+    // must be rewritten before becoming visible.
     llama_spec_ckpt_discard(ctx.get());
+    const size_t end = accepted == 0 ? 2 : (size_t) accepted + 1;
+    check_continuation(
+            ctx.get(), seq_id, (llama_pos) prompt.size(), continuation, expected_logits, n_vocab,
+            (size_t) accepted, end);
+    committed.insert(committed.end(), continuation.begin() + accepted, continuation.begin() + end);
+    CHECK(tokens_for_seq(ctx.get(), seq_id) == expected_tokens(committed));
+}
+
+static void check_single_token_checkpoint(
+        llama_model * model,
+        const std::vector<uint8_t> & seq_state,
+        const std::vector<llama_token> & prompt,
+        const std::vector<llama_token> & continuation,
+        const std::vector<std::vector<float>> & expected_logits,
+        int32_t n_vocab) {
+    context_ptr ctx = make_context(model);
+    CHECK(ctx != nullptr);
+    CHECK(llama_state_seq_set_data(
+            ctx.get(), seq_state.data(), seq_state.size(), 0, 0) == seq_state.size());
+    CHECK(llama_spec_ckpt_init(ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, 1) == LLAMA_SPEC_CKPT_PER_STEP);
+    CHECK(llama_spec_ckpt_save(ctx.get(), 0));
+    decode_tokens(ctx.get(), { continuation[0] }, (llama_pos) prompt.size(), 0, false);
+    CHECK(llama_spec_ckpt_restore_ex(
+            ctx.get(), 0, (llama_pos) prompt.size(), 0) == LLAMA_SPEC_CKPT_RESTORE_DIRECT);
+    std::vector<llama_token> committed = prompt;
+    committed.push_back(continuation[0]);
+    CHECK(tokens_for_seq(ctx.get(), 0) == expected_tokens(committed));
+    llama_spec_ckpt_discard(ctx.get());
+    check_continuation(
+            ctx.get(), 0, (llama_pos) prompt.size(), continuation, expected_logits, n_vocab, 1, 2);
+}
+
+static void check_begin_only_base_restore(
+        llama_model * model,
+        const std::vector<uint8_t> & seq_state,
+        const std::vector<llama_token> & prompt,
+        const std::vector<llama_token> & continuation) {
+    context_ptr ctx = make_context(model);
+    CHECK(ctx != nullptr);
+    CHECK(llama_state_seq_set_data(
+            ctx.get(), seq_state.data(), seq_state.size(), 0, 0) == seq_state.size());
+    CHECK(llama_spec_ckpt_init(ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, 2) == LLAMA_SPEC_CKPT_PER_STEP);
+    CHECK(llama_spec_ckpt_save(ctx.get(), 0));
+    const std::vector<uint8_t> base_state = save_seq_state(ctx.get(), 0);
+
+    llama_batch batch = llama_batch_init(2, 0, 1);
+    batch.n_tokens = 2;
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        batch.token[i] = continuation[(size_t) i];
+        batch.pos[i] = (llama_pos) prompt.size() + i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+    }
+    CHECK(llama_qwen4exp_spec_ckpt_begin_capture(ctx.get(), batch));
+    llama_batch_free(batch);
+
+    // A decode can fail after begin_capture has established the batch boundary
+    // but before finish_capture records step rows. Zero-prefix rollback must
+    // still restore the saved base and trim any partial KV metadata.
+    CHECK(llama_spec_ckpt_restore_ex(
+            ctx.get(), 0, (llama_pos) prompt.size(), -1) == LLAMA_SPEC_CKPT_RESTORE_DIRECT);
+    CHECK(save_seq_state(ctx.get(), 0) == base_state);
+    llama_spec_ckpt_discard(ctx.get());
+}
+
+static void check_multi_ubatch_checkpoint_rejected(llama_model * model) {
+    llama_context_params params = make_context_params(1);
+    params.n_ubatch = 2;
+    context_ptr ctx(llama_init_from_model(model, params), llama_free);
+    CHECK(ctx != nullptr);
+    CHECK(llama_spec_ckpt_init(
+            ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, TEST_SPEC_SIZE) == LLAMA_SPEC_CKPT_NONE);
 }
 
 int main(int argc, char ** argv) {
@@ -431,19 +544,25 @@ int main(int argc, char ** argv) {
     CHECK(model != nullptr);
     CHECK(std::strcmp(llama_model_arch_string(model.get()), "qwen4exp") == 0);
     CHECK(!llama_model_supports_ctx_shift(model.get()));
+    CHECK(model->hparams.is_recurrent(0));
+    CHECK(model->hparams.is_ple(0));
+    CHECK(!model->hparams.is_recurrent(1));
+    CHECK(model->hparams.is_ple(1));
+    CHECK(model->hparams.n_embd_ple_conv(0) > 0);
+    CHECK(model->hparams.n_embd_ple_conv(1) > 0);
 
-    const std::string text =
-            "Canonical predecessor tokens must survive state restoration, sequence cloning, rollback, "
-            "and replay without changing the next logits produced by Qwen 3.8 Flash.";
-    const std::vector<llama_token> all_tokens = tokenize(model.get(), text);
-    CHECK(all_tokens.size() >= TEST_PROMPT_SIZE + TEST_NEXT_SIZE);
+    const int32_t n_vocab = llama_n_vocab(model.get());
+    CHECK(n_vocab > 3);
+    std::vector<llama_token> all_tokens(TEST_PROMPT_SIZE + TEST_NEXT_SIZE);
+    for (size_t i = 0; i < all_tokens.size(); ++i) {
+        all_tokens[i] = 3 + (llama_token) (i % (size_t) (n_vocab - 3));
+    }
     const std::vector<llama_token> prompt(
             all_tokens.begin(), all_tokens.begin() + TEST_PROMPT_SIZE);
     const std::vector<llama_token> continuation(
             all_tokens.begin() + TEST_PROMPT_SIZE,
             all_tokens.begin() + TEST_PROMPT_SIZE + TEST_NEXT_SIZE);
 
-    const int32_t n_vocab = llama_n_vocab(model.get());
     // MTP requires hidden outputs regardless of the ordinary embeddings flag.
     check_mtp_whole_state_round_trip(model.get(), prompt, continuation[0], n_vocab, false);
     check_mtp_whole_state_round_trip(model.get(), prompt, continuation[0], n_vocab, true);
@@ -529,10 +648,18 @@ int main(int argc, char ** argv) {
     CHECK(save_seq_state(sequence_restored.get(), 1) == seq_state);
     sequence_restored.reset();
 
-    for (int accepted : { 0, 1, TEST_SPEC_SIZE }) {
-        check_speculative_rollback(
-                model.get(), seq_state, prompt, continuation, expected_logits, n_vocab, accepted);
-    }
+    check_speculative_direct_restore(
+            model.get(), seq_state, prompt, continuation, expected_logits, n_vocab, 0, 0);
+    check_speculative_direct_restore(
+            model.get(), seq_state, prompt, continuation, expected_logits, n_vocab, 1, 0);
+    check_speculative_direct_restore(
+            model.get(), seq_state, prompt, continuation, expected_logits, n_vocab, 2, 1);
+    check_speculative_direct_restore(
+            model.get(), seq_state, prompt, continuation, expected_logits, n_vocab, TEST_SPEC_SIZE, 0);
+    check_single_token_checkpoint(
+            model.get(), seq_state, prompt, continuation, expected_logits, n_vocab);
+    check_begin_only_base_restore(model.get(), seq_state, prompt, continuation);
+    check_multi_ubatch_checkpoint_rejected(model.get());
 
     context_ptr lifecycle = make_context(model.get());
     CHECK(lifecycle != nullptr);
@@ -575,6 +702,11 @@ int main(int argc, char ** argv) {
     const std::vector<uint8_t> image_seq_state = save_seq_state(image_original.get(), 0);
     decode_tokens(image_original.get(), { continuation[0] }, 5, 0, false);
     const std::vector<float> expected_image_logits = copy_logits(image_original.get(), 0, n_vocab);
+    const std::vector<qsa_cell_meta> expected_image_after_first =
+            qsa_meta_for_seq(image_original.get(), 0);
+    decode_tokens(image_original.get(), { continuation[1] }, 6, 0, false);
+    const std::vector<float> expected_image_next_logits =
+            copy_logits(image_original.get(), 0, n_vocab);
     image_original.reset();
 
     context_ptr image_whole = make_context(model.get());
@@ -596,6 +728,27 @@ int main(int argc, char ** argv) {
     check_logits_equal(expected_image_logits, copy_logits(image_sequence.get(), 0, n_vocab));
     image_sequence.reset();
 
+    // Scalar M-RoPE time does not encode the logical next token after an image
+    // grid. The checkpoint start must come from this verified batch (position 5),
+    // not max(cell.pos) + 1 (which would be 3 here).
+    context_ptr image_checkpoint = make_context(model.get());
+    CHECK(image_checkpoint != nullptr);
+    CHECK(llama_state_set_data(
+            image_checkpoint.get(), image_state.data(), image_state.size()) == image_state.size());
+    CHECK(llama_spec_ckpt_init(
+            image_checkpoint.get(), LLAMA_SPEC_CKPT_PER_STEP, 2) == LLAMA_SPEC_CKPT_PER_STEP);
+    CHECK(llama_spec_ckpt_save(image_checkpoint.get(), 0));
+    decode_tokens(image_checkpoint.get(), { continuation[0], continuation[1] }, 5, 0, true);
+    CHECK(llama_spec_ckpt_restore_ex(
+            image_checkpoint.get(), 0, 5, 0) == LLAMA_SPEC_CKPT_RESTORE_DIRECT);
+    CHECK(!image_checkpoint->qsa_pooled_stale);
+    CHECK(qsa_meta_for_seq(image_checkpoint.get(), 0) == expected_image_after_first);
+    llama_spec_ckpt_discard(image_checkpoint.get());
+    decode_tokens(image_checkpoint.get(), { continuation[1] }, 6, 0, false);
+    check_logits_equal(expected_image_next_logits,
+            copy_logits(image_checkpoint.get(), 0, n_vocab));
+    image_checkpoint.reset();
+
     context_ptr image_reference = make_context(model.get());
     context_ptr image_defrag = make_context(model.get());
     CHECK(image_reference != nullptr);
@@ -610,9 +763,11 @@ int main(int argc, char ** argv) {
     decode_tokens(image_reference.get(), { continuation[0] }, 5, 0, false);
     decode_tokens(image_defrag.get(), { continuation[0] }, 5, 0, false);
     CHECK(qsa_meta_for_seq(image_defrag.get(), 0) == qsa_meta_for_seq(image_reference.get(), 0));
-    check_logits_equal(
+    // Defrag changes the physical key order. The attention reduction can then
+    // differ by one rounding bit even though the logical cache is identical.
+    check_logits_close(
             copy_logits(image_reference.get(), 0, n_vocab),
-            copy_logits(image_defrag.get(), 0, n_vocab));
+            copy_logits(image_defrag.get(), 0, n_vocab), 1e-6f);
     image_defrag.reset();
     image_reference.reset();
 

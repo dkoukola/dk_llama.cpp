@@ -2,6 +2,7 @@
 #include "../llama-model.h"
 #include "../llama-context.h"
 #include "../llama-delta-net.h"
+#include "../llama-qwen4exp.h"
 
 // the [hc_dim] gamma is wider than the per-stream reduction, so ggml_fused_rms_norm cannot
 // express this and the two ops stay separate
@@ -99,6 +100,7 @@ static ggml_tensor * qwen4exp_ple_conv(
         const llama_model   & model,
         ggml_tensor         * state_all,
         ggml_tensor         * xt,          // [n_tokens, hc_dim]
+        ggml_tensor         * per_step,
         int32_t               hc_dim,
         int32_t               n_tokens,
         uint32_t              slot,
@@ -121,6 +123,22 @@ static ggml_tensor * qwen4exp_ple_conv(
     cb(state, "ple_conv_state", il);
 
     ggml_tensor * conv_in = ggml_concat(ctx0, state, xt, 0); // [hist + n_tokens, hc_dim]
+
+    if (per_step != nullptr) {
+        const int64_t state_width = (int64_t) hist * hc_dim;
+        GGML_ASSERT(n_tokens > 1);
+        GGML_ASSERT(per_step->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_nelements(per_step) >= (int64_t) (n_tokens - 1) * state_width);
+        for (int32_t step = 0; step + 1 < n_tokens; ++step) {
+            ggml_tensor * step_state = ggml_cont(ctx0,
+                    ggml_view_2d(ctx0, conv_in, hist, hc_dim, conv_in->nb[1],
+                        (size_t) (step + 1) * conv_in->nb[0]));
+            step_state = ggml_reshape_1d(ctx0, step_state, state_width);
+            ggml_tensor * step_dst = ggml_view_1d(ctx0, per_step, state_width,
+                    (size_t) step * state_width * sizeof(float));
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, step_state, step_dst));
+        }
+    }
 
     ggml_tensor * conv_out = nullptr;
     for (int32_t k = 0; k < kern; ++k) {
@@ -216,8 +234,11 @@ static ggml_tensor * qwen4exp_ple(
     ggml_tensor * xt = ggml_cont(ctx0, ggml_transpose(ctx0, normalized)); // [n_tokens, hc_dim]
 
     ggml_tensor * conv_out = nullptr;
+    ggml_tensor * per_step = delta.save_per_step_states
+            ? llama_qwen4exp_spec_ckpt_ple(&lctx, il)
+            : nullptr;
     if (delta.batch_shares_one_seq()) {
-        conv_out = qwen4exp_ple_conv(ctx0, gf, hparams, model, state_all, xt, hc_dim, n_tokens,
+        conv_out = qwen4exp_ple_conv(ctx0, gf, hparams, model, state_all, xt, per_step, hc_dim, n_tokens,
                 delta.state_slot(0), reset_state, il, cb);
     } else {
         // A mixed-sequence ubatch reads a different history per token, exactly as the
@@ -225,7 +246,7 @@ static ggml_tensor * qwen4exp_ple(
         for (int32_t i = 0; i < n_tokens; ++i) {
             ggml_tensor * x_i = ggml_cont(ctx0,
                     ggml_view_2d(ctx0, xt, 1, hc_dim, xt->nb[1], i*xt->nb[0]));
-            ggml_tensor * out_i = qwen4exp_ple_conv(ctx0, gf, hparams, model, state_all, x_i, hc_dim, 1,
+            ggml_tensor * out_i = qwen4exp_ple_conv(ctx0, gf, hparams, model, state_all, x_i, nullptr, hc_dim, 1,
                     delta.state_slot(i), reset_pos[i], il, cb);
             conv_out = conv_out ? ggml_concat(ctx0, conv_out, out_i, 0) : out_i;
         }
@@ -381,9 +402,10 @@ static ggml_tensor * qwen4exp_qsa_mask(
             lctx.cparams.mtp_op_type == MTP_OP_DRAFT_GEN &&
             !lctx.qwen4_mtp_qsa_topk.empty();
     if (reuse_mtp_topk) {
-        GGML_ASSERT(lctx.qwen4_mtp_qsa_tail_capacity > 0);
+        GGML_ASSERT(lctx.qwen4_mtp_qsa_tail_capacity >= 0);
         const int64_t n_selected = (int64_t) lctx.qwen4_mtp_qsa_topk.size() +
                 lctx.qwen4_mtp_qsa_tail_capacity;
+        GGML_ASSERT(n_selected <= KQ_mask->ne[0]);
         inp->reuse_topk = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_selected, n_tokens);
         cb(inp->reuse_topk, "qsa_reuse_top_k", -1);
         ggml_set_input(inp->reuse_topk);

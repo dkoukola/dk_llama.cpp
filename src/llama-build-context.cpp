@@ -371,7 +371,10 @@ ggml_cgraph * llm_build_context::build_defrag(const std::vector<uint32_t> & ids)
             nm++;
         }
 
-        for (int il = 0; il < n_layer; ++il) {
+        // The target side of an embedded-MTP model intentionally omits the
+        // predictor tail from its KV vectors.  Iterate the allocated cache
+        // layers rather than the model's total (target + predictor) count.
+        for (int il = 0; il < (int) kv_self.k_l.size(); ++il) {
             if (llm_arch_is_hybrid(model.arch) && hparams.is_recurrent(il)) {
                 continue;
             }

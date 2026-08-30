@@ -214,6 +214,30 @@ struct llama_kv_cache {
         int64_t per_step_conv_dim = 0;
         int32_t per_step_d_conv = 0;
 
+        struct qwen4exp_per_step_base {
+            ggml_tensor * state = nullptr;
+            ggml_tensor * shadow = nullptr;
+            int64_t offset = 0;
+            int64_t width = 0;
+        };
+
+        // Qwen4Exp keeps the GDN checkpoints above in the generic kernel-facing
+        // buffers, but needs architecture-specific base rows and PLE histories.
+        std::vector<qwen4exp_per_step_base> qwen4exp_per_step_base_rows;
+        std::vector<ggml_tensor *> qwen4exp_per_step_ple;
+        std::vector<ggml_context *> qwen4exp_per_step_ctxs;
+        std::vector<ggml_backend_buffer_t> qwen4exp_per_step_bufs;
+        bool qwen4exp_per_step_allocated = false;
+        bool qwen4exp_per_step_saved = false;
+        bool qwen4exp_per_step_captured = false;
+        bool qwen4exp_per_step_invalid = false;
+        int32_t qwen4exp_per_step_max_tokens = 0;
+        int32_t qwen4exp_per_step_n_tokens = 0;
+        llama_seq_id qwen4exp_per_step_seq_id = -1;
+        llama_pos qwen4exp_per_step_first_pos = -1;
+        size_t qwen4exp_per_step_base_bytes = 0;
+        size_t qwen4exp_per_step_delta_bytes = 0;
+
         // DSV4 per-step compressor-state base and per-row deltas.
         std::vector<ggml_tensor *> dsv4_per_step_state;
         std::vector<ggml_tensor *> dsv4_per_step_state_shadow;
@@ -260,10 +284,12 @@ struct llama_kv_cache {
 
         void release_dsv4_per_step();
         void release_dsv4_snapshot();
+        void release_qwen4exp_per_step();
 
         void release() {
             release_dsv4_per_step();
             release_dsv4_snapshot();
+            release_qwen4exp_per_step();
 
             std::vector<llama_kv_cell>().swap(cells_snapshot);
             head_snapshot = 0;

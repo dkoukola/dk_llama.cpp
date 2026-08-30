@@ -34,6 +34,11 @@ def generate(output: Path, companion: bool = False) -> None:
     ssm_groups = 1
     ssm_dt_rank = 1
     ssm_conv = 4
+    # Two PLE heads are concatenated before projection, so their combined
+    # embedding width must equal the model embedding width.
+    ple_head_dim = hidden // 2
+    ple_ngram = 3
+    ple_kernel = 4
 
     writer.add_name("synthetic-qwen4exp-mtp-companion" if companion else "synthetic-qwen4exp-mtp")
     writer.add_block_count(layers)
@@ -65,6 +70,18 @@ def generate(output: Path, companion: bool = False) -> None:
     writer.add_attention_indexer_key_length(indexer_dim)
     writer.add_attention_indexer_top_k(2)
     writer.add_attention_compress_ratios([0, 2, 2])
+    if not companion:
+        # Layer 0 exercises the combined [GDN | PLE] state row and layer 1
+        # exercises a PLE-only row.
+        writer.add_ple_layers([0, 1])
+        writer.add_ple_ngram_size(ple_ngram)
+        writer.add_ple_heads_per_ngram(1)
+        writer.add_ple_conv_kernel(ple_kernel)
+        writer.add_embedding_length_per_layer_input(ple_head_dim)
+        writer.add_ple_layer_multipliers([1, 17, 257])
+        writer.add_ple_head_offsets([0, vocab])
+        writer.add_ple_head_vocab_sizes([vocab, vocab])
+        writer.add_ple_eos_token_id(2)
 
     tokens = ["<unk>", "<s>", "</s>"] + [chr(ord("a") + i) for i in range(vocab - 3)]
     writer.add_tokenizer_model("llama")
@@ -97,6 +114,12 @@ def generate(output: Path, companion: bool = False) -> None:
     token_embd = rand((vocab, hidden))
     writer.add_tensor("token_embd.weight", token_embd)
     writer.add_tensor("output.weight", token_embd.copy())
+    ple_table = rand(((ple_ngram - 1) * vocab, ple_head_dim))
+    if not companion:
+        writer.add_tensor(
+            "per_layer_token_embd.weight",
+            ple_table,
+        )
     add("output_hc_norm.weight", (hc_width,), norm=True)
     add("output_hc_down.weight", (hc_rank, hc_width))
     add("output_hc_up.weight", (hc_width, hc_rank))
@@ -111,6 +134,14 @@ def generate(output: Path, companion: bool = False) -> None:
         add(f"{prefix}.hc_ffn_down.weight", (hc_rank, hc_width))
         add(f"{prefix}.hc_ffn_up.weight", (hc_width, hc_rank))
         add(f"{prefix}.hc_ffn_inject.weight", (hc_count, hc_width))
+
+        if layer in (0, 1):
+            add(f"{prefix}.ple_key.weight", (hc_width, hidden))
+            add(f"{prefix}.ple_value.weight", (hidden, hidden))
+            add(f"{prefix}.ple_norm_key.weight", (hc_width,), norm=True)
+            add(f"{prefix}.ple_norm_query.weight", (hc_width,), norm=True)
+            add(f"{prefix}.ple_norm_conv.weight", (hc_width,), norm=True)
+            add(f"{prefix}.ple_conv1d.weight", (hc_width, ple_kernel))
 
         if layer == 0:
             conv_dim = ssm_state * ssm_groups * 2 + ssm_inner

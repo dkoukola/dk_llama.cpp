@@ -20,6 +20,7 @@
 #include "llama-spec-features.h"
 #include "llama-dflash.h"
 #include "llama-dsv4.h"
+#include "llama-qwen4exp.h"
 #include "llama-quantize.h"
 
 #include "unicode.h"
@@ -869,8 +870,12 @@ void llama_context::set_mtp_n_heads(int32_t value) {
 }
 
 llama_context::~llama_context() {
-    if (qwen4_mtp_qsa_pending && sched != nullptr) {
+    // Graphs can write into persistent checkpoint tensors. They must finish and
+    // leave the graph cache before the checkpoint buffers are released, even
+    // when no QSA readback is pending.
+    if (sched != nullptr) {
         ggml_backend_sched_synchronize(sched);
+        reset_scheduler();
         qwen4_mtp_qsa_pending = false;
     }
     if (dflash.kv.cache_sched != nullptr) {
@@ -2424,7 +2429,7 @@ bool llama_kv_cache::per_step_alloc(const llama_model & model, int max_tokens) {
     std::map<ggml_backend_buffer_type_t, std::vector<std::pair<std::pair<uint32_t, int32_t>, ggml_backend_buffer_type_t>>> buft_layers;
 
     for (uint32_t il = 0; il < n_layer; ++il) {
-        if (s_l[il] == nullptr) continue;
+        if (s_l[il] == nullptr || !model.hparams.is_recurrent(il)) continue;
 
         if (s_l[il]->extra) {
             auto split_sl = (ggml_split_tensor_t *)s_l[il]->extra;
@@ -5552,10 +5557,16 @@ static void llama_qwen4_mtp_qsa_retire_pending(llama_context & lctx) {
 
 static void llama_qwen4_mtp_qsa_reset(llama_context & lctx) {
     llama_qwen4_mtp_qsa_retire_pending(lctx);
+    const bool reset_graph = !lctx.qwen4_mtp_qsa_topk.empty() ||
+            lctx.qwen4_mtp_qsa_tail_capacity != 0;
     lctx.qwen4_mtp_qsa_topk.clear();
     lctx.qwen4_mtp_qsa_valid.clear();
     lctx.qwen4_mtp_qsa_captured_len = -1;
     lctx.qwen4_mtp_qsa_seq = -1;
+    lctx.qwen4_mtp_qsa_tail_capacity = 0;
+    if (reset_graph) {
+        lctx.prev_mtp.reset();
+    }
 }
 
 static void llama_qwen4_mtp_qsa_snapshot_valid(
@@ -5664,13 +5675,27 @@ static bool llama_qwen4_mtp_qsa_prepare_reuse(
                 __func__, (int) tail_size);
         return false;
     }
-    int32_t capacity = std::max<int32_t>(8, lctx.qwen4_mtp_qsa_tail_capacity);
-    while (capacity < tail_size && capacity < (int32_t) lctx.cparams.n_ctx) {
-        capacity = std::min<int32_t>((int32_t) lctx.cparams.n_ctx, capacity*2);
-    }
-    if (capacity < tail_size) {
-        LLAMA_LOG_ERROR("%s: Qwen3.8 MTP post-capture tail exceeds the context\n", __func__);
+
+    // ggml_indexer_mask requires every selected index to fit in the key dimension of
+    // the current (padded) KQ mask. Keep some spare tail slots to reuse the graph across
+    // draft steps, but clip that reserve at a padding boundary. It may legitimately be
+    // smaller than the usual eight slots, including zero when the frozen selection fills
+    // the mask exactly.
+    const int32_t mask_width = (int32_t) lctx.kv_self.n;
+    if (lctx.qwen4_mtp_qsa_topk.size() > (size_t) mask_width) {
+        LLAMA_LOG_ERROR("%s: Qwen3.8 MTP frozen QSA selection exceeds mask width\n", __func__);
         return false;
+    }
+    const int32_t max_capacity = mask_width - (int32_t) lctx.qwen4_mtp_qsa_topk.size();
+    if (tail_size > max_capacity) {
+        LLAMA_LOG_ERROR("%s: Qwen3.8 MTP post-capture tail exceeds mask width\n", __func__);
+        return false;
+    }
+
+    int32_t capacity = std::min<int32_t>(max_capacity,
+            std::max<int32_t>(8, lctx.qwen4_mtp_qsa_tail_capacity));
+    while (capacity < tail_size) {
+        capacity = (int32_t) std::min<int64_t>(max_capacity, (int64_t) capacity*2);
     }
     if (capacity != lctx.qwen4_mtp_qsa_tail_capacity) {
         lctx.qwen4_mtp_qsa_tail_capacity = capacity;
@@ -5850,6 +5875,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             const size_t tail_capacity = (size_t) lctx.qwen4_mtp_qsa_tail_capacity;
             const size_t row_width = frozen_size + tail_capacity;
             GGML_ASSERT((int64_t) row_width == qsa.reuse_topk->ne[0]);
+            GGML_ASSERT(row_width <= (size_t) n_kv);
             GGML_ASSERT(ggml_backend_buffer_is_host(qsa.reuse_topk->buffer));
             int32_t * dst = (int32_t *) qsa.reuse_topk->data;
             for (int32_t row = 0; row < n_tokens; ++row) {
@@ -7093,6 +7119,10 @@ static int llama_decode_internal(
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
+    if (!llama_qwen4exp_spec_ckpt_begin_capture(&lctx, batch_all)) {
+        return -1;
+    }
+
     if (lctx.t_compute_start_us == 0) {
         lctx.t_compute_start_us = ggml_time_us();
     }
@@ -7454,7 +7484,7 @@ static int llama_decode_internal(
             return GGML_STATUS_FAILED;
         }
 
-        if (hparams.ple_n_heads > 0) {
+        if (hparams.ple_n_heads > 0 && cparams.mtp_op_type == MTP_OP_NONE) {
             // The context stores one input pointer while graph reuse can retain a
             // different graph. Refresh it from the graph selected for this decode.
             lctx.inp_ple_rows = ggml_graph_get_tensor(gf, "inp_ple_rows");
@@ -7535,6 +7565,7 @@ static int llama_decode_internal(
         llama_graph_compute(lctx, gf, n_threads);
 
         llama_qwen4_mtp_qsa_capture(lctx, u_batch, gf);
+        llama_qwen4exp_spec_ckpt_finish_capture(&lctx, u_batch.n_tokens);
 
         if (lctx.model.arch == LLM_ARCH_DEEPSEEK4 &&
             lctx.cparams.mtp_op_type == MTP_OP_NONE &&
@@ -10295,6 +10326,10 @@ static bool llama_context_accumulate_checkpoint_host_storage(
            memory.add_nested_host_vectors(ckpt.split_s_l_shadow) &&
            memory.add_nested_host_vectors(ckpt.per_step_ssm) &&
            memory.add_nested_host_vectors(ckpt.per_step_conv) &&
+           memory.add_host_vector(ckpt.qwen4exp_per_step_base_rows) &&
+           memory.add_host_vector(ckpt.qwen4exp_per_step_ple) &&
+           memory.add_host_vector(ckpt.qwen4exp_per_step_ctxs) &&
+           memory.add_host_vector(ckpt.qwen4exp_per_step_bufs) &&
            memory.add_host_vector(ckpt.dsv4_per_step_state) &&
            memory.add_host_vector(ckpt.dsv4_per_step_state_shadow) &&
            memory.add_host_vector(ckpt.dsv4_per_step_delta) &&
@@ -10474,6 +10509,7 @@ bool llama_context_get_memory_info(
             !memory.add_backend_buffers(kv.bufs) ||
             !memory.add_backend_buffers(ckpt.shadow_bufs) ||
             !memory.add_backend_buffers(ckpt.per_step_bufs) ||
+            !memory.add_backend_buffers(ckpt.qwen4exp_per_step_bufs) ||
             !memory.add_backend_buffers(ckpt.dsv4_per_step_shadow_bufs) ||
             !memory.add_backend_buffers(ckpt.dsv4_shadow_bufs) ||
             !memory.add_backend_buffers(ctx->cvec.bufs) ||
@@ -10488,6 +10524,7 @@ bool llama_context_get_memory_info(
         if (!memory.add_ggml_contexts(kv.ctxs) ||
             !memory.add_ggml_contexts(ckpt.shadow_ctxs) ||
             !memory.add_ggml_contexts(ckpt.per_step_ctxs) ||
+            !memory.add_ggml_contexts(ckpt.qwen4exp_per_step_ctxs) ||
             !memory.add_ggml_contexts(ckpt.dsv4_per_step_shadow_ctxs) ||
             !memory.add_ggml_contexts(ckpt.dsv4_shadow_ctxs) ||
             !memory.add_ggml_contexts(ctx->cvec.ctxs) ||
@@ -11046,11 +11083,9 @@ void llama_kv_cache_clear(struct llama_context * ctx) {
 
 // Unified speculative-checkpoint
 static bool spec_ckpt_try_per_step(llama_kv_cache & kv, const llama_model & model, int max_tokens) {
-    // openPangu carries only a conv state (no SSM recurrent term). Qwen4Exp packs
-    // its delta-net state before a PLE convolution tail and can also have PLE-only
-    // state rows. Neither layout matches the generic [conv prefix][SSM] per-step
-    // checkpoint. Use the arch-agnostic whole-slot shadow for both architectures.
-    if (model.arch == LLM_ARCH_OPENPANGU || model.arch == LLM_ARCH_QWEN4EXP) {
+    // openPangu carries only a conv state (no SSM recurrent term), so its layout
+    // does not match the generic [conv prefix][SSM] checkpoint.
+    if (model.arch == LLM_ARCH_OPENPANGU) {
         kv.save_per_step_ssm = false;
         return false;
     }
@@ -11133,6 +11168,7 @@ static const char * llama_spec_ckpt_mode_name(int mode) {
 int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     auto & kv = ctx->kv_self;
     const bool is_dsv4 = ctx->model.arch == LLM_ARCH_DEEPSEEK4;
+    const bool is_qwen4exp = ctx->model.arch == LLM_ARCH_QWEN4EXP;
 
     kv.save_per_step_ssm     = false;
     kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
@@ -11163,9 +11199,13 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     int resolved = LLAMA_SPEC_CKPT_NONE;
 
     const auto prepare_per_step = [&]() {
-        return is_dsv4
-            ? llama_dsv4_spec_ckpt_prepare(ctx, LLAMA_SPEC_CKPT_PER_STEP, max_tokens)
-            : spec_ckpt_try_per_step(kv, ctx->model, max_tokens);
+        if (is_dsv4) {
+            return llama_dsv4_spec_ckpt_prepare(ctx, LLAMA_SPEC_CKPT_PER_STEP, max_tokens);
+        }
+        if (is_qwen4exp) {
+            return llama_qwen4exp_spec_ckpt_prepare(ctx, max_tokens);
+        }
+        return spec_ckpt_try_per_step(kv, ctx->model, max_tokens);
     };
     const auto prepare_gpu_fallback = [&]() {
         return is_dsv4
@@ -11223,7 +11263,8 @@ int llama_spec_ckpt_init(struct llama_context * ctx, int mode, int max_tokens) {
     kv.ckpt.selected_spec_mode = resolved;
 
     LLAMA_LOG_INFO("%s: fixed %s checkpoint mode = %s%s\n",
-            __func__, is_dsv4 ? "DSV4" : "recurrent", llama_spec_ckpt_mode_name(resolved),
+            __func__, is_dsv4 ? "DSV4" : is_qwen4exp ? "Qwen4Exp" : "recurrent",
+            llama_spec_ckpt_mode_name(resolved),
             resolved == LLAMA_SPEC_CKPT_PER_STEP ? (std::string(" (max_tokens=") + std::to_string(max_tokens) + ")").c_str() : "");
 
     return resolved;
@@ -11236,6 +11277,9 @@ bool llama_spec_ckpt_save(struct llama_context * ctx, llama_seq_id seq_id) {
         case LLAMA_SPEC_CKPT_PER_STEP:
             if (ctx->model.arch == LLM_ARCH_DEEPSEEK4) {
                 return llama_dsv4_spec_ckpt_save(ctx, true);
+            }
+            if (ctx->model.arch == LLM_ARCH_QWEN4EXP) {
+                return llama_qwen4exp_spec_ckpt_save(ctx, seq_id);
             }
             kv.save_per_step_ssm = true;
             return true;
@@ -11274,6 +11318,26 @@ enum llama_spec_ckpt_restore_result llama_spec_ckpt_restore_ex(
                 const llama_pos accepted_pos = n_past + accepted_step;
                 llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1);
                 return llama_dsv4_spec_ckpt_restore(ctx, true, accepted_step);
+            }
+            if (ctx->model.arch == LLM_ARCH_QWEN4EXP) {
+                const llama_spec_ckpt_restore_result result =
+                        llama_qwen4exp_spec_ckpt_restore(ctx, seq_id, n_past, accepted_step);
+                if (result != LLAMA_SPEC_CKPT_RESTORE_DIRECT) {
+                    return result;
+                }
+                if (accepted_step < 0 ||
+                        accepted_step + 1 < kv.ckpt.qwen4exp_per_step_n_tokens) {
+                    const llama_pos accepted_pos = n_past + accepted_step;
+                    if (!llama_kv_cache_seq_rm(kv, seq_id, accepted_pos + 1, -1)) {
+                        return LLAMA_SPEC_CKPT_RESTORE_FAILED;
+                    }
+                    // QSA ranks only cells that retain this sequence id. A rolled-back
+                    // suffix therefore cannot be selected; if it leaves a partial block,
+                    // the next appended token touches and rewrites that boundary block.
+                    // Avoid a global pooled-key rebuild, which is prohibitively expensive
+                    // at long contexts.
+                }
+                return LLAMA_SPEC_CKPT_RESTORE_DIRECT;
             }
             if (!kv.per_step_restore(ctx->model, ctx->sched, accepted_step)) {
                 return LLAMA_SPEC_CKPT_RESTORE_FAILED;
@@ -11350,6 +11414,7 @@ void llama_spec_ckpt_discard(struct llama_context * ctx) {
     kv.ckpt.selected_spec_mode = LLAMA_SPEC_CKPT_NONE;
     kv.ckpt.cpu_state_data.clear();
     llama_dsv4_spec_ckpt_discard(ctx);
+    llama_qwen4exp_spec_ckpt_discard(ctx);
 }
 
 void llama_spec_ckpt_release(struct llama_context * ctx) {
@@ -11357,6 +11422,13 @@ void llama_spec_ckpt_release(struct llama_context * ctx) {
         return;
     }
 
+    // A backend graph may still be copying per-step states into checkpoint
+    // storage when a speculative session detaches. The reusable graph also
+    // retains those tensor pointers after computation has completed.
+    if (ctx->sched != nullptr) {
+        ggml_backend_sched_synchronize(ctx->sched);
+        ctx->reset_scheduler();
+    }
     llama_spec_ckpt_discard(ctx);
 
     auto & kv = ctx->kv_self;

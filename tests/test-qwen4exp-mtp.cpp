@@ -8,12 +8,15 @@
 #include "llama-spec-features.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
+#include <string>
 #include <vector>
 
 #define CHECK(condition) do { \
@@ -101,11 +104,14 @@ static context_ptr make_context(
         ggml_backend_sched_eval_callback callback = nullptr,
         void * callback_data = nullptr,
         int32_t dsa_top_k = -1,
-        uint32_t n_ctx = 32) {
+        uint32_t n_ctx = 32,
+        bool graph_reuse = true,
+        bool flash_attn = true,
+        bool fused_idx_topk = true) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = n_ctx;
-    params.n_batch = 4;
-    params.n_ubatch = 4;
+    params.n_batch = 8;
+    params.n_ubatch = 8;
     params.n_seq_max = 1;
     params.n_threads = 2;
     params.n_threads_batch = 2;
@@ -115,14 +121,17 @@ static context_ptr make_context(
     params.cb_eval = callback;
     params.cb_eval_user_data = callback_data;
     params.dsa_top_k = dsa_top_k;
+    params.graph_reuse = graph_reuse;
+    params.flash_attn = flash_attn;
+    params.fused_idx_topk = fused_idx_topk;
     return context_ptr(llama_init_from_model(model, params), llama_free);
 }
 
 static context_ptr make_plain_context(llama_model * model, bool embeddings = false) {
     llama_context_params params = llama_context_default_params();
     params.n_ctx = 32;
-    params.n_batch = 4;
-    params.n_ubatch = 4;
+    params.n_batch = 8;
+    params.n_ubatch = 8;
     params.n_seq_max = 1;
     params.n_threads = 2;
     params.n_threads_batch = 2;
@@ -143,8 +152,30 @@ static void decode_one(llama_context * ctx, llama_token token, llama_pos pos, bo
     CHECK(status == 0);
 }
 
-static std::vector<float> copy_embedding(llama_context * ctx, int32_t width) {
-    const float * data = llama_get_embeddings_ith(ctx, 0);
+static void decode_many(
+        llama_context * ctx,
+        const std::vector<llama_token> & tokens,
+        llama_pos pos) {
+    CHECK(!tokens.empty());
+    llama_batch batch = llama_batch_init((int32_t) tokens.size(), 0, 1);
+    batch.n_tokens = (int32_t) tokens.size();
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        batch.token[i] = tokens[i];
+        batch.pos[i] = pos + (llama_pos) i;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = 0;
+        batch.logits[i] = true;
+    }
+    const int32_t status = llama_decode(ctx, batch);
+    llama_batch_free(batch);
+    CHECK(status == 0);
+}
+
+static std::vector<float> copy_embedding(
+        llama_context * ctx,
+        int32_t width,
+        int32_t index = 0) {
+    const float * data = llama_get_embeddings_ith(ctx, index);
     CHECK(data != nullptr);
     std::vector<float> result(data, data + width);
     CHECK(std::all_of(result.begin(), result.end(), [](float value) { return std::isfinite(value); }));
@@ -168,6 +199,86 @@ static void seed_draft_step(
     CHECK(llama_set_draft_input_hidden_state_copy(ctx, hidden.data(), hidden.size()));
     llama_set_mtp_step_idx(ctx, step);
     decode_one(ctx, token, pos);
+}
+
+static void check_qsa_reuse_row(
+        llama_context * ctx,
+        int32_t expected_mask_width,
+        int32_t expected_capacity,
+        int32_t expected_tail_size) {
+    CHECK(ctx->kv_self.n == (uint32_t) expected_mask_width);
+    CHECK(ctx->qwen4_mtp_qsa_tail_capacity == expected_capacity);
+    const size_t frozen_size = ctx->qwen4_mtp_qsa_topk.size();
+    CHECK(frozen_size + (size_t) expected_capacity <= (size_t) expected_mask_width);
+
+    const auto qsa = std::find_if(ctx->inp_qsa.begin(), ctx->inp_qsa.end(),
+            [](const llama_context::qsa_input & input) { return input.reuse_topk != nullptr; });
+    CHECK(qsa != ctx->inp_qsa.end());
+    CHECK(qsa->reuse_topk->ne[0] == (int64_t) frozen_size + expected_capacity);
+    CHECK(qsa->reuse_topk->ne[0] <= expected_mask_width);
+    CHECK(ggml_backend_buffer_is_host(qsa->reuse_topk->buffer));
+
+    int32_t actual_tail_size = 0;
+    for (const llama_kv_cell & cell : ctx->kv_self.cells) {
+        if (!cell.is_empty() && cell.has_seq_id(0) &&
+                cell.qsa_pos >= ctx->qwen4_mtp_qsa_captured_len) {
+            ++actual_tail_size;
+        }
+    }
+    CHECK(actual_tail_size == expected_tail_size);
+    CHECK(actual_tail_size <= expected_capacity);
+}
+
+static void check_qsa_reuse_padding_boundary(
+        llama_model * model,
+        bool graph_reuse) {
+    static constexpr int32_t frozen_width = 25;
+    static constexpr int32_t top_k = 24;
+    static constexpr uint32_t n_ctx = 64;
+
+    context_ptr ctx = make_context(
+            model, MTP_OP_UPDATE_ACCEPTED, nullptr, nullptr, top_k, n_ctx,
+            graph_reuse, false, false);
+    CHECK(ctx != nullptr);
+    CHECK(ctx->cparams.graph_reuse == graph_reuse);
+
+    const int32_t width = (int32_t) llama_model_mtp_feature_width(model);
+    const int32_t n_vocab = llama_n_vocab(model);
+    std::vector<float> hidden((size_t) width, 1.0f);
+    for (llama_pos pos = 0; pos < frozen_width; ++pos) {
+        seed_draft_step(ctx.get(), hidden, 3 + pos%(n_vocab - 3), pos, 0);
+    }
+
+    llama_set_mtp_op_type(ctx.get(), MTP_OP_DRAFT_GEN);
+    seed_draft_step(ctx.get(), hidden, 3 + frozen_width%(n_vocab - 3), frozen_width, 0);
+    CHECK(!ctx->qwen4_mtp_qsa_pending);
+    CHECK(ctx->qwen4_mtp_qsa_topk.size() == (size_t) frozen_width);
+    check_qsa_reuse_row(ctx.get(), 32, 7, 1);
+
+    // Position 26 establishes the settled graph. The remaining rows fit the same
+    // clipped reserve and must retain that graph when reuse is enabled.
+    seed_draft_step(ctx.get(), hidden, 3 + (frozen_width + 1)%(n_vocab - 3), frozen_width + 1, 1);
+    const auto * settled_prev = ctx->prev_mtp.get();
+    if (graph_reuse) {
+        CHECK(settled_prev != nullptr);
+    }
+    for (llama_pos pos = frozen_width + 2; pos < 32; ++pos) {
+        seed_draft_step(ctx.get(), hidden, 3 + pos%(n_vocab - 3), pos, 1);
+        if (graph_reuse) {
+            CHECK(ctx->prev_mtp.get() == settled_prev);
+        }
+    }
+    check_qsa_reuse_row(ctx.get(), 32, 7, 7);
+
+    // Crossing position 31 -> 32 grows the padded mask and restores the usual reserve.
+    seed_draft_step(ctx.get(), hidden, 3 + 32%(n_vocab - 3), 32, 1);
+    check_qsa_reuse_row(ctx.get(), 64, 8, 8);
+
+    llama_kv_cache_clear(ctx.get());
+    CHECK(ctx->qwen4_mtp_qsa_topk.empty());
+    CHECK(ctx->qwen4_mtp_qsa_valid.empty());
+    CHECK(ctx->qwen4_mtp_qsa_tail_capacity == 0);
+    CHECK(ctx->prev_mtp == nullptr);
 }
 
 #if defined(LLAMA_TEST_SPECULATIVE_BRIDGE)
@@ -239,9 +350,203 @@ static std::vector<uint8_t> save_bridge_state(
     return state;
 }
 
+static constexpr size_t MTP_STATE_V1_HEADER_SIZE = 72;
+static constexpr size_t MTP_STATE_V1_SECTION_ENTRY_SIZE = 32;
+static constexpr size_t MTP_STATE_V1_PREFIX_SIZE = 72;
+static constexpr size_t MTP_STATE_V1_DIGEST_OFFSET = 40;
+static constexpr size_t MTP_STATE_V1_DIGEST_SIZE = 32;
+static constexpr uint32_t MTP_STATE_V1_SECTION_TYPE = 2;
+static constexpr uint32_t MTP_STATE_V1_SECTION_REQUIRED = 1;
+static constexpr std::array<uint8_t, 8> MTP_STATE_V1_MAGIC = {
+    'L', 'L', 'S', 'P', 'S', 'T', 1, 0,
+};
+
+struct mtp_state_v1_view {
+    uint32_t feature_width;
+    uint32_t hidden_count;
+    size_t digest_begin;
+    size_t digest_end;
+    size_t hidden_begin;
+    size_t context_begin;
+    size_t context_end;
+};
+
+static bool checked_add_size(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs > std::numeric_limits<size_t>::max() - rhs) {
+        return false;
+    }
+    result = lhs + rhs;
+    return true;
+}
+
+static bool checked_multiply_size(size_t lhs, size_t rhs, size_t & result) {
+    if (lhs != 0 && rhs > std::numeric_limits<size_t>::max() / lhs) {
+        return false;
+    }
+    result = lhs * rhs;
+    return true;
+}
+
+static bool read_u16_le(
+        const std::vector<uint8_t> & bytes,
+        size_t offset,
+        uint16_t & result) {
+    if (offset > bytes.size() || bytes.size() - offset < sizeof(uint16_t)) {
+        return false;
+    }
+    result = (uint16_t) bytes[offset] |
+            (uint16_t) ((uint16_t) bytes[offset + 1] << 8);
+    return true;
+}
+
+static bool read_u32_le(
+        const std::vector<uint8_t> & bytes,
+        size_t offset,
+        uint32_t & result) {
+    if (offset > bytes.size() || bytes.size() - offset < sizeof(uint32_t)) {
+        return false;
+    }
+    result = (uint32_t) bytes[offset] |
+            (uint32_t) bytes[offset + 1] << 8 |
+            (uint32_t) bytes[offset + 2] << 16 |
+            (uint32_t) bytes[offset + 3] << 24;
+    return true;
+}
+
+static bool read_u64_le(
+        const std::vector<uint8_t> & bytes,
+        size_t offset,
+        uint64_t & result) {
+    if (offset > bytes.size() || bytes.size() - offset < sizeof(uint64_t)) {
+        return false;
+    }
+    result = 0;
+    for (size_t i = 0; i < sizeof(uint64_t); ++i) {
+        result |= (uint64_t) bytes[offset + i] << (8*i);
+    }
+    return true;
+}
+
+static mtp_state_v1_view parse_mtp_state_v1(
+        const std::vector<uint8_t> & bytes,
+        uint32_t expected_feature_width) {
+    CHECK(bytes.size() >= MTP_STATE_V1_HEADER_SIZE +
+            MTP_STATE_V1_SECTION_ENTRY_SIZE + MTP_STATE_V1_PREFIX_SIZE);
+    CHECK(std::equal(MTP_STATE_V1_MAGIC.begin(), MTP_STATE_V1_MAGIC.end(), bytes.begin()));
+
+    uint32_t header_size = 0;
+    uint32_t total_size = 0;
+    uint32_t container_flags = 0;
+    uint32_t section_count = 0;
+    CHECK(read_u32_le(bytes, 8, header_size));
+    CHECK(read_u32_le(bytes, 12, total_size));
+    CHECK(read_u32_le(bytes, 64, container_flags));
+    CHECK(read_u32_le(bytes, 68, section_count));
+    CHECK(header_size == MTP_STATE_V1_HEADER_SIZE);
+    CHECK(total_size == bytes.size());
+    CHECK(container_flags == 0);
+    CHECK(section_count == 1);
+
+    const size_t entry = MTP_STATE_V1_HEADER_SIZE;
+    uint32_t section_index = 0;
+    uint32_t section_type = 0;
+    uint16_t section_major = 0;
+    uint16_t section_minor = 0;
+    uint32_t section_flags = 0;
+    uint64_t section_offset_wire = 0;
+    uint64_t section_size_wire = 0;
+    CHECK(read_u32_le(bytes, entry, section_index));
+    CHECK(read_u32_le(bytes, entry + 4, section_type));
+    CHECK(read_u16_le(bytes, entry + 8, section_major));
+    CHECK(read_u16_le(bytes, entry + 10, section_minor));
+    CHECK(read_u32_le(bytes, entry + 12, section_flags));
+    CHECK(read_u64_le(bytes, entry + 16, section_offset_wire));
+    CHECK(read_u64_le(bytes, entry + 24, section_size_wire));
+    CHECK(section_index == 0);
+    CHECK(section_type == MTP_STATE_V1_SECTION_TYPE);
+    CHECK(section_major == 1 && section_minor == 0);
+    CHECK(section_flags == MTP_STATE_V1_SECTION_REQUIRED);
+    CHECK(section_offset_wire == MTP_STATE_V1_HEADER_SIZE + MTP_STATE_V1_SECTION_ENTRY_SIZE);
+    CHECK(section_offset_wire <= bytes.size());
+    CHECK(section_size_wire <= bytes.size());
+
+    const size_t section_offset = (size_t) section_offset_wire;
+    const size_t section_size = (size_t) section_size_wire;
+    size_t section_end = 0;
+    CHECK(checked_add_size(section_offset, section_size, section_end));
+    CHECK(section_end == bytes.size());
+    CHECK(section_size >= MTP_STATE_V1_PREFIX_SIZE);
+
+    const size_t payload = section_offset;
+    uint32_t feature_width = 0;
+    uint32_t warmed_heads = 0;
+    uint32_t hidden_count = 0;
+    uint32_t payload_flags = 0;
+    uint64_t context_size_wire = 0;
+    CHECK(read_u32_le(bytes, payload, feature_width));
+    CHECK(read_u32_le(bytes, payload + 4, warmed_heads));
+    CHECK(read_u32_le(bytes, payload + 8, hidden_count));
+    CHECK(read_u32_le(bytes, payload + 12, payload_flags));
+    CHECK(read_u64_le(bytes, payload + 32, context_size_wire));
+    CHECK(feature_width == expected_feature_width);
+    CHECK(warmed_heads == 1);
+    CHECK(hidden_count == feature_width);
+    CHECK(payload_flags == 1);
+    CHECK(context_size_wire > 0 && context_size_wire <= bytes.size());
+
+    size_t hidden_bytes = 0;
+    size_t expected_section_size = MTP_STATE_V1_PREFIX_SIZE;
+    CHECK(checked_multiply_size(hidden_count, sizeof(float), hidden_bytes));
+    CHECK(checked_add_size(expected_section_size, hidden_bytes, expected_section_size));
+    CHECK(checked_add_size(expected_section_size, (size_t) context_size_wire, expected_section_size));
+    CHECK(expected_section_size == section_size);
+
+    mtp_state_v1_view result = {};
+    result.feature_width = feature_width;
+    result.hidden_count = hidden_count;
+    CHECK(checked_add_size(payload, MTP_STATE_V1_DIGEST_OFFSET, result.digest_begin));
+    CHECK(checked_add_size(result.digest_begin, MTP_STATE_V1_DIGEST_SIZE, result.digest_end));
+    CHECK(checked_add_size(payload, MTP_STATE_V1_PREFIX_SIZE, result.hidden_begin));
+    CHECK(result.digest_end == result.hidden_begin);
+    CHECK(checked_add_size(result.hidden_begin, hidden_bytes, result.context_begin));
+    CHECK(checked_add_size(result.context_begin, (size_t) context_size_wire, result.context_end));
+    CHECK(result.context_end == section_end);
+    return result;
+}
+
+static float read_f32_le(
+        const std::vector<uint8_t> & bytes,
+        size_t offset,
+        uint32_t & bits) {
+    CHECK(read_u32_le(bytes, offset, bits));
+    float result = 0.0f;
+    static_assert(sizeof(result) == sizeof(bits), "F32 wire decoding requires 32-bit float");
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+static uint32_t f32_host_bits(float value) {
+    uint32_t result = 0;
+    static_assert(sizeof(result) == sizeof(value), "F32 comparison requires 32-bit float");
+    std::memcpy(&result, &value, sizeof(result));
+    return result;
+}
+
+static llama_speculative_metrics bridge_metrics(llama_speculative_session * session) {
+    llama_speculative_metrics metrics = {};
+    llama_speculative_error * error = nullptr;
+    check_speculative_status(
+        llama_speculative_session_get_metrics(session, &metrics, &error),
+        LLAMA_SPECULATIVE_OK,
+        &error);
+    return metrics;
+}
+
 static void check_mtp_bridge(
         llama_model * target_model,
-        llama_model * companion_model) {
+        llama_model * companion_model,
+        int32_t n_max) {
+    CHECK(n_max >= 1 && n_max <= 4);
     llama_speculative_model_binding binding = {};
     binding.name = "draft";
     binding.model = companion_model;
@@ -253,7 +558,9 @@ static void check_mtp_bridge(
     engine_params.target_model = target_model;
     engine_params.auxiliary_models = &binding;
     engine_params.auxiliary_model_count = 1;
-    engine_params.stage_expression = "mtp:n_max=2,p_min=0,heads=1";
+    const std::string stage_expression =
+        "mtp:n_max=" + std::to_string(n_max) + ",p_min=0,heads=1";
+    engine_params.stage_expression = stage_expression.c_str();
 
     llama_speculative_error * error = nullptr;
     llama_speculative_engine * engine = nullptr;
@@ -273,7 +580,7 @@ static void check_mtp_bridge(
     CHECK((capabilities.flags & LLAMA_SPECULATIVE_CAP_REQUIRES_TARGET_MTP_OUTPUT) != 0);
     CHECK((capabilities.flags & LLAMA_SPECULATIVE_CAP_TARGET_ONLY_WARMUP) == 0);
     CHECK(capabilities.history_requirement == LLAMA_SPECULATIVE_HISTORY_COMPLETE_PREFIX);
-    CHECK(capabilities.configured_max_draft_tokens == 2);
+    CHECK(capabilities.configured_max_draft_tokens == (uint32_t) n_max);
 
     context_ptr plain = make_plain_context(target_model);
     CHECK(plain != nullptr);
@@ -342,9 +649,9 @@ static void check_mtp_bridge(
         &error);
 
     llama_speculative_round_params round_params = {};
-    round_params.cooperative_token_allowance = 3;
-    round_params.generation_token_allowance = 3;
-    round_params.context_token_allowance = 3;
+    round_params.cooperative_token_allowance = (uint32_t) n_max + 2;
+    round_params.generation_token_allowance = (uint32_t) n_max + 2;
+    round_params.context_token_allowance = (uint32_t) n_max + 2;
     llama_speculative_round * round = nullptr;
     check_speculative_status(
         llama_speculative_round_begin(session, &round_params, &round, &call, &error),
@@ -356,6 +663,9 @@ static void check_mtp_bridge(
         LLAMA_SPECULATIVE_OK,
         &error);
     CHECK(view.proposed_draft_tokens > 0);
+    if (n_max == 4) {
+        CHECK(view.proposed_draft_tokens == 4);
+    }
     CHECK(view.committable_count > 0 && view.tokens != nullptr);
     CHECK((view.flags & LLAMA_SPECULATIVE_ROUND_USED_SPECULATION) != 0);
     check_speculative_status(
@@ -375,6 +685,7 @@ static void check_mtp_bridge(
         llama_speculative_session_generation_begin(session, &generation, &call, &error),
         LLAMA_SPECULATIVE_OK,
         &error);
+    const llama_speculative_metrics before_commit_metrics = bridge_metrics(session);
     check_speculative_status(
         llama_speculative_round_begin(session, &round_params, &round, &call, &error),
         LLAMA_SPECULATIVE_OK,
@@ -384,6 +695,11 @@ static void check_mtp_bridge(
         LLAMA_SPECULATIVE_OK,
         &error);
     CHECK(view.committable_count > 0);
+    if (n_max == 4) {
+        CHECK(view.proposed_draft_tokens == 4);
+    }
+    const std::vector<llama_token> verification_tokens(
+            view.tokens, view.tokens + view.committable_count);
     const llama_token committed_token = view.tokens[0];
     llama_speculative_round_commit_result commit = {};
     check_speculative_status(
@@ -391,6 +707,10 @@ static void check_mtp_bridge(
         LLAMA_SPECULATIVE_OK,
         &error);
     CHECK(commit.call.resulting_position == 3);
+    const llama_speculative_metrics after_commit_metrics = bridge_metrics(session);
+    // One target decode verifies the round. A base replay of the committed
+    // prefix would add another target decode call here.
+    CHECK(after_commit_metrics.target_decode_calls == before_commit_metrics.target_decode_calls + 1);
     check_speculative_status(
         llama_speculative_session_generation_end(session, &call, &error),
         LLAMA_SPECULATIVE_OK,
@@ -446,7 +766,78 @@ static void check_mtp_bridge(
     bridge_decode(replay_session, { 3, 4 }, 0);
     bridge_decode(replay_session, { committed_token }, 2);
     llama_speculative_state_info replay_info = {};
-    CHECK(save_bridge_state(replay_session, replay_info) == committed_state);
+    const std::vector<uint8_t> replay_state = save_bridge_state(replay_session, replay_info);
+    if (n_max < 4) {
+        CHECK(replay_state == committed_state);
+    } else {
+        // At five verification rows the CPU backend changes matrix kernels. To
+        // distinguish that reduction-order difference from checkpoint damage,
+        // compare each wire row bit-exactly with an independent execution of its
+        // own shape. The companion context must remain byte-identical.
+        const int64_t feature_width = llama_model_mtp_feature_width(target_model);
+        CHECK(feature_width > 0 && feature_width <= UINT32_MAX);
+        const mtp_state_v1_view committed = parse_mtp_state_v1(
+                committed_state, (uint32_t) feature_width);
+        const mtp_state_v1_view replay = parse_mtp_state_v1(
+                replay_state, (uint32_t) feature_width);
+        CHECK(committed_info.container_version == 1);
+        CHECK(replay_info.container_version == 1);
+        CHECK(committed_info.flags == LLAMA_SPECULATIVE_STATE_CAN_DRAFT);
+        CHECK(replay_info.flags == committed_info.flags);
+        CHECK(committed_info.section_count == 1 && replay_info.section_count == 1);
+        CHECK(committed_info.readiness == LLAMA_SPECULATIVE_CONDITIONING_READY);
+        CHECK(replay_info.readiness == committed_info.readiness);
+        CHECK(committed_info.sequence_start_position == replay_info.sequence_start_position);
+        CHECK(committed_info.next_position == replay_info.next_position);
+        CHECK(committed_info.canonical_state_bytes == committed_state.size());
+        CHECK(replay_info.canonical_state_bytes == replay_state.size());
+        CHECK(committed_info.derived_state_bytes == 0 && replay_info.derived_state_bytes == 0);
+        CHECK(committed.feature_width == replay.feature_width);
+        CHECK(committed.hidden_count == replay.hidden_count);
+        CHECK(committed.digest_begin == replay.digest_begin);
+        CHECK(committed.context_begin == replay.context_begin);
+        CHECK(committed.context_end == replay.context_end);
+        CHECK(std::equal(
+                replay_state.begin(), replay_state.begin() + replay.digest_begin,
+                committed_state.begin(), committed_state.begin() + committed.digest_begin));
+        CHECK(std::equal(
+                replay_state.begin() + replay.context_begin,
+                replay_state.begin() + replay.context_end,
+                committed_state.begin() + committed.context_begin,
+                committed_state.begin() + committed.context_end));
+
+        CHECK(verification_tokens.size() == 5);
+        context_ptr batched_reference = make_context(target_model, MTP_OP_NONE);
+        context_ptr scalar_reference = make_context(target_model, MTP_OP_NONE);
+        CHECK(batched_reference != nullptr && scalar_reference != nullptr);
+        decode_many(batched_reference.get(), history, 0);
+        decode_many(scalar_reference.get(), history, 0);
+        decode_many(batched_reference.get(), verification_tokens, 2);
+        decode_one(scalar_reference.get(), committed_token, 2);
+        const std::vector<float> batched_hidden = copy_embedding(
+                batched_reference.get(), (int32_t) feature_width, 0);
+        const std::vector<float> scalar_hidden = copy_embedding(
+                scalar_reference.get(), (int32_t) feature_width, 0);
+
+        size_t committed_cursor = committed.hidden_begin;
+        size_t replay_cursor = replay.hidden_begin;
+        for (uint32_t i = 0; i < committed.hidden_count; ++i) {
+            uint32_t committed_bits = 0;
+            uint32_t replay_bits = 0;
+            const float committed_value = read_f32_le(
+                    committed_state, committed_cursor, committed_bits);
+            const float replay_value = read_f32_le(
+                    replay_state, replay_cursor, replay_bits);
+            CHECK(std::isfinite(committed_value));
+            CHECK(std::isfinite(replay_value));
+            CHECK(committed_bits == f32_host_bits(batched_hidden[i]));
+            CHECK(replay_bits == f32_host_bits(scalar_hidden[i]));
+            committed_cursor += sizeof(float);
+            replay_cursor += sizeof(float);
+        }
+        CHECK(committed_cursor == committed.context_begin);
+        CHECK(replay_cursor == replay.context_begin);
+    }
     check_speculative_status(
         llama_speculative_session_quiesce_and_detach(replay_session, &call, &error),
         LLAMA_SPECULATIVE_OK,
@@ -469,8 +860,12 @@ static void check_mtp_bridge(
     CHECK(inspected.next_position == 3);
 
     std::vector<uint8_t> corrupted = committed_state;
-    CHECK(corrupted.size() > 116);
-    corrupted[116] ^= 1;
+    const int64_t corruption_feature_width = llama_model_mtp_feature_width(target_model);
+    CHECK(corruption_feature_width > 0 && corruption_feature_width <= UINT32_MAX);
+    const mtp_state_v1_view corruption_view = parse_mtp_state_v1(
+            corrupted, (uint32_t) corruption_feature_width);
+    CHECK(corruption_view.hidden_begin < corruption_view.context_begin);
+    corrupted[corruption_view.hidden_begin] ^= 1;
     inspect.state = corrupted.data();
     check_speculative_status(
         llama_speculative_engine_state_inspect(engine, &inspect, &inspected, &error),
@@ -582,6 +977,12 @@ int main(int argc, char ** argv) {
         CHECK(llama_model_n_nextn_layer(companion.get()) == 1);
         CHECK((int32_t) llama_model_mtp_feature_width(companion.get()) == width);
         CHECK(llama_n_vocab(companion.get()) == n_vocab);
+
+        context_ptr companion_checkpoint = make_context(companion.get(), MTP_OP_UPDATE_ACCEPTED);
+        CHECK(companion_checkpoint != nullptr);
+        CHECK(llama_spec_ckpt_init(
+                companion_checkpoint.get(), LLAMA_SPEC_CKPT_PER_STEP, 2) ==
+                LLAMA_SPEC_CKPT_NONE);
     }
 
 #if defined(LLAMA_TEST_SPECULATIVE_BRIDGE)
@@ -589,7 +990,9 @@ int main(int argc, char ** argv) {
         CHECK(companion != nullptr);
         model_ptr bridge_target = load_model(model_path, false);
         CHECK(bridge_target != nullptr);
-        check_mtp_bridge(bridge_target.get(), companion.get());
+        check_mtp_bridge(bridge_target.get(), companion.get(), 1);
+        check_mtp_bridge(bridge_target.get(), companion.get(), 2);
+        check_mtp_bridge(bridge_target.get(), companion.get(), 4);
         companion.reset();
         model.reset();
         llama_backend_free();
@@ -627,6 +1030,9 @@ int main(int argc, char ** argv) {
     for (const int32_t top_k : { 0, 1, 3 }) {
         CHECK(make_context(model.get(), MTP_OP_DRAFT_GEN, nullptr, nullptr, top_k) == nullptr);
     }
+
+    check_qsa_reuse_padding_boundary(model.get(), true);
+    check_qsa_reuse_padding_boundary(model.get(), false);
 
     selection_capture selection;
     context_ptr top_k_check = make_context(
@@ -702,7 +1108,9 @@ int main(int argc, char ** argv) {
     if (companion) {
         model_ptr bridge_target = load_model(model_path, false);
         CHECK(bridge_target != nullptr);
-        check_mtp_bridge(bridge_target.get(), companion.get());
+        check_mtp_bridge(bridge_target.get(), companion.get(), 1);
+        check_mtp_bridge(bridge_target.get(), companion.get(), 2);
+        check_mtp_bridge(bridge_target.get(), companion.get(), 4);
     }
 #endif
     companion.reset();
