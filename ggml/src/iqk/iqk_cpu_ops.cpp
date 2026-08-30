@@ -1123,7 +1123,12 @@ void iqk_mask_topk(struct ggml_tensor * dst, int ith, int nth) {
             auto y = (ggml_half *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
             if (i1 < topk->ne[1]) {
                 for (int j = 0; j < n; ++j) y[j] = hinf;
-                for (int j = 0; j < nidx; ++j) y[idx[j]] = hzero;
+                for (int j = 0; j < nidx; ++j) {
+                    if (idx[j] >= 0) {
+                        GGML_ASSERT(idx[j] < n);
+                        y[idx[j]] = hzero;
+                    }
+                }
                 iqk_add_f16(n, x, y);
             } else {
                 for (int j = 0; j < n; ++j) y[j] = x[j];
@@ -1133,7 +1138,12 @@ void iqk_mask_topk(struct ggml_tensor * dst, int ith, int nth) {
             auto y = (float *)((char *)dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
             if (i1 < topk->ne[1]) {
                 for (int j = 0; j < n; ++j) y[j] = -INFINITY;
-                for (int j = 0; j < nidx; ++j) y[idx[j]] = 0.0f;
+                for (int j = 0; j < nidx; ++j) {
+                    if (idx[j] >= 0) {
+                        GGML_ASSERT(idx[j] < n);
+                        y[idx[j]] = 0.0f;
+                    }
+                }
                 for (int j = 0; j < n; ++j) y[j] += x[j];
             } else {
                 for (int j = 0; j < n; ++j) y[j] = x[j];

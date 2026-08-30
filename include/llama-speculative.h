@@ -119,6 +119,9 @@ enum {
     LLAMA_SPECULATIVE_CAP_TOKEN_INPUT = UINT64_C(1) << 6,
     LLAMA_SPECULATIVE_CAP_EMBEDDING_INPUT = UINT64_C(1) << 7,
     LLAMA_SPECULATIVE_CAP_DERIVED_STATE = UINT64_C(1) << 8,
+    // Target contexts must be created with llama_context_params.mtp=true so
+    // the backend exposes the architecture's full MTP conditioning row.
+    LLAMA_SPECULATIVE_CAP_REQUIRES_TARGET_MTP_OUTPUT = UINT64_C(1) << 9,
 };
 
 typedef int32_t llama_speculative_history_requirement;

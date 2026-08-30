@@ -187,25 +187,28 @@ IQK_NOINLINE void mul_mat_Qx_Qy_MxN(int n, const char * cx, size_t bx, int ix0, 
     Qy y(info);
     Qx x(cx + ix0*bx, bx);
     QFBase::Data xv[Qx::nrc];
-    QFBase::Acc  acc[Qx::nrc*Qy::nrc];
-    auto yv = y.load1(0, 0);
-    for (int ix = 0; ix < Qx::nrc; ++ix) {
-        xv[ix] = x.load1(ix, 0);
-        acc[ix] = QFBase::acc_first(yv, xv[ix]);
-    }
-    for (int iy = 1; iy < Qy::nrc; ++iy) {
-        yv = y.load1(iy, 0);
-        for (int ix = 0; ix < Qx::nrc; ++ix) acc[Qx::nrc*iy + ix] = QFBase::acc_first(yv, xv[ix]);
-    }
-    for (int i = 1; i < nb; ++i) {
-        yv = y.load1(0, i);
+    QFBase::Data yv;
+    QFBase::Acc  acc[Qx::nrc*Qy::nrc] = {};
+    if (nb > 0) {
+        yv = y.load1(0, 0);
         for (int ix = 0; ix < Qx::nrc; ++ix) {
-            xv[ix] = x.load1(ix, i);
-            acc[ix] = QFBase::acc(acc[ix], yv, xv[ix]);
+            xv[ix] = x.load1(ix, 0);
+            acc[ix] = QFBase::acc_first(yv, xv[ix]);
         }
         for (int iy = 1; iy < Qy::nrc; ++iy) {
-            yv = y.load1(iy, i);
-            for (int ix = 0; ix < Qx::nrc; ++ix) acc[Qx::nrc*iy + ix] = QFBase::acc(acc[Qx::nrc*iy + ix], yv, xv[ix]);
+            yv = y.load1(iy, 0);
+            for (int ix = 0; ix < Qx::nrc; ++ix) acc[Qx::nrc*iy + ix] = QFBase::acc_first(yv, xv[ix]);
+        }
+        for (int i = 1; i < nb; ++i) {
+            yv = y.load1(0, i);
+            for (int ix = 0; ix < Qx::nrc; ++ix) {
+                xv[ix] = x.load1(ix, i);
+                acc[ix] = QFBase::acc(acc[ix], yv, xv[ix]);
+            }
+            for (int iy = 1; iy < Qy::nrc; ++iy) {
+                yv = y.load1(iy, i);
+                for (int ix = 0; ix < Qx::nrc; ++ix) acc[Qx::nrc*iy + ix] = QFBase::acc(acc[Qx::nrc*iy + ix], yv, xv[ix]);
+            }
         }
     }
     for (int i = (QFBase::k_step/4)*nb; i < nb4; ++i) {

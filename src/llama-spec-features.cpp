@@ -17,6 +17,10 @@ uint32_t llama_mtp_state_n_embd(const struct llama_context * ctx) {
     return llama_model_mtp_feature_width(&ctx->model);
 }
 
+bool llama_mtp_state_enabled(const struct llama_context * ctx) {
+    return ctx != nullptr && ctx->cparams.mtp;
+}
+
 uint32_t llama_model_mtp_feature_width(const struct llama_model * model) {
     if (model == nullptr) {
         return 0;
@@ -29,6 +33,9 @@ uint32_t llama_model_mtp_feature_width(const struct llama_model * model) {
     }
     if (model->arch == LLM_ARCH_DEEPSEEK4 && hparams.n_embd_out > hparams.n_embd) {
         return hparams.n_embd_out;
+    }
+    if (model->arch == LLM_ARCH_QWEN4EXP && hparams.dsv4_hc_mult > 0) {
+        return hparams.dsv4_hc_mult * hparams.n_embd;
     }
     return hparams.n_embd;
 }

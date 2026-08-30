@@ -52,6 +52,15 @@ struct llama_kv_cell {
     llama_pos pos   = -1;
     llama_pos delta = 0;
     int32_t   src   = 0; // used by recurrent state models to copy states
+    llama_token token = LLAMA_TOKEN_NULL;
+
+    // Qwen4Exp QSA groups the logical token axis, which is independent of the
+    // temporal M-RoPE coordinate for image tokens.  Preserve both that stable
+    // ordinal and the remaining M-RoPE planes alongside the ordinary position.
+    llama_pos qsa_pos = -1;
+    llama_pos pos_h   = 0;
+    llama_pos pos_w   = 0;
+    llama_pos pos_e   = 0;
 
     std::set<llama_seq_id> seq_id;
 
@@ -79,6 +88,8 @@ struct llama_kv_cache {
     bool recurrent = false; // with recurrent state models, a cell can hold the state for more than one past token
     bool hybrid    = false;
     bool v_trans   = true;  // the value tensor is transposed
+    bool mrope     = false;
+    bool qsa       = false;
 
     // openPangu s_l holds position-strict MoME conv state, not per-sequence recurrent slots: qnext
     // seq ops and generic serialization skip it, the openPangu state layouts carry it instead.
@@ -101,6 +112,18 @@ struct llama_kv_cache {
 
     bool is_compacted(int il) const {
         return !row_count.empty() && row_count[il] < size;
+    }
+
+    int32_t remap_cell_id_after_defrag(const std::vector<uint32_t> & ids, uint32_t old_id) const {
+        if (old_id >= ids.size()) {
+            return -1;
+        }
+        if (ids[old_id] < ids.size()) {
+            return (int32_t) ids[old_id];
+        }
+        // A partial defrag leaves an unmoved live cell at its original index with the
+        // sentinel ID. Moved sources have already been cleared and are no longer valid.
+        return old_id < cells.size() && !cells[old_id].is_empty() ? (int32_t) old_id : -1;
     }
 
     // rows [sinks|window]; row(pos) = sink_rows + pos - pos_base_swa
@@ -677,27 +700,33 @@ struct llama_context {
     // so the graph only gathers, pools and scores. One entry per distinct compress ratio.
     struct qsa_input {
         int32_t ratio    = 0;
-        struct ggml_tensor * cell_blk  = nullptr; // I32 [n_kv]           block each cell belongs to
-        struct ggml_tensor * bias      = nullptr; // F32 [n_kv, n_tokens] causal mask plus the tail boost
+        int32_t n_kv     = 0;
+        struct ggml_tensor * bias      = nullptr; // F32 [n_blocks, n_tokens] 0 for a complete visible block, -inf otherwise
         // only the blocks this ubatch writes into are pooled again; the rest are read from kp_l
         struct ggml_tensor * win_blocks = nullptr; // I32 [n_win]         which block each entry rebuilds
         struct ggml_tensor * win_cells  = nullptr; // I32 [ratio*n_win]   member cells of those blocks
-        struct ggml_tensor * win_pos    = nullptr; // I32 [4*n_win]       mrope position of those blocks
+        struct ggml_tensor * win_pos    = nullptr; // I32 [4*n_win]       cached M-RoPE position of each block's first token
         struct ggml_tensor * head_w     = nullptr; // F32 [n_idx_h, n_tokens] all ones; the head sum is unweighted
+        struct ggml_tensor * block_cells= nullptr; // I32 [ratio,n_blocks] physical cells for selected block ids
+        struct ggml_tensor * tail_cells = nullptr; // I32 [ratio-1,n_tokens] exact incomplete causal tail, -1-padded
+        struct ggml_tensor * reuse_topk = nullptr; // I32 [frozen+draft_tail,n_tokens], -1-padded
     };
     std::vector<qsa_input> inp_qsa;
+
+    // Qwen3.8 MTP freezes the step-0 QSA selection for later draft iterations. The graph
+    // produces physical cell indices; validity is snapshotted before the next draft token
+    // can occupy a formerly empty cache cell, then applied after the async readback retires.
+    std::vector<int32_t> qwen4_mtp_qsa_topk;
+    std::vector<uint8_t> qwen4_mtp_qsa_valid;
+    llama_pos qwen4_mtp_qsa_captured_len = -1;
+    llama_seq_id qwen4_mtp_qsa_seq = -1;
+    int32_t qwen4_mtp_qsa_tail_capacity = 0;
+    bool qwen4_mtp_qsa_pending = false;
 
     // the pooled block keys no longer match the raw indexer keys and the next built graph must
     // pool every block; set on state restore and defrag, cleared by that graph's host fill
     bool qsa_pooled_stale = false;
-
-    // each sequence's recent tokens, read by the n-gram hash when a ubatch does not carry its
-    // first tokens' predecessors; trusted only while contiguous with the incoming position
-    struct ple_history {
-        llama_pos next_pos = -1;
-        std::vector<llama_token> toks;
-    };
-    std::map<llama_seq_id, ple_history> ple_hist;
+    llama_seq_id qsa_pooled_seq = -1;
 
     struct swa_window_view_state {
         bool active       = false;

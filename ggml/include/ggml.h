@@ -2472,6 +2472,7 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 c);
 
+    // Each top-k entry is either a valid index in mask dim 0 or -1 for padding.
     GGML_API struct ggml_tensor * ggml_indexer_mask(
             struct ggml_context * ctx,
             struct ggml_tensor  * mask,

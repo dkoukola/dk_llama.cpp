@@ -219,35 +219,15 @@ static void llama_tensor_dequantize_internal(
     workers.clear();
 }
 
-static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
-    bool convert_incompatible_tensor = false;
-    if (new_type == GGML_TYPE_Q2_K    || new_type == GGML_TYPE_Q3_K    || new_type == GGML_TYPE_Q4_K   ||
-        new_type == GGML_TYPE_Q5_K    || new_type == GGML_TYPE_Q6_K    || new_type == GGML_TYPE_IQ4_XS ||
-        new_type == GGML_TYPE_IQ2_XS  || new_type == GGML_TYPE_IQ2_XXS || new_type == GGML_TYPE_IQ2_S  ||
-        new_type == GGML_TYPE_IQ3_XXS || new_type == GGML_TYPE_IQ1_S   || new_type == GGML_TYPE_IQ3_S  ||
-        new_type == GGML_TYPE_IQ1_M   || new_type == GGML_TYPE_IQ4_K   || new_type == GGML_TYPE_IQ2_K  ||
-        new_type == GGML_TYPE_IQ5_K   || new_type == GGML_TYPE_IQ3_K   || new_type == GGML_TYPE_Q4_K_R4 ||
-        new_type == GGML_TYPE_IQ6_K   || new_type == GGML_TYPE_IQ4_KS  || new_type == GGML_TYPE_IQ4_XS_R8 ||
-        new_type == GGML_TYPE_IQ2_KS  || new_type == GGML_TYPE_IQ4_KSS || new_type == GGML_TYPE_Q6_K_R4 ||
-        new_type == GGML_TYPE_Q5_K_R4 || new_type == GGML_TYPE_Q3_K_R4 || new_type == GGML_TYPE_Q2_K_R4 ||
-        new_type == GGML_TYPE_IQ4_K_R4|| new_type == GGML_TYPE_Q8_K_R8 || new_type == GGML_TYPE_IQ3_K_R4||
-        new_type == GGML_TYPE_IQ2_K_R4|| new_type == GGML_TYPE_IQ5_K_R4|| new_type == GGML_TYPE_IQ4_KS_R4 ||
-        new_type == GGML_TYPE_IQ3_XXS_R4 || new_type == GGML_TYPE_IQ2_XXS_R4 || new_type == GGML_TYPE_IQ2_XS_R4 ||
-        new_type == GGML_TYPE_IQ2_S_R4|| new_type == GGML_TYPE_IQ3_S_R4|| new_type == GGML_TYPE_IQ3_KS ||
-        new_type == GGML_TYPE_IQ2_KT  || new_type == GGML_TYPE_IQ3_KT  || new_type == GGML_TYPE_IQ4_KT ||
-        new_type == GGML_TYPE_IQ5_KS || new_type == GGML_TYPE_IQ5_KS_R4|| new_type == GGML_TYPE_IQ2_KL ||
-        new_type == GGML_TYPE_IQ1_KT) {
-        if (nx % QK_K != 0) {
-            LLAMA_LOG_WARN("\n\n%s : tensor cols %d x %d are not divisible by %d, required for %s", __func__, nx, ny, QK_K, ggml_type_name(new_type));
-            convert_incompatible_tensor = true;
-        }
-    }
-    if (new_type == GGML_TYPE_IQ1_BN || new_type == GGML_TYPE_IQ2_BN || new_type == GGML_TYPE_IQ2_BN_R4) {
-        if (nx % QK_IQ1BN != 0) {
-            convert_incompatible_tensor = true;
-        }
-    }
-    if (convert_incompatible_tensor) {
+static ggml_type change_type_if_necessary(ggml_type new_type, const ggml_tensor * tensor) {
+    const int64_t ncols      = tensor->ne[0];
+    const int64_t block_size = ggml_blck_size(new_type);
+
+    if (ncols % block_size != 0) {
+        LLAMA_LOG_WARN(
+                "warning: %-36s - ncols %6" PRId64 " not divisible by %3" PRId64 " (required for type %7s) ",
+                tensor->name, ncols, block_size, ggml_type_name(new_type));
+
         switch (new_type) {
             case GGML_TYPE_IQ2_XXS:
             case GGML_TYPE_IQ2_XXS_R4:
@@ -295,10 +275,21 @@ static ggml_type change_type_if_necessary(ggml_type new_type, int nx, int ny) {
             case GGML_TYPE_Q6_K_R4:
             case GGML_TYPE_Q8_K_R8:
             case GGML_TYPE_Q6_K:   new_type = GGML_TYPE_Q8_0;   break;
-            default: throw std::runtime_error("\nUnsupported tensor size encountered\n");
+            default:
+                if (block_size > 32) {
+                    throw std::runtime_error(format(
+                            "no tensor type fallback is defined for type %s", ggml_type_name(new_type)));
+                }
+                break;
         }
-        LLAMA_LOG_WARN(" - using fallback quantization %s\n", ggml_type_name(new_type));
+
+        if (ncols % ggml_blck_size(new_type) != 0) {
+            LLAMA_LOG_WARN("(WARNING: must use F16 due to unusual shape) ");
+            new_type = GGML_TYPE_F16;
+        }
+        LLAMA_LOG_WARN("-> falling back to %7s\n", ggml_type_name(new_type));
     }
+
     return new_type;
 }
 
@@ -839,7 +830,7 @@ static ggml_type llama_tensor_get_type(quantize_state_internal & qs, ggml_type n
         LLAMA_LOG_INFO("Using custom type %s for tensor %s\n", ggml_type_name(new_type), name.c_str());
     }
 
-    auto working_type = change_type_if_necessary(new_type, tensor->ne[0], tensor->ne[1]);
+    auto working_type = change_type_if_necessary(new_type, tensor);
     if (working_type != new_type) {
         ++qs.n_fallback;
         new_type = working_type;
@@ -1549,7 +1540,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
             // get more optimal quantization type based on the tensor shape, layer, etc.
             if (params->pure) {
-                auto working_type = change_type_if_necessary(new_type, tensor->ne[0], tensor->ne[1]);
+                auto working_type = change_type_if_necessary(new_type, tensor);
                 if (working_type != new_type) {
                     ++qs.n_fallback;
                     new_type = working_type;

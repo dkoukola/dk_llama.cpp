@@ -341,7 +341,9 @@ ggml_cgraph * llm_build_context::build_s_copy() {
         }
 
         if (kv_self.s_l.size() > (size_t) il && kv_self.s_l[il] != nullptr) {
-            struct ggml_tensor * qnext_states_all = ggml_reshape_2d(ctx0, kv_self.s_l[il], hparams.n_embd_v_s(), kv_self.s_l[il]->ne[1]);
+            // A Qwen4Exp PLE layer appends convolution history to the DeltaNet state row.
+            // Copy the complete packed row instead of reshaping it to the DeltaNet-only width.
+            struct ggml_tensor * qnext_states_all = kv_self.s_l[il];
             GGML_ASSERT((uint32_t) qnext_states_all->ne[1] == qnext_state_slots);
             struct ggml_tensor * qnext_state_copy = ggml_view_1d(ctx0, state_copy, qnext_state_slots, 0);
             struct ggml_tensor * qnext_states = ggml_get_rows(ctx0, qnext_states_all, qnext_state_copy);
@@ -3061,8 +3063,8 @@ ggml_cgraph * llm_build_context::llama_build_graph(
     result->n_batch = llm.n_tokens;
 
     // add on pooling layer
-    if (lctx.cparams.mtp_op_type == MTP_OP_NONE && (lctx.cparams.embeddings ||
-        (lctx.model.hparams.nextn_predict_layers > 0 || lctx.model.mtp))) {
+    if (lctx.cparams.mtp_op_type == MTP_OP_NONE &&
+            (lctx.cparams.embeddings || lctx.cparams.mtp)) {
         result = llm.append_pooling(result);
     }
 

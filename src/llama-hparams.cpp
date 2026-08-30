@@ -683,6 +683,14 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
+                ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                if (hparams.nextn_predict_layers > hparams.n_layer) {
+                    throw std::runtime_error("qwen4exp: NextN layer count exceeds the total block count");
+                }
+                hparams.n_layer_kv_from_start = model.mtp
+                    ? hparams.n_layer
+                    : hparams.n_layer - hparams.nextn_predict_layers;
+
                 ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
 
                 ml.get_key(LLM_KV_SSM_CONV_KERNEL,    hparams.ssm_d_conv);
@@ -701,8 +709,15 @@ void llm_load_hparams(
                 {
                     uint32_t full_attn_interval = 4;
                     ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+                    if (full_attn_interval == 0) {
+                        throw std::runtime_error("qwen4exp: full-attention interval must be positive");
+                    }
                     for (uint32_t i = 0; i < hparams.n_layer; ++i) {
                         hparams.recurrent_layer_arr[i] = ((i + 1) % full_attn_interval != 0);
+                    }
+                    for (uint32_t i = hparams.n_layer - hparams.nextn_predict_layers;
+                            i < hparams.n_layer; ++i) {
+                        hparams.recurrent_layer_arr[i] = false;
                     }
                 }
 
@@ -734,6 +749,10 @@ void llm_load_hparams(
                         ml.get_key(LLM_KV_PLE_EOS_TOKEN_ID,    hparams.ple_eos_token_id, false);
                         ml.get_key(LLM_KV_PLE_IMAGE_TOKEN_ID,  hparams.ple_image_token_id, false);
 
+                        if (hparams.ple_ngram_size < 2 || hparams.ple_heads_per_ngram == 0 ||
+                                hparams.ple_conv_kernel == 0 || hparams.ple_head_dim == 0) {
+                            throw std::runtime_error("qwen4exp: PLE geometry must have a usable n-gram, head, convolution, and embedding size");
+                        }
                         hparams.ple_n_heads = (hparams.ple_ngram_size - 1) * hparams.ple_heads_per_ngram;
                         if (hparams.ple_n_heads > LLAMA_MAX_PLE_HEADS || hparams.ple_ngram_size > LLAMA_MAX_PLE_NGRAM) {
                             throw std::runtime_error("qwen4exp: PLE geometry exceeds the supported bounds");
@@ -761,7 +780,7 @@ void llm_load_hparams(
                     }
                 }
 
-                switch (hparams.n_layer) {
+                switch (hparams.n_layer - hparams.nextn_predict_layers) {
                     case 48: model.type = e_model::MODEL_125B_A6B; break;
                     default: model.type = e_model::MODEL_UNKNOWN;
                 }

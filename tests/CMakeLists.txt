@@ -232,6 +232,7 @@ llama_build_and_test(test-speculative-config.cpp)
 target_include_directories(test-speculative-config PRIVATE ${PROJECT_SOURCE_DIR}/src)
 llama_build_and_test(test-iq4-ks-kt-decode.cpp)
 target_include_directories(test-iq4-ks-kt-decode PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+llama_build_and_test(test-quantize-shape-fallback.cpp)
 
 # llama_target_and_test(test-opt.cpp) # SLOW
 
@@ -256,6 +257,22 @@ target_include_directories(test-swa-state PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-swa-state PRIVATE llama)
 add_test(NAME test-swa-state COMMAND test-swa-state)
 set_property(TEST test-swa-state PROPERTY LABELS model)
+
+add_executable(test-qwen4exp-state test-qwen4exp-state.cpp)
+target_include_directories(test-qwen4exp-state PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-qwen4exp-state PRIVATE llama)
+add_test(NAME test-qwen4exp-state COMMAND test-qwen4exp-state)
+set_property(TEST test-qwen4exp-state PROPERTY LABELS model)
+
+add_executable(test-qwen4exp-mtp test-qwen4exp-mtp.cpp)
+target_include_directories(test-qwen4exp-mtp PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-qwen4exp-mtp PRIVATE llama)
+if (TARGET llama::speculative)
+    target_link_libraries(test-qwen4exp-mtp PRIVATE llama::speculative)
+    target_compile_definitions(test-qwen4exp-mtp PRIVATE LLAMA_TEST_SPECULATIVE_BRIDGE)
+endif()
+add_test(NAME test-qwen4exp-mtp COMMAND test-qwen4exp-mtp)
+set_property(TEST test-qwen4exp-mtp PROPERTY LABELS model)
 
 if (TARGET llama::speculative)
     add_executable(test-speculative-api test-speculative-api.c)

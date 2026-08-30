@@ -264,7 +264,11 @@ static __global__ void k_indexer_mask(int ne0, int ne1, int ne2, int ntopk, int 
     if (i1 < ne11) {
         for (int j = threadIdx.x; j < ne0;   j += blockDim.x) d[j] = inf;
         __syncthreads();
-        for (int j = threadIdx.x; j < ntopk; j += blockDim.x) d[i[j]] = zero;
+        for (int j = threadIdx.x; j < ntopk; j += blockDim.x) {
+            if (i[j] >= 0) {
+                d[i[j]] = zero;
+            }
+        }
         __syncthreads();
         for (int j = threadIdx.x; j < ne0;   j += blockDim.x) d[j] += m[j];
     } else {

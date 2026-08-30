@@ -161,6 +161,7 @@ class TensorNameMap:
             "encoder.layers.{bid}.self_attention.query_key_value",                 # chatglm
             "transformer.layers.{bid}.attn.qkv_proj",                              # openelm
             "layers.{bid}.attention.wqkv",
+            "model.layers.{bid}.linear_attn.in_proj_qkv",                          # qwen4exp
         ),
 
         # Attention query
@@ -239,6 +240,7 @@ class TensorNameMap:
 
         MODEL_TENSOR.ATTN_GATE: (
             "model.layers.{bid}.self_attn.g_proj",              # laguna
+            "model.layers.{bid}.linear_attn.in_proj_z",         # qwen4exp
         ),
 
         # Rotary embeddings
@@ -512,6 +514,7 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_CONV1D: (
             "model.layers.{bid}.conv1d",
             "backbone.layers.{bid}.mixer.conv1d",
+            "model.layers.{bid}.linear_attn.conv1d",            # qwen4exp
         ),
 
         MODEL_TENSOR.SSM_X: (
@@ -522,11 +525,13 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_DT: (
             "model.layers.{bid}.dt_proj",
             "backbone.layers.{bid}.mixer.dt_proj",
+            "model.layers.{bid}.linear_attn.dt_proj",           # qwen4exp
         ),
 
         MODEL_TENSOR.SSM_A: (
             "model.layers.{bid}.A_log",
             "backbone.layers.{bid}.mixer.A_log",
+            "model.layers.{bid}.linear_attn.A_log",             # qwen4exp
         ),
 
         MODEL_TENSOR.SSM_D: (
@@ -537,6 +542,19 @@ class TensorNameMap:
         MODEL_TENSOR.SSM_OUT: (
             "model.layers.{bid}.out_proj",
             "backbone.layers.{bid}.mixer.out_proj",
+            "model.layers.{bid}.linear_attn.out_proj",          # qwen4exp
+        ),
+
+        MODEL_TENSOR.SSM_NORM: (
+            "model.layers.{bid}.linear_attn.norm",              # qwen4exp
+        ),
+
+        MODEL_TENSOR.SSM_ALPHA: (
+            "model.layers.{bid}.linear_attn.in_proj_a",         # qwen4exp
+        ),
+
+        MODEL_TENSOR.SSM_BETA: (
+            "model.layers.{bid}.linear_attn.in_proj_b",         # qwen4exp
         ),
 
         MODEL_TENSOR.ATTN_Q_A: (
@@ -747,6 +765,65 @@ class TensorNameMap:
             ),
             MODEL_TENSOR.FFN_NORM_EXP: (
                 "model.layers.{bid}.post_attention_layernorm",
+            ),
+        },
+        MODEL_ARCH.QWEN4EXP: {
+            MODEL_TENSOR.HC_ATTN_NORM: (
+                "model.layers.{bid}.attn_hyper_connection.hc_norm",
+            ),
+            MODEL_TENSOR.HC_ATTN_DOWN: (
+                "model.layers.{bid}.attn_hyper_connection.input_mix_weight_down",
+            ),
+            MODEL_TENSOR.HC_ATTN_UP: (
+                "model.layers.{bid}.attn_hyper_connection.input_mix_weight_up",
+            ),
+            MODEL_TENSOR.HC_ATTN_INJECT: (
+                "model.layers.{bid}.attn_hyper_connection.block_inject_weight",
+            ),
+            MODEL_TENSOR.HC_FFN_NORM: (
+                "model.layers.{bid}.mlp_hyper_connection.hc_norm",
+            ),
+            MODEL_TENSOR.HC_FFN_DOWN: (
+                "model.layers.{bid}.mlp_hyper_connection.input_mix_weight_down",
+            ),
+            MODEL_TENSOR.HC_FFN_UP: (
+                "model.layers.{bid}.mlp_hyper_connection.input_mix_weight_up",
+            ),
+            MODEL_TENSOR.HC_FFN_INJECT: (
+                "model.layers.{bid}.mlp_hyper_connection.block_inject_weight",
+            ),
+            MODEL_TENSOR.HC_HEAD_NORM: (
+                "model.hyper_connection_mixer.hc_norm",
+            ),
+            MODEL_TENSOR.HC_HEAD_DOWN: (
+                "model.hyper_connection_mixer.input_mix_weight_down",
+            ),
+            MODEL_TENSOR.HC_HEAD_UP: (
+                "model.hyper_connection_mixer.input_mix_weight_up",
+            ),
+            MODEL_TENSOR.INDEXER_Q_NORM: (
+                "model.layers.{bid}.self_attn.indexer.q_layernorm",
+            ),
+            MODEL_TENSOR.INDEXER_K_NORM_QWEN4: (
+                "model.layers.{bid}.self_attn.indexer.k_layernorm",
+            ),
+            MODEL_TENSOR.PLE_KEY: (
+                "model.layers.{bid}.ple.key_proj",
+            ),
+            MODEL_TENSOR.PLE_VALUE: (
+                "model.layers.{bid}.ple.value_proj",
+            ),
+            MODEL_TENSOR.PLE_NORM_KEY: (
+                "model.layers.{bid}.ple.norm_key",
+            ),
+            MODEL_TENSOR.PLE_NORM_QUERY: (
+                "model.layers.{bid}.ple.norm_query",
+            ),
+            MODEL_TENSOR.PLE_NORM_CONV: (
+                "model.layers.{bid}.ple.norm_conv",
+            ),
+            MODEL_TENSOR.PLE_CONV1D: (
+                "model.layers.{bid}.ple.conv1d",
             ),
         },
         # openPangu-2.0: disambiguate the sandwich norms (post_attention/pre_mlp/post_mlp)

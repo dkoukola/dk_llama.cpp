@@ -340,6 +340,57 @@ bool common_speculative_dflash_state_import(
         common_speculative * spec,
         const common_speculative_dflash_state_data & data);
 
+struct common_speculative_mtp_state_view {
+    const float * target_hidden = nullptr;
+    size_t target_hidden_count = 0;
+    int32_t warmed_heads = 0;
+};
+
+enum common_speculative_mtp_state_import_status {
+    COMMON_SPECULATIVE_MTP_STATE_IMPORT_OK,
+    COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED,
+    COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_CLEARED,
+};
+
+// The returned hidden-state pointer is borrowed and remains valid only until
+// the next mutable operation on spec.
+bool common_speculative_mtp_state_get_view(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        common_speculative_mtp_state_view & view);
+
+// Restores both the companion sequence state and its matching target hidden
+// row. The implementation rolls the companion context back on import failure.
+common_speculative_mtp_state_import_status common_speculative_mtp_state_import(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const float * target_hidden,
+        size_t target_hidden_count,
+        int32_t warmed_heads,
+        const uint8_t * context_state,
+        size_t context_state_size);
+
+bool common_speculative_mtp_state_reset(
+        common_speculative * spec,
+        llama_seq_id seq_id);
+
+bool common_speculative_mtp_discard_draft_tail(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        llama_pos pos_begin);
+
+// Commits target tokens T[p..p+n) using the target hidden rows H[p..p+n).
+// The predictor consumes T[p] with H[p-1], so a correctly conditioned row at
+// p may be retained from drafting; later rows are reconstructed with the
+// preceding target hidden row. The final H row becomes the next draft input.
+bool common_speculative_mtp_commit_prefix(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        llama_pos pos_base,
+        const std::vector<llama_token> & committed_tokens,
+        const std::vector<float> & target_hidden_rows,
+        bool boundary_row_retained);
+
 common_speculative_metrics_snapshot common_speculative_get_metrics_snapshot(const common_speculative * spec);
 
 // Context shift for MTP to match how server handle main model

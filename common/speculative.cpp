@@ -200,7 +200,8 @@ static bool common_speculative_are_compatible(
 
 static bool common_speculative_target_has_appended_mtp_contract(const llama_model * model) {
     return llama_model_is_step35(model) || llama_model_is_deepseek4(model) ||
-           llama_model_is_qwen35_family(model);
+           llama_model_is_qwen35_family(model) ||
+           (model != nullptr && std::strcmp(llama_model_arch_string(model), "qwen4exp") == 0);
 }
 
 static bool common_speculative_has_recognized_mtp_companion(
@@ -2439,6 +2440,17 @@ bool common_speculative_finalize_startup(
                             __func__, n_heads);
                     return false;
                 }
+            } else if (std::strcmp(llama_model_arch_string(model), "qwen4exp") == 0) {
+                if (std::strcmp(llama_model_arch_string(companion), "qwen4exp") != 0) {
+                    LOG_ERR("%s: Qwen3.8 MTP requires a qwen4exp companion\n", __func__);
+                    return false;
+                }
+                const int32_t n_heads = llama_model_n_nextn_layer(companion);
+                if (n_heads != 1) {
+                    LOG_ERR("%s: Qwen3.8 MTP companion requires exactly one predictor layer, got %d\n",
+                            __func__, n_heads);
+                    return false;
+                }
             }
 
             if (common_speculative_has_recognized_mtp_companion(model, companion)) {
@@ -3278,14 +3290,16 @@ static bool mtp_model_uses_recurrent_conditioning(const common_speculative_state
     if (state.ctx_mtp == nullptr) {
         return false;
     }
-    return true;
 
     const llama_model * model = llama_get_model(state.ctx_mtp);
+    const std::string arch{llama_model_arch_string(model)};
+    if (arch == "qwen4exp") {
+        return true;
+    }
     if (!llama_model_has_recurrent(model)) {
         return false;
     }
 
-    std::string arch{llama_model_arch_string(model)};
     return arch == "qwen35" || arch == "qwen35moe";
 }
 
@@ -3393,6 +3407,215 @@ llama_context * common_speculative_get_companion_ctx(common_speculative * spec) 
     }
 
     return nullptr;
+}
+
+bool common_speculative_mtp_state_get_view(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        common_speculative_mtp_state_view & view) {
+    view = {};
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr || state->ctx_mtp == nullptr || state->n_embd <= 0) {
+        return false;
+    }
+
+    const auto hidden = state->target_hidden_by_seq.find(seq_id);
+    if (hidden != state->target_hidden_by_seq.end()) {
+        view.target_hidden = hidden->second.empty() ? nullptr : hidden->second.data();
+        view.target_hidden_count = hidden->second.size();
+    }
+    view.warmed_heads = state->mtp_warmed_heads;
+    return view.target_hidden_count == 0 || view.target_hidden_count == (size_t) state->n_embd;
+}
+
+common_speculative_mtp_state_import_status common_speculative_mtp_state_import(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        const float * target_hidden,
+        size_t target_hidden_count,
+        int32_t warmed_heads,
+        const uint8_t * context_state,
+        size_t context_state_size) {
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr || state->ctx_mtp == nullptr || state->n_embd <= 0 ||
+            (target_hidden_count != 0 &&
+             (target_hidden_count != (size_t) state->n_embd || target_hidden == nullptr)) ||
+            warmed_heads < 0 || warmed_heads > state->n_heads_model ||
+            context_state == nullptr || context_state_size == 0 ||
+            (target_hidden_count != 0 && !std::all_of(
+                target_hidden, target_hidden + target_hidden_count,
+                [](float value) { return std::isfinite(value); }))) {
+        return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED;
+    }
+
+    try {
+        std::vector<float> prepared_hidden;
+        if (target_hidden_count != 0) {
+            prepared_hidden.assign(target_hidden, target_hidden + target_hidden_count);
+        }
+
+        const size_t backup_size = llama_state_seq_get_size(state->ctx_mtp, seq_id, 0);
+        if (backup_size == 0 || backup_size == SIZE_MAX) {
+            return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED;
+        }
+        std::vector<uint8_t> backup(backup_size);
+        if (llama_state_seq_get_data(state->ctx_mtp, backup.data(), backup.size(), seq_id, 0) != backup.size()) {
+            return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED;
+        }
+
+        std::vector<float> * stored_hidden = nullptr;
+        bool inserted_hidden = false;
+        if (target_hidden_count != 0) {
+            const auto inserted = state->target_hidden_by_seq.try_emplace(seq_id);
+            stored_hidden = &inserted.first->second;
+            inserted_hidden = inserted.second;
+        }
+
+        const size_t restored = llama_state_seq_set_data(
+            state->ctx_mtp, context_state, context_state_size, seq_id, 0);
+        if (restored != context_state_size) {
+            llama_kv_cache_seq_rm(state->ctx_mtp, seq_id, -1, -1);
+            const size_t rolled_back = llama_state_seq_set_data(
+                state->ctx_mtp, backup.data(), backup.size(), seq_id, 0);
+            if (rolled_back != backup.size()) {
+                llama_kv_cache_seq_rm(state->ctx_mtp, seq_id, -1, -1);
+                mtp_clear_target_hidden(*state, seq_id);
+                state->mtp_warmed_heads = 0;
+                return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_CLEARED;
+            }
+            if (inserted_hidden) {
+                state->target_hidden_by_seq.erase(seq_id);
+            }
+            return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED;
+        }
+
+        if (stored_hidden != nullptr) {
+            stored_hidden->swap(prepared_hidden);
+        } else {
+            state->target_hidden_by_seq.erase(seq_id);
+        }
+        state->draft_cache_by_seq.erase(seq_id);
+        state->mtp_warmed_heads = warmed_heads;
+        return COMMON_SPECULATIVE_MTP_STATE_IMPORT_OK;
+    } catch (const std::exception &) {
+        return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED;
+    } catch (...) {
+        return COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_UNCHANGED;
+    }
+}
+
+bool common_speculative_mtp_state_reset(
+        common_speculative * spec,
+        llama_seq_id seq_id) {
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr || state->ctx_mtp == nullptr) {
+        return false;
+    }
+
+    const bool removed = llama_kv_cache_seq_rm(state->ctx_mtp, seq_id, -1, -1);
+    mtp_clear_target_hidden(*state, seq_id);
+    state->mtp_warmed_heads = 0;
+    return removed;
+}
+
+bool common_speculative_mtp_discard_draft_tail(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        llama_pos pos_begin) {
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr || state->ctx_mtp == nullptr || pos_begin < 0) {
+        return false;
+    }
+
+    const bool removed = llama_kv_cache_seq_rm(state->ctx_mtp, seq_id, pos_begin, -1);
+    mtp_invalidate_cached_draft(*state, seq_id);
+    return removed;
+}
+
+bool common_speculative_mtp_commit_prefix(
+        common_speculative * spec,
+        llama_seq_id seq_id,
+        llama_pos pos_base,
+        const std::vector<llama_token> & committed_tokens,
+        const std::vector<float> & target_hidden_rows,
+        bool boundary_row_retained) {
+    auto * state = common_speculative_get_mtp_state(spec);
+    if (state == nullptr || state->ctx_mtp == nullptr || state->n_embd <= 0) {
+        return false;
+    }
+    const auto previous_hidden = state->target_hidden_by_seq.find(seq_id);
+    if (committed_tokens.empty() || pos_base < 0 ||
+            committed_tokens.size() > (size_t) std::numeric_limits<int32_t>::max() ||
+            committed_tokens.size() > std::numeric_limits<size_t>::max() / (size_t) state->n_embd ||
+            target_hidden_rows.size() != committed_tokens.size() * (size_t) state->n_embd ||
+            previous_hidden == state->target_hidden_by_seq.end() ||
+            previous_hidden->second.size() != (size_t) state->n_embd ||
+            committed_tokens.size() - 1 >
+                (size_t) (std::numeric_limits<llama_pos>::max() - pos_base)) {
+        return false;
+    }
+
+    const llama_pos expected_pos_max = boundary_row_retained ? pos_base : pos_base - 1;
+    if (llama_kv_cache_seq_pos_max(state->ctx_mtp, seq_id) != expected_pos_max) {
+        return false;
+    }
+
+    const size_t token_offset = boundary_row_retained ? 1 : 0;
+    const size_t decode_count = committed_tokens.size() - token_offset;
+    std::vector<float> conditioned_hidden;
+    if (decode_count != 0) {
+        conditioned_hidden.resize(decode_count * (size_t) state->n_embd);
+        if (!boundary_row_retained) {
+            std::copy(previous_hidden->second.begin(), previous_hidden->second.end(), conditioned_hidden.begin());
+        }
+        if (committed_tokens.size() > 1) {
+            const size_t copied_rows = committed_tokens.size() - 1;
+            std::copy_n(
+                target_hidden_rows.begin(),
+                copied_rows * (size_t) state->n_embd,
+                conditioned_hidden.begin() + (boundary_row_retained ? 0 : state->n_embd));
+        }
+
+        struct batch_owner {
+            llama_batch value;
+
+            ~batch_owner() {
+                llama_batch_free(value);
+            }
+        } accepted = { llama_batch_init((int32_t) decode_count, 0, 1) };
+        llama_batch & batch = accepted.value;
+        if (batch.token == nullptr || batch.pos == nullptr || batch.n_seq_id == nullptr ||
+                batch.seq_id == nullptr || batch.logits == nullptr) {
+            return false;
+        }
+        for (size_t i = 0; i < decode_count; ++i) {
+            if (batch.seq_id[i] == nullptr) {
+                return false;
+            }
+            batch.token[i] = committed_tokens[token_offset + i];
+            batch.pos[i] = pos_base + (llama_pos) (token_offset + i);
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = seq_id;
+            batch.logits[i] = false;
+        }
+        batch.n_tokens = (int32_t) decode_count;
+
+        if (!llama_set_draft_input_hidden_state_copy(
+                state->ctx_mtp, conditioned_hidden.data(), conditioned_hidden.size()) ||
+                mtp_update_kv_cache(state->ctx_mtp, batch, false, state->mtp_heads_active) != 0) {
+            return false;
+        }
+    }
+
+    const float * last_hidden = target_hidden_rows.data() +
+        (committed_tokens.size() - 1) * (size_t) state->n_embd;
+    mtp_store_target_hidden(*state, seq_id, last_hidden, state->n_embd);
+    mtp_invalidate_cached_draft(*state, seq_id);
+    const llama_pos next_position = pos_base + (llama_pos) committed_tokens.size();
+    // Frozen QSA selection and the cached next-token shortcut are derived state and
+    // are intentionally absent from the portable bridge state. Reset them at every
+    // canonical boundary so a live session and a restored session draft identically.
+    return llama_kv_cache_seq_rm(state->ctx_mtp, seq_id, next_position, -1);
 }
 
 static int32_t mtp_accept_batch(
@@ -3667,6 +3890,7 @@ std::vector<llama_token> mtp_speculative_gen_draft(
     const int n_mtp_heads = mtp_heads > 0
         ? std::max(1, std::min((int) mtp_heads, n_mtp_heads_model))
         : n_mtp_heads_model;
+    const bool qwen4exp_mtp = std::strcmp(llama_model_arch_string(llama_get_model(ctx)), "qwen4exp") == 0;
 
     llama_batch mtp_batch = llama_batch_init(1, 0, 1);
     llama_set_mtp_n_heads(ctx, n_mtp_heads);
@@ -3703,7 +3927,10 @@ std::vector<llama_token> mtp_speculative_gen_draft(
         mtp_batch.n_tokens = 0;
         const llama_pos draft_pos = constant_draft_positions ? n_past : current_n_past;
         common_batch_add(mtp_batch, current_input_id, draft_pos, {seq_id}, true);
-        llama_set_mtp_step_idx(ctx, std::min(i, n_mtp_heads - 1));
+        // Qwen3.8 has one physical predictor layer, but step 0 computes QSA top-k while
+        // every later draft iteration reuses that selection. Preserve this logical phase
+        // after clamping the layer index for architectures whose heads are distinct.
+        llama_set_mtp_step_idx(ctx, qwen4exp_mtp ? std::min(i, 1) : std::min(i, n_mtp_heads - 1));
 
         ++n_decode;
         if (llama_decode(ctx, mtp_batch) != 0) {

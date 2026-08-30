@@ -48,6 +48,7 @@ class Model:
     _model_classes: dict[str, type[Model]] = {}
     mtp_only = False
     preserve_tensor_dimensions = False
+    use_text_config = False
 
     dir_model: Path
     ftype: gguf.LlamaFileType
@@ -95,6 +96,8 @@ class Model:
             if len(self.part_names) == 0:
                 self.part_names = Model.get_model_part_names_from_weight_map(self.dir_model, "pytorch_model.bin.index.json")
         self.hparams = Model.load_hparams(self.dir_model)
+        if self.use_text_config and isinstance(self.hparams.get("text_config"), dict):
+            self.hparams = {**self.hparams, **self.hparams["text_config"]}
         self.block_count = self.find_hparam(["n_layers", "num_hidden_layers", "n_layer", "num_layers"])
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
         self.tensor_names = None
@@ -297,10 +300,11 @@ class Model:
                     d
                     if self.preserve_tensor_dimensions
                     or self.mtp_only and n == "output_hc_scale.weight"
+                    or isinstance(d, gguf.LazyChunkedTensor)
                     else d.squeeze()
                 ).numpy(),
             ) for n, d in self.modify_tensors(data_torch, name, bid)):
-                data: np.ndarray  # type hint
+                data: np.ndarray | gguf.LazyChunkedTensor  # type hint
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
 
@@ -369,12 +373,15 @@ class Model:
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
+                quantize = data.quantize if isinstance(data, gguf.LazyChunkedTensor) else (
+                    lambda qtype, d=data: gguf.quants.quantize(d, qtype)
+                )
                 try:
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = quantize(data_qtype)
                 except gguf.QuantError as e:
                     logger.warning("%s, %s", e, "falling back to F16")
                     data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = quantize(data_qtype)
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
@@ -384,7 +391,7 @@ class Model:
                 # n_dims is implicit in the shape
                 logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
 
-                self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+                self.gguf_writer.add_tensor(new_name, cast(Any, data), raw_dtype=data_qtype)
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
@@ -1962,37 +1969,37 @@ class BitnetModel(Model):
         return weight.type(dtype), scale.type(torch.float32)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # transform weight into 1/0/-1 (in fp32)
-        if name.endswith(("q_proj.weight", "k_proj.weight", "v_proj.weight",
-                          "down_proj.weight", "up_proj.weight", "gate_proj.weight",
-                          "o_proj.weight")):
-            weight_torch, scale_torch = self.weight_quant(data_torch)
-
         tensors: list[tuple[str, Tensor]] = []
 
         if name.endswith("q_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_Q, bid, suffix=".scale"), scale_torch))
         elif name.endswith("k_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_K, bid, suffix=".scale"), scale_torch))
         elif name.endswith("v_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_V, bid, suffix=".scale"), scale_torch))
         elif name.endswith("o_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_OUT, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_OUT, bid, suffix=".scale"), scale_torch))
         elif name.endswith("up_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.FFN_UP, bid, suffix=".scale"), scale_torch))
         elif name.endswith("down_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.FFN_DOWN, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.FFN_DOWN, bid, suffix=".scale"), scale_torch))
         elif name.endswith("gate_proj.weight"):
+            weight_torch, scale_torch = self.weight_quant(data_torch)
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE, bid), weight_torch))
             tensors.append((self.format_tensor_name(gguf.MODEL_TENSOR.FFN_GATE, bid, suffix=".scale"), scale_torch))
-
-        if len(tensors) == 0:
+        else:
             tensors.append((self.map_tensor_name(name), data_torch))
 
         return tensors
@@ -2340,6 +2347,605 @@ class Qwen3Model(Qwen2Model):
 @Model.register("Qwen3MoeForCausalLM")
 class Qwen3MoeModel(Qwen2MoeModel):
     model_arch = gguf.MODEL_ARCH.QWEN3MOE
+
+
+@Model.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
+class Qwen4ExpModel(Qwen2MoeModel):
+    """Qwen3.8-Flash-Next conversion with streamed PLE and MTP packaging."""
+
+    model_arch = gguf.MODEL_ARCH.QWEN4EXP
+    supports_mtp_export = True
+    use_text_config = True
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        raw_hparams = self.load_hparams(dir_model)
+        text_hparams = raw_hparams.get("text_config", raw_hparams)
+        mtp_config = text_hparams.get("mtp", {})
+        config_nextn = mtp_config.get("num_hidden_layers", 0) if isinstance(mtp_config, dict) else 0
+        self._nextn = int(text_hparams.get("mtp_num_hidden_layers", config_nextn) or 0)
+        self._tensor_sources = self._index_tensor_sources(dir_model)
+        self._ple_shards: dict[int, tuple[str, tuple[int, ...]]] = {}
+        self._ple_row_dim: int | None = None
+        self._ple_multipliers: list[int] = []
+        self._ple_head_offsets: list[int] = []
+        self._ple_head_vocab_sizes: list[int] = []
+        self._ple_weight_scale: float = 1.0
+        self._mtp_special_seen: set[str] = set()
+        self._qwen4_lazy_expert_groups: set[str] = set()
+        self._qwen4_streamable_expert_groups: dict[str, bool] = {}
+        self._qwen4_expert_pending: dict[str, tuple[str, int, Tensor]] = {}
+        self._qwen4_expert_scales: dict[str, Tensor] = {}
+        self._experts = None
+        super().__init__(dir_model, *args, **kwargs)
+
+        self._trunk_block_count = self.find_hparam(["num_hidden_layers"])
+        self._nextn = int(self.hparams.get("mtp_num_hidden_layers", config_nextn) or 0)
+        if self._nextn not in (0, 1):
+            raise ValueError(f"Qwen4Exp conversion supports exactly one MTP layer, got {self._nextn}")
+        if self.mtp_only and self._nextn != 1:
+            raise ValueError(f"Qwen4Exp standalone MTP export requires one predictor layer, got {self._nextn}")
+        self.block_count = self._trunk_block_count + self._nextn
+        self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
+
+    @staticmethod
+    def _normalize_tensor_name(name: str) -> str:
+        if name.startswith("model.language_model."):
+            return "model." + name.removeprefix("model.language_model.")
+        if name.startswith("language_model."):
+            return "model." + name.removeprefix("language_model.")
+        if name.startswith("model.mtp."):
+            return name.removeprefix("model.")
+        return name
+
+    @classmethod
+    def _index_tensor_sources(cls, dir_model: Path) -> dict[str, tuple[str, str]]:
+        sources: dict[str, tuple[str, str]] = {}
+        for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            index_path = dir_model / index_name
+            if not index_path.is_file():
+                continue
+            with open(index_path, "r", encoding="utf-8") as index_file:
+                weight_map = json.load(index_file).get("weight_map", {})
+            for original_name, part_name in weight_map.items():
+                sources[cls._normalize_tensor_name(original_name)] = (original_name, part_name)
+            return sources
+
+        for model_path in sorted(dir_model.glob("model*.safetensors")):
+            from safetensors import safe_open
+            with safe_open(model_path, framework="pt", device="cpu") as model_part:
+                for original_name in model_part.keys():
+                    sources[cls._normalize_tensor_name(original_name)] = (original_name, model_path.name)
+        return sources
+
+    def _load_checkpoint_tensor(self, name: str) -> Tensor:
+        try:
+            original_name, part_name = self._tensor_sources[name]
+        except KeyError:
+            raise ValueError(f"Qwen4Exp tensor {name!r} is missing from the checkpoint index") from None
+
+        part_path = self.dir_model / part_name
+        if part_path.suffix == ".safetensors":
+            from safetensors import safe_open
+            with safe_open(part_path, framework="pt", device="cpu") as model_part:
+                return model_part.get_tensor(original_name)
+
+        model_part = torch.load(str(part_path), map_location="cpu", mmap=True, weights_only=True)
+        tensor = model_part[original_name]
+        if not isinstance(tensor, torch.Tensor):
+            raise TypeError(f"Qwen4Exp checkpoint entry {original_name!r} is not a tensor")
+        return tensor
+
+    def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
+        if self.mtp_only:
+            selected = {
+                name for name in self._tensor_sources
+                if name in {"model.embed_tokens.weight", "lm_head.weight"} or name.startswith("mtp.")
+            }
+            required_roots = {"model.embed_tokens.weight", "lm_head.weight"}
+            if missing := required_roots - selected:
+                raise ValueError(f"Qwen4Exp standalone MTP export is missing root tensors: {sorted(missing)}")
+            if not any(name.startswith("mtp.layers.0.") for name in selected):
+                raise ValueError("Qwen4Exp standalone MTP export found no mtp.layers.0 tensors")
+
+            selected_parts = sorted({self._tensor_sources[name][1] for name in selected})
+            seen: set[str] = set()
+            for part_name in selected_parts:
+                logger.info(f"gguf: loading selected Qwen4Exp MTP model part '{part_name}'")
+                ctx: ContextManager[Any]
+                if self.is_safetensors:
+                    from safetensors import safe_open
+                    ctx = cast(ContextManager[Any], safe_open(
+                        self.dir_model / part_name, framework="pt", device="cpu"
+                    ))
+                else:
+                    ctx = contextlib.nullcontext(torch.load(
+                        str(self.dir_model / part_name), map_location="cpu", mmap=True, weights_only=True
+                    ))
+
+                with ctx as model_part:
+                    for original_name in model_part.keys():
+                        name = self._normalize_tensor_name(original_name)
+                        if name not in selected:
+                            continue
+                        expert = self._qwen4_expert_source(name)
+                        if expert is not None and self._can_stream_qwen4_expert_group(expert[0]):
+                            group, _, _, is_scale = expert
+                            if is_scale or group in self._qwen4_lazy_expert_groups:
+                                continue
+                        seen.add(name)
+                        if self.is_safetensors:
+                            if self.lazy:
+                                data_torch = LazyTorchTensor.from_safetensors_slice(model_part.get_slice(original_name))
+                            else:
+                                data_torch = model_part.get_tensor(original_name)
+                        else:
+                            data_torch = model_part[original_name]
+                            if self.lazy:
+                                data_torch = LazyTorchTensor.from_eager(data_torch)
+                        yield name, data_torch
+
+            skipped_expert_names = {
+                name for name in selected
+                if (expert := self._qwen4_expert_source(name)) is not None and
+                self._can_stream_qwen4_expert_group(expert[0])
+            }
+            if missing := selected - seen - skipped_expert_names:
+                raise ValueError(f"Qwen4Exp MTP index names missing from selected model parts: {sorted(missing)}")
+            return
+
+        for original_name, data_torch in super().get_tensors():
+            name = self._normalize_tensor_name(original_name)
+            if (name.startswith("mtp.") and self._nextn == 0) or name.startswith("model.visual."):
+                continue
+            expert = self._qwen4_expert_source(name)
+            if expert is not None and self._can_stream_qwen4_expert_group(expert[0]):
+                group, _, _, is_scale = expert
+                # A complete individual-expert group is emitted once, as a row-chunked
+                # logical tensor, when its first weight is visited. Scale tensors are read
+                # by the chunk loader and must not be exported independently.
+                if is_scale or group in self._qwen4_lazy_expert_groups:
+                    continue
+            yield name, data_torch
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        hp = self.hparams
+        rope_parameters = hp.get("rope_parameters", {})
+
+        self.gguf_writer.add_rope_freq_base(rope_parameters["rope_theta"])
+        self.gguf_writer.add_rope_dimension_count(
+            int(hp["head_dim"] * rope_parameters.get("partial_rotary_factor", 0.25))
+        )
+        mrope_sections = list(rope_parameters.get("mrope_section", [11, 11, 10]))
+        while len(mrope_sections) < 4:
+            mrope_sections.append(0)
+        self.gguf_writer.add_rope_dimension_sections(mrope_sections[:4])
+
+        self.gguf_writer.add_ssm_conv_kernel(hp["linear_conv_kernel_dim"])
+        self.gguf_writer.add_ssm_state_size(hp["linear_key_head_dim"])
+        self.gguf_writer.add_ssm_group_count(hp["linear_num_key_heads"])
+        self.gguf_writer.add_ssm_time_step_rank(hp["linear_num_value_heads"])
+        self.gguf_writer.add_ssm_inner_size(hp["linear_value_head_dim"] * hp["linear_num_value_heads"])
+        self.gguf_writer.add_full_attention_interval(hp.get("full_attention_interval", 4))
+        if self._nextn > 0:
+            self.gguf_writer.add_nextn_predict_layers(self._nextn)
+
+        self.gguf_writer.add_hyper_connection_count(hp["hc_count"])
+        self.gguf_writer.add_hyper_connection_low_rank(hp["hc_lowrank"])
+
+        self.gguf_writer.add_attention_indexer_head_count(hp["indexer_n_heads"])
+        self.gguf_writer.add_attention_indexer_key_length(hp["indexer_head_dim"])
+        self.gguf_writer.add_attention_indexer_top_k(hp["indexer_budget"])
+        ratio = hp["indexer_compress_ratio"]
+        compress_ratios = [
+            ratio if layer_type == "full_attention" else 0
+            for layer_type in hp["layer_types"]
+        ]
+        compress_ratios.extend([ratio] * self._nextn)
+        self.gguf_writer.add_attention_compress_ratios(compress_ratios)
+
+        ple_layers = [] if self.mtp_only else [layer_id - 1 for layer_id in hp["ple_layer_ids"]]
+        if not ple_layers:
+            return
+        self.gguf_writer.add_ple_layers(ple_layers)
+        self.gguf_writer.add_ple_ngram_size(hp["ngram_size"])
+        self.gguf_writer.add_ple_heads_per_ngram(hp["heads_per_ngram"])
+        self.gguf_writer.add_ple_conv_kernel(hp["ple_conv_kernel_size"])
+        self.gguf_writer.add_ple_eos_token_id(self._eos_token_id())
+        if (image_token_id := hp.get("image_token_id")) is not None:
+            self.gguf_writer.add_ple_image_token_id(int(image_token_id))
+        if self._ple_row_dim is None:
+            raise ValueError("Qwen4Exp PLE metadata is present but no PLE table was converted")
+        self.gguf_writer.add_embedding_length_per_layer_input(self._ple_row_dim)
+        self.gguf_writer.add_ple_layer_multipliers(self._ple_multipliers)
+        self.gguf_writer.add_ple_head_offsets(self._ple_head_offsets)
+        self.gguf_writer.add_ple_head_vocab_sizes(self._ple_head_vocab_sizes)
+
+    def _eos_token_id(self) -> int:
+        eos = self.hparams.get("eos_token_id")
+        if isinstance(eos, list):
+            return int(eos[-1])
+        if eos is None:
+            raise ValueError("Qwen4Exp eos_token_id is required for PLE n-gram resets")
+        return int(eos)
+
+    @staticmethod
+    def _reorder_v_heads(
+        tensor: Tensor,
+        dim: int,
+        num_k_heads: int,
+        num_v_per_k: int,
+        head_dim: int,
+    ) -> Tensor:
+        shape = list(tensor.shape)
+        if dim < 0:
+            dim += len(shape)
+        new_shape = shape[:dim] + [num_k_heads, num_v_per_k, head_dim] + shape[dim + 1:]
+        tensor = tensor.reshape(*new_shape)
+        permutation = list(range(len(new_shape)))
+        permutation[dim], permutation[dim + 1] = permutation[dim + 1], permutation[dim]
+        return tensor.permute(*permutation).contiguous().reshape(*shape)
+
+    def _reorder_linear_attention(self, data_torch: Tensor, name: str) -> Tensor:
+        num_k_heads = self.hparams["linear_num_key_heads"]
+        num_v_heads = self.hparams["linear_num_value_heads"]
+        if num_k_heads == num_v_heads or "linear_attn." not in name:
+            return data_torch
+        if num_v_heads % num_k_heads != 0:
+            raise ValueError("Qwen4Exp linear value head count must be divisible by key head count")
+
+        head_k_dim = self.hparams["linear_key_head_dim"]
+        head_v_dim = self.hparams["linear_value_head_dim"]
+        num_v_per_k = num_v_heads // num_k_heads
+
+        if ".in_proj_qkv." in name:
+            q_dim = head_k_dim * num_k_heads
+            k_dim = head_k_dim * num_k_heads
+            q = data_torch[:q_dim]
+            k = data_torch[q_dim:q_dim + k_dim]
+            v = self._reorder_v_heads(data_torch[q_dim + k_dim:], 0, num_k_heads, num_v_per_k, head_v_dim)
+            return torch.cat([q, k, v], dim=0)
+        if ".in_proj_z." in name:
+            return self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, head_v_dim)
+        if ".in_proj_a." in name or ".in_proj_b." in name:
+            return self._reorder_v_heads(data_torch, 0, num_k_heads, num_v_per_k, 1)
+        if ".A_log" in name or ".dt_bias" in name or ".dt_proj" in name:
+            if data_torch.ndim == 1:
+                return self._reorder_v_heads(
+                    data_torch.unsqueeze(-1), 0, num_k_heads, num_v_per_k, 1
+                ).squeeze(-1)
+            return self._reorder_v_heads(data_torch, -1, num_k_heads, num_v_per_k, 1)
+        if ".conv1d" in name:
+            qk_channels = head_k_dim * num_k_heads * 2
+            qk_part = data_torch[:qk_channels]
+            v_part = self._reorder_v_heads(
+                data_torch[qk_channels:], 0, num_k_heads, num_v_per_k, head_v_dim
+            )
+            return torch.cat([qk_part, v_part], dim=0)
+        if ".out_proj." in name:
+            return self._reorder_v_heads(data_torch, 1, num_k_heads, num_v_per_k, head_v_dim)
+        return data_torch
+
+    def _map_mtp_tensor(
+        self,
+        data_torch: Tensor,
+        name: str,
+    ) -> tuple[Tensor, str, int | None, list[tuple[str, Tensor]] | None]:
+        special = {
+            "mtp.fc_embedding.weight": gguf.MODEL_TENSOR.NEXTN_E_PROJ,
+            "mtp.fc_hidden.weight": gguf.MODEL_TENSOR.NEXTN_H_PROJ,
+            "mtp.pre_fc_norm_embedding.weight": gguf.MODEL_TENSOR.NEXTN_ENORM,
+            "mtp.pre_fc_norm_hidden.weight": gguf.MODEL_TENSOR.NEXTN_HNORM,
+            "mtp.hyper_connection_mixer.hc_norm.weight": gguf.MODEL_TENSOR.NEXTN_HC_NORM,
+            "mtp.hyper_connection_mixer.input_mix_weight_down.weight": gguf.MODEL_TENSOR.NEXTN_HC_DOWN,
+            "mtp.hyper_connection_mixer.input_mix_weight_up.weight": gguf.MODEL_TENSOR.NEXTN_HC_UP,
+        }
+        if key := special.get(name):
+            if self._nextn == 0:
+                raise ValueError(f"Qwen4Exp checkpoint contains {name!r} but declares no MTP layer")
+            if key in (
+                gguf.MODEL_TENSOR.NEXTN_ENORM,
+                gguf.MODEL_TENSOR.NEXTN_HNORM,
+                gguf.MODEL_TENSOR.NEXTN_HC_NORM,
+            ):
+                data_torch = data_torch + 1
+            self._mtp_special_seen.add(name)
+            bid = self._trunk_block_count
+            return data_torch, name, bid, [(self.format_tensor_name(key, bid), data_torch)]
+
+        match = re.match(r"mtp\.layers\.(\d+)\.(.+)$", name)
+        if match is None:
+            if name.startswith("mtp."):
+                raise ValueError(f"unsupported Qwen4Exp MTP tensor {name!r}")
+            return data_torch, name, None, None
+
+        mtp_layer = int(match.group(1))
+        if mtp_layer >= self._nextn:
+            raise ValueError(f"Qwen4Exp MTP tensor {name!r} exceeds the declared layer count")
+        bid = self._trunk_block_count + mtp_layer
+        return data_torch, f"model.layers.{bid}.{match.group(2)}", bid, None
+
+    @staticmethod
+    def _dequantize_qwen4_fp8(weight: Tensor, scale: Tensor) -> Tensor:
+        if weight.ndim != 2 or scale.ndim != 2:
+            raise ValueError("Qwen4Exp FP8 expert weight and scale must both be two-dimensional")
+        row_repeat = (weight.shape[0] + scale.shape[0] - 1) // scale.shape[0]
+        col_repeat = (weight.shape[1] + scale.shape[1] - 1) // scale.shape[1]
+        scale_f = scale.float().repeat_interleave(row_repeat, 0)[:weight.shape[0]]
+        scale_f = scale_f.repeat_interleave(col_repeat, 1)[:, :weight.shape[1]]
+        return weight.float() * scale_f
+
+    @staticmethod
+    def _qwen4_expert_source(name: str) -> tuple[str, str, int, bool] | None:
+        match = re.fullmatch(
+            r"(.+\.mlp\.experts)\.(\d+)\.(down_proj|gate_proj|up_proj)\.weight(_scale_inv)?",
+            name,
+        )
+        if match is None:
+            return None
+        prefix, expert, projection, scale_suffix = match.groups()
+        return f"{prefix}.{projection}", prefix, int(expert), scale_suffix is not None
+
+    def _can_stream_qwen4_expert_group(self, group: str) -> bool:
+        if group in self._qwen4_streamable_expert_groups:
+            return self._qwen4_streamable_expert_groups[group]
+        prefix, _, projection_name = group.rpartition(".")
+        n_experts = int(self.hparams["num_experts"])
+        weights = [f"{prefix}.{expert}.{projection_name}.weight" for expert in range(n_experts)]
+        if not all(name in self._tensor_sources for name in weights):
+            self._qwen4_streamable_expert_groups[group] = False
+            return False
+        scales = [f"{name}_scale_inv" for name in weights]
+        streamable = all(name in self._tensor_sources for name in scales) or not any(
+            name in self._tensor_sources for name in scales
+        )
+        self._qwen4_streamable_expert_groups[group] = streamable
+        return streamable
+
+    def _stream_qwen4_expert_group(
+        self,
+        data_torch: Tensor,
+        source_name: str,
+        mapped_name: str,
+        bid: int,
+    ) -> list[tuple[str, Tensor]] | None:
+        expert = self._qwen4_expert_source(source_name)
+        if expert is None or expert[3]:
+            return None
+        group, prefix, _, _ = expert
+        projection = group.rpartition(".")[2]
+        if not self._can_stream_qwen4_expert_group(group):
+            return None
+
+        n_experts = int(self.hparams["num_experts"])
+        weights = [f"{prefix}.{expert_id}.{projection}.weight" for expert_id in range(n_experts)]
+        has_scales = f"{weights[0]}_scale_inv" in self._tensor_sources
+        weight_shape = tuple(int(dim) for dim in data_torch.shape)
+        if len(weight_shape) != 2:
+            raise ValueError(f"Qwen4Exp expert weight {source_name!r} is not two-dimensional")
+
+        def make_chunk(weight_name: str) -> Callable[[], np.ndarray]:
+            def load() -> np.ndarray:
+                weight = self._load_checkpoint_tensor(weight_name)
+                if has_scales:
+                    scale = self._load_checkpoint_tensor(f"{weight_name}_scale_inv")
+                    weight = self._dequantize_qwen4_fp8(weight, scale)
+                return weight.to(torch.float32).contiguous().unsqueeze(0).numpy()
+            return load
+
+        table = gguf.LazyChunkedTensor(
+            [make_chunk(weight_name) for weight_name in weights],
+            shape=(n_experts, *weight_shape),
+            dtype=np.float32,
+        )
+        self._qwen4_lazy_expert_groups.add(group)
+        merged_name = re.sub(r"\.\d+\.(down_proj|gate_proj|up_proj)\.weight$", r".\1.weight", mapped_name)
+        return [(self.map_tensor_name(merged_name), cast(Any, table))]
+
+    def _record_qwen4_expert(
+        self,
+        data_torch: Tensor,
+        source_name: str,
+        mapped_name: str,
+        bid: int,
+    ) -> list[tuple[str, Tensor]] | None:
+        streamed = self._stream_qwen4_expert_group(data_torch, source_name, mapped_name, bid)
+        if streamed is not None:
+            return streamed
+
+        scale_suffix = ".weight_scale_inv"
+        weight_source = source_name.removesuffix("_scale_inv") if source_name.endswith(scale_suffix) else source_name
+        mapped_weight = mapped_name.removesuffix("_scale_inv") if mapped_name.endswith(scale_suffix) else mapped_name
+
+        if source_name.endswith(scale_suffix):
+            self._qwen4_expert_scales[weight_source] = data_torch
+            pending = self._qwen4_expert_pending.pop(weight_source, None)
+            if pending is None:
+                return []
+            mapped_weight, bid, weight = pending
+            data_torch = self._dequantize_qwen4_fp8(weight, data_torch)
+        elif f"{source_name}_scale_inv" in self._tensor_sources:
+            scale = self._qwen4_expert_scales.pop(source_name, None)
+            if scale is None:
+                self._qwen4_expert_pending[source_name] = (mapped_weight, bid, data_torch)
+                return []
+            data_torch = self._dequantize_qwen4_fp8(data_torch, scale)
+
+        match = re.fullmatch(r"model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(down_proj|gate_proj|up_proj)\.weight", mapped_weight)
+        if match is None:
+            raise ValueError(f"unexpected Qwen4Exp expert tensor {mapped_weight!r}")
+        expert = int(match.group(2))
+        projection = match.group(3)
+        n_experts = self.hparams["num_experts"]
+
+        if self._experts is None:
+            self._experts = [{} for _ in range(self.block_count)]
+        self._experts[bid][mapped_weight] = data_torch
+        if len(self._experts[bid]) < n_experts * 3:
+            return []
+
+        tensors: list[tuple[str, Tensor]] = []
+        for projection in ("down_proj", "gate_proj", "up_proj"):
+            names = [
+                f"model.layers.{bid}.mlp.experts.{eid}.{projection}.weight"
+                for eid in range(n_experts)
+            ]
+            values = [self._experts[bid].pop(expert_name) for expert_name in names]
+            merged_name = f"model.layers.{bid}.mlp.experts.{projection}.weight"
+            tensors.append((self.map_tensor_name(merged_name), torch.stack(values, dim=0)))
+        return tensors
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        source_name = name
+        if self.mtp_only and data_torch.dtype not in (torch.float16, torch.float32):
+            expert = self._qwen4_expert_source(name)
+            if expert is None or expert[3]:
+                data_torch = data_torch.to(torch.float32)
+        data_torch, name, mtp_bid, mapped = self._map_mtp_tensor(data_torch, name)
+        if mapped is not None:
+            return mapped
+        if mtp_bid is not None:
+            bid = mtp_bid
+
+        if re.fullmatch(
+            r"model\.layers\.\d+\.mlp\.experts\.\d+\.(down_proj|gate_proj|up_proj)\.weight(_scale_inv)?",
+            name,
+        ):
+            assert bid is not None
+            expert_tensors = self._record_qwen4_expert(data_torch, source_name, name, bid)
+            assert expert_tensors is not None
+            return expert_tensors
+
+        if name.endswith((
+            "ple_embedding.layer_multipliers",
+            "ple_embedding.ngram_heads_offsets",
+            "ple_embedding.ngram_heads_vocab_sizes",
+            "ple_embedding.ngram_embedding.weight_scale",
+        )):
+            return []
+        if ".ngram_embedding.shard_" in name:
+            return self._place_ple_shard(data_torch, name)
+
+        if ".indexer.index_qk_proj.weight" in name:
+            n_q = self.hparams["indexer_n_heads"] * self.hparams["indexer_head_dim"]
+            return [
+                (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_Q_PROJ, bid), data_torch[:n_q]),
+                (self.format_tensor_name(gguf.MODEL_TENSOR.INDEXER_K_PROJ, bid), data_torch[n_q:]),
+            ]
+
+        if name.endswith("mlp.experts.down_proj") or name.endswith("mlp.experts.down_proj.weight"):
+            mapped_name = name if name.endswith(".weight") else name + ".weight"
+            return [(self.map_tensor_name(mapped_name), data_torch)]
+        if name.endswith("mlp.experts.gate_up_proj") or name.endswith("mlp.experts.gate_up_proj.weight"):
+            if data_torch.ndim < 3 or data_torch.shape[-2] % 2 != 0:
+                raise ValueError(f"unexpected Qwen4Exp gate_up_proj shape: {tuple(data_torch.shape)}")
+            n_ff = data_torch.shape[-2] // 2
+            base_name = name.removesuffix(".weight").removesuffix(".gate_up_proj")
+            return [
+                (self.map_tensor_name(f"{base_name}.gate_proj.weight"), data_torch[..., :n_ff, :].contiguous()),
+                (self.map_tensor_name(f"{base_name}.up_proj.weight"), data_torch[..., n_ff:, :].contiguous()),
+            ]
+
+        if name.endswith((
+            ".ple.norm_key.weight",
+            ".ple.norm_query.weight",
+            ".ple.norm_conv.weight",
+            ".indexer.q_layernorm.weight",
+            ".indexer.k_layernorm.weight",
+        )):
+            return [(self.map_tensor_name(name), data_torch + 1)]
+        if name.endswith(".ple.conv1d.weight"):
+            return [(self.map_tensor_name(name), data_torch.squeeze())]
+
+        original_name = name
+        if name.endswith(".A_log"):
+            data_torch = -torch.exp(data_torch)
+        elif name.endswith(".dt_bias"):
+            name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
+        elif "linear_attn.conv1d" in name:
+            data_torch = data_torch.squeeze()
+        elif name.endswith("norm.weight") and not name.endswith("linear_attn.norm.weight"):
+            data_torch = data_torch + 1
+
+        data_torch = self._reorder_linear_attention(data_torch, original_name)
+        return [(self.map_tensor_name(name), data_torch)]
+
+    def _place_ple_shard(self, data_torch: Tensor, name: str) -> Iterable[tuple[str, Tensor]]:
+        shard_index = int(name.rpartition(".shard_")[2].partition(".")[0])
+        n_parts = self.hparams["split_ngram_parts"]
+        shape = tuple(int(dim) for dim in data_torch.shape)
+        if len(shape) != 2:
+            raise ValueError(f"Qwen4Exp PLE shard {name!r} is not two-dimensional")
+        if self._ple_row_dim is not None and shape[1] != self._ple_row_dim:
+            raise ValueError(f"Qwen4Exp PLE shard {name!r} has inconsistent row width")
+        self._ple_row_dim = shape[1]
+        self._ple_shards[shard_index] = (name, shape)
+        if len(self._ple_shards) < n_parts:
+            return []
+
+        missing = sorted(set(range(n_parts)) - self._ple_shards.keys())
+        if missing:
+            raise ValueError(f"Qwen4Exp PLE shard indexes are missing: {missing}")
+        shards = [self._ple_shards[index] for index in range(n_parts)]
+        rows = sum(shard_shape[0] for _, shard_shape in shards)
+        table = gguf.LazyChunkedTensor(
+            [self._load_ple_shard(shard_name) for shard_name, _ in shards],
+            shape=(rows, self._ple_row_dim),
+            dtype=np.float32,
+        )
+        table_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD] + ".weight"
+        return [(table_name, cast(Any, table))]
+
+    def _load_ple_shard(self, name: str) -> Callable[[], np.ndarray]:
+        def load() -> np.ndarray:
+            shard = self._load_checkpoint_tensor(name).to(torch.float32)
+            if self._ple_weight_scale != 1.0:
+                shard.mul_(self._ple_weight_scale)
+            return shard.contiguous().numpy()
+        return load
+
+    def _read_ple_constant(self, suffix: str) -> list[int]:
+        name = next((tensor_name for tensor_name in self._tensor_sources if tensor_name.endswith(suffix)), None)
+        if name is None:
+            raise ValueError(f"Qwen4Exp PLE constant {suffix!r} is missing")
+        return [int(value) for value in self._load_checkpoint_tensor(name).to(torch.int64).tolist()]
+
+    def _read_ple_weight_scale(self) -> float:
+        suffix = "ple_embedding.ngram_embedding.weight_scale"
+        name = next((tensor_name for tensor_name in self._tensor_sources if tensor_name.endswith(suffix)), None)
+        if name is None:
+            return 1.0
+        scale = self._load_checkpoint_tensor(name)
+        if scale.numel() != 1:
+            raise ValueError(f"Qwen4Exp PLE weight scale must be scalar, got shape {tuple(scale.shape)}")
+        return float(scale.to(torch.float32).item())
+
+    def prepare_tensors(self):
+        ple_layers = [] if self.mtp_only else self.hparams.get("ple_layer_ids", [])
+        if ple_layers:
+            self._ple_multipliers = self._read_ple_constant("ple_embedding.layer_multipliers")
+            self._ple_head_offsets = self._read_ple_constant("ple_embedding.ngram_heads_offsets")
+            self._ple_head_vocab_sizes = self._read_ple_constant("ple_embedding.ngram_heads_vocab_sizes")
+            self._ple_weight_scale = self._read_ple_weight_scale()
+        super().prepare_tensors()
+
+        expected_parts = self.hparams.get("split_ngram_parts", 0) if ple_layers else 0
+        if len(self._ple_shards) != expected_parts:
+            raise ValueError(f"got {len(self._ple_shards)} Qwen4Exp PLE shards, expected {expected_parts}")
+        if self._qwen4_expert_pending or self._qwen4_expert_scales:
+            raise ValueError("Qwen4Exp conversion found unpaired FP8 expert weights or scales")
+        if self._nextn > 0:
+            required = {
+                "mtp.fc_embedding.weight",
+                "mtp.fc_hidden.weight",
+                "mtp.pre_fc_norm_embedding.weight",
+                "mtp.pre_fc_norm_hidden.weight",
+                "mtp.hyper_connection_mixer.hc_norm.weight",
+                "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+                "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+            }
+            if missing := required - self._mtp_special_seen:
+                raise ValueError(f"Qwen4Exp MTP conversion is missing tensors: {sorted(missing)}")
 
 
 @Model.register("DFlashDraftModel")
@@ -6860,7 +7466,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--mtp", action="store_true",
-        help="export a standalone DeepSeek-V4 MTP predictor companion",
+        help="export a standalone MTP predictor companion for a supported architecture",
     )
     parser.add_argument(
         "--dspark", action="store_true",

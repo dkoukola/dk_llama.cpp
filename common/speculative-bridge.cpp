@@ -33,10 +33,12 @@ namespace {
 
 constexpr uint32_t STATE_CONTAINER_VERSION = 1;
 constexpr uint32_t STATE_SECTION_DSPARK = 1;
+constexpr uint32_t STATE_SECTION_MTP = 2;
 constexpr uint32_t STATE_SECTION_REQUIRED = 1u << 0;
 constexpr size_t STATE_HEADER_SIZE = 72;
 constexpr size_t STATE_SECTION_ENTRY_SIZE = 32;
 constexpr size_t STATE_DSPARK_PREFIX_SIZE = 48;
+constexpr size_t STATE_MTP_PREFIX_SIZE = 72;
 constexpr size_t STATE_QUALITY_KEY_SIZE = 17;
 constexpr std::array<uint8_t, 8> STATE_MAGIC = { 'L', 'L', 'S', 'P', 'S', 'T', 1, 0 };
 
@@ -173,10 +175,25 @@ std::array<uint8_t, 32> sha256(const std::string & text) {
     return sha256_finish(context);
 }
 
+std::array<uint8_t, 32> sha256_mtp_payload(const uint8_t * payload, size_t size) {
+    sha256_context context;
+    sha256_init(context);
+    sha256_update(context, payload, 40);
+    sha256_update(context, payload + STATE_MTP_PREFIX_SIZE, size - STATE_MTP_PREFIX_SIZE);
+    return sha256_finish(context);
+}
+
+enum class bridge_stage_type {
+    DSPARK,
+    MTP,
+};
+
 struct parsed_stage {
+    bridge_stage_type type = bridge_stage_type::DSPARK;
     int32_t n_max = 5;
     float p_min = 0.0f;
     int32_t cross_ctx = 512;
+    int32_t mtp_heads = 1;
     std::string normalized;
 };
 
@@ -236,6 +253,7 @@ struct llama_speculative_session {
     bool round_open = false;
     bool attached = false;
     bool poisoned = false;
+    bool mtp_prefix_complete = false;
     std::vector<float> authoritative_logits;
     bool has_authoritative_logits = false;
     llama_speculative_internal::sampler_token_carry private_carry;
@@ -252,6 +270,9 @@ struct llama_speculative_round {
     llama_speculative_round_params params = {};
     llama_speculative_round_view view = {};
     llama_batch verify_batch = {};
+    llama_pos * verify_owned_positions = nullptr;
+    std::vector<llama_pos> verify_scalar_positions;
+    std::vector<llama_pos> verify_positions;
     sampler_state provisional;
     std::vector<llama_token> committable_tokens;
     std::vector<llama_token> commit_ids;
@@ -262,9 +283,23 @@ struct llama_speculative_round {
     std::vector<float> previous_logits;
     llama_speculative_internal::sampler_token_carry outgoing_carry;
     bool checkpoint_saved = false;
+    bool companion_draft_tail_open = false;
+    bool companion_boundary_row_retained = false;
 
     ~llama_speculative_round() {
+        if (companion_draft_tail_open && session != nullptr && session->speculative != nullptr) {
+            try {
+                if (!common_speculative_mtp_discard_draft_tail(
+                        session->speculative, 0, view.initial_position)) {
+                    common_speculative_mtp_state_reset(session->speculative, 0);
+                    session->mtp_prefix_complete = false;
+                }
+            } catch (...) {
+                session->mtp_prefix_complete = false;
+            }
+        }
         if (verify_batch.token != nullptr) {
+            verify_batch.pos = verify_owned_positions;
             llama_batch_free(verify_batch);
         }
     }
@@ -408,13 +443,17 @@ bool parse_stage_expression(const char * expression, parsed_stage & stage, std::
         return false;
     }
 
+    stage = {};
     const std::string input(expression);
     const size_t colon = input.find(':');
     const std::string name = input.substr(0, colon);
-    if (name != "draft-dspark" && name != "draft_dspark" && name != "dspark") {
-        error = "v1 supports exactly one draft-dspark stage";
+    const bool is_dspark = name == "draft-dspark" || name == "draft_dspark" || name == "dspark";
+    const bool is_mtp = name == "mtp" || name == "draft-mtp" || name == "draft_mtp";
+    if (!is_dspark && !is_mtp) {
+        error = "v1 supports exactly one draft-dspark or mtp stage";
         return false;
     }
+    stage.type = is_mtp ? bridge_stage_type::MTP : bridge_stage_type::DSPARK;
     if (input.find('+') != std::string::npos || input.find(';') != std::string::npos) {
         error = "v1 does not support speculative stage chains";
         return false;
@@ -423,6 +462,7 @@ bool parse_stage_expression(const char * expression, parsed_stage & stage, std::
     bool saw_n_max = false;
     bool saw_p_min = false;
     bool saw_cross_ctx = false;
+    bool saw_mtp_heads = false;
     if (colon != std::string::npos) {
         size_t begin = colon + 1;
         while (begin <= input.size()) {
@@ -430,7 +470,7 @@ bool parse_stage_expression(const char * expression, parsed_stage & stage, std::
             const std::string item = input.substr(begin, comma == std::string::npos ? std::string::npos : comma - begin);
             const size_t equal = item.find('=');
             if (item.empty() || equal == std::string::npos || item.find('=', equal + 1) != std::string::npos) {
-                error = "invalid draft-dspark key/value list";
+                error = "invalid speculative stage key/value list";
                 return false;
             }
             const std::string key = item.substr(0, equal);
@@ -448,13 +488,20 @@ bool parse_stage_expression(const char * expression, parsed_stage & stage, std::
                 }
                 saw_p_min = true;
             } else if (key == "cross_ctx") {
-                if (saw_cross_ctx || !parse_i32(value, 1, std::numeric_limits<int32_t>::max(), stage.cross_ctx)) {
+                if (!is_dspark || saw_cross_ctx ||
+                        !parse_i32(value, 1, std::numeric_limits<int32_t>::max(), stage.cross_ctx)) {
                     error = "invalid or duplicate cross_ctx";
                     return false;
                 }
                 saw_cross_ctx = true;
+            } else if (key == "heads" || key == "mtp_heads") {
+                if (!is_mtp || saw_mtp_heads || !parse_i32(value, 0, 1024, stage.mtp_heads)) {
+                    error = "invalid or duplicate MTP heads";
+                    return false;
+                }
+                saw_mtp_heads = true;
             } else {
-                error = "unknown draft-dspark key '" + key + "'";
+                error = "unknown speculative stage key '" + key + "'";
                 return false;
             }
             if (comma == std::string::npos) {
@@ -465,9 +512,15 @@ bool parse_stage_expression(const char * expression, parsed_stage & stage, std::
     }
 
     std::ostringstream normalized;
-    normalized << "draft-dspark:n_max=" << stage.n_max
-               << ",p_min=" << stage.p_min
-               << ",cross_ctx=" << stage.cross_ctx;
+    if (is_mtp) {
+        normalized << "mtp:n_max=" << stage.n_max
+                   << ",p_min=" << stage.p_min
+                   << ",heads=" << stage.mtp_heads;
+    } else {
+        normalized << "draft-dspark:n_max=" << stage.n_max
+                   << ",p_min=" << stage.p_min
+                   << ",cross_ctx=" << stage.cross_ctx;
+    }
     stage.normalized = normalized.str();
     return true;
 }
@@ -495,6 +548,40 @@ bool dflash_vocab_compatible(const llama_model * target, const llama_model * dra
     for (int32_t token = 5; token < std::min(target_count, draft_count); ++token) {
         if (std::strcmp(llama_vocab_get_text(target_vocab, token), llama_vocab_get_text(draft_vocab, token)) != 0) {
             error = "target and draft token text differs at token " + std::to_string(token);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool mtp_vocab_compatible(const llama_model * target, const llama_model * companion, std::string & error) {
+    const llama_vocab * target_vocab = llama_model_get_vocab(target);
+    const llama_vocab * companion_vocab = llama_model_get_vocab(companion);
+    if (target_vocab == nullptr || companion_vocab == nullptr ||
+            llama_vocab_type(target_vocab) != llama_vocab_type(companion_vocab) ||
+            llama_vocab_get_add_bos(target_vocab) != llama_vocab_get_add_bos(companion_vocab) ||
+            llama_vocab_get_add_eos(target_vocab) != llama_vocab_get_add_eos(companion_vocab) ||
+            llama_vocab_bos(target_vocab) != llama_vocab_bos(companion_vocab) ||
+            llama_vocab_eos(target_vocab) != llama_vocab_eos(companion_vocab)) {
+        error = "target and MTP companion vocabulary contracts differ";
+        return false;
+    }
+
+    const int32_t target_count = llama_vocab_n_tokens(target_vocab);
+    if (target_count <= 0 || target_count != llama_vocab_n_tokens(companion_vocab)) {
+        error = "target and MTP companion vocabulary sizes differ";
+        return false;
+    }
+    for (llama_token token = 0; token < target_count; ++token) {
+        const char * target_text = llama_vocab_get_text(target_vocab, token);
+        const char * companion_text = llama_vocab_get_text(companion_vocab, token);
+        const float target_score = llama_token_get_score(target, token);
+        const float companion_score = llama_token_get_score(companion, token);
+        if (target_text == nullptr || companion_text == nullptr ||
+                std::strcmp(target_text, companion_text) != 0 ||
+                llama_token_get_attr(target, token) != llama_token_get_attr(companion, token) ||
+                std::memcmp(&target_score, &companion_score, sizeof(target_score)) != 0) {
+            error = "target and MTP companion token mapping differs at token " + std::to_string(token);
             return false;
         }
     }
@@ -615,6 +702,20 @@ struct parsed_dspark_state {
     bool ready = false;
 };
 
+struct parsed_mtp_state {
+    uint32_t feature_width = 0;
+    uint32_t warmed_heads = 0;
+    uint32_t hidden_count = 0;
+    llama_pos sequence_start_position = 0;
+    llama_pos next_position = 0;
+    const uint8_t * hidden = nullptr;
+    const uint8_t * context_state = nullptr;
+    uint64_t context_state_size = 0;
+    uint64_t total_size = 0;
+    bool prefix_complete = false;
+    bool ready = false;
+};
+
 bool position_from_wire(int64_t wire, llama_pos & position) {
     if (wire < (int64_t) std::numeric_limits<llama_pos>::min() ||
             wire > (int64_t) std::numeric_limits<llama_pos>::max()) {
@@ -630,6 +731,12 @@ void make_quality_key(const parsed_dspark_state & state, uint8_t key[STATE_QUALI
     write_be64(key + 9, state.row_count);
 }
 
+void make_quality_key(const parsed_mtp_state & state, uint8_t key[STATE_QUALITY_KEY_SIZE]) {
+    key[0] = state.ready ? 1 : 0;
+    write_be64(key + 1, state.prefix_complete ? UINT64_MAX : 0);
+    write_be64(key + 9, state.context_state_size);
+}
+
 void fill_state_info(
         const llama_speculative_engine & engine,
         const parsed_dspark_state & state,
@@ -641,6 +748,31 @@ void fill_state_info(
     info->container_version = STATE_CONTAINER_VERSION;
     info->flags = state.ready ? LLAMA_SPECULATIVE_STATE_CAN_DRAFT : 0;
     if (!state.ready && state.row_count != 0) {
+        info->flags |= LLAMA_SPECULATIVE_STATE_PARTIAL_CONDITIONING;
+    }
+    std::memcpy(info->state_layout_id, engine.state_layout_id.data(), engine.state_layout_id.size());
+    info->sequence_start_position = state.sequence_start_position;
+    info->next_position = state.next_position;
+    info->section_count = 1;
+    info->quality_key_size = STATE_QUALITY_KEY_SIZE;
+    info->canonical_state_bytes = state.total_size;
+    info->derived_state_bytes = 0;
+    info->readiness = state.ready
+        ? LLAMA_SPECULATIVE_CONDITIONING_READY
+        : LLAMA_SPECULATIVE_CONDITIONING_WARMING;
+}
+
+void fill_state_info(
+        const llama_speculative_engine & engine,
+        const parsed_mtp_state & state,
+        llama_speculative_state_info * info) {
+    if (info == nullptr) {
+        return;
+    }
+    *info = {};
+    info->container_version = STATE_CONTAINER_VERSION;
+    info->flags = state.ready ? LLAMA_SPECULATIVE_STATE_CAN_DRAFT : 0;
+    if (!state.prefix_complete && state.next_position > state.sequence_start_position) {
         info->flags |= LLAMA_SPECULATIVE_STATE_PARTIAL_CONDITIONING;
     }
     std::memcpy(info->state_layout_id, engine.state_layout_id.data(), engine.state_layout_id.size());
@@ -787,6 +919,111 @@ llama_speculative_status parse_state(
     return LLAMA_SPECULATIVE_OK;
 }
 
+llama_speculative_status parse_mtp_state(
+        const llama_speculative_engine & engine,
+        const void * state,
+        uint64_t state_size,
+        parsed_mtp_state & parsed,
+        std::string & message) {
+    parsed = {};
+    if (state == nullptr || state_size < STATE_HEADER_SIZE + STATE_SECTION_ENTRY_SIZE + STATE_MTP_PREFIX_SIZE ||
+            state_size > engine.capabilities.maximum_canonical_state_bytes || state_size > UINT32_MAX) {
+        message = "MTP speculative state length is outside the v1 bounds";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+    const auto * bytes = static_cast<const uint8_t *>(state);
+    if (!std::equal(STATE_MAGIC.begin(), STATE_MAGIC.end(), bytes)) {
+        message = "speculative state magic or container version differs";
+        return LLAMA_SPECULATIVE_STATE_INCOMPATIBLE;
+    }
+    if (read_u32(bytes + 8) != STATE_HEADER_SIZE || read_u32(bytes + 12) != state_size) {
+        message = "speculative state header or total length is invalid";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+    if (std::memcmp(bytes + 16, engine.state_layout_id.data(), engine.state_layout_id.size()) != 0) {
+        message = "speculative state layout differs from the engine";
+        return LLAMA_SPECULATIVE_STATE_INCOMPATIBLE;
+    }
+    if (read_u32(bytes + 64) != 0 || read_u32(bytes + 68) != 1) {
+        message = "unsupported speculative container flags or section count";
+        return LLAMA_SPECULATIVE_STATE_INCOMPATIBLE;
+    }
+
+    llama_pos header_sequence_start;
+    llama_pos header_next;
+    if (!position_from_wire(read_i64(bytes + 48), header_sequence_start) ||
+            !position_from_wire(read_i64(bytes + 56), header_next) ||
+            header_sequence_start < 0 || header_next < header_sequence_start) {
+        message = "speculative state header positions are invalid";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+
+    const uint8_t * section = bytes + STATE_HEADER_SIZE;
+    const uint64_t section_offset = read_u64(section + 16);
+    const uint64_t section_size = read_u64(section + 24);
+    uint64_t section_end = 0;
+    if (read_u32(section) != 0 || read_u32(section + 4) != STATE_SECTION_MTP ||
+            read_u16(section + 8) != 1 || read_u16(section + 10) != 0 ||
+            read_u32(section + 12) != STATE_SECTION_REQUIRED) {
+        message = "required MTP state section is incompatible";
+        return LLAMA_SPECULATIVE_STATE_INCOMPATIBLE;
+    }
+    if (section_offset != STATE_HEADER_SIZE + STATE_SECTION_ENTRY_SIZE ||
+            !checked_add(section_offset, section_size, section_end) || section_end != state_size ||
+            section_size < STATE_MTP_PREFIX_SIZE) {
+        message = "MTP section boundaries are invalid";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+
+    const uint8_t * payload = bytes + section_offset;
+    parsed.feature_width = read_u32(payload);
+    parsed.warmed_heads = read_u32(payload + 4);
+    parsed.hidden_count = read_u32(payload + 8);
+    const uint32_t flags = read_u32(payload + 12);
+    parsed.prefix_complete = (flags & 1u) != 0;
+    parsed.context_state_size = read_u64(payload + 32);
+    if (parsed.feature_width != (uint32_t) engine.feature_width || parsed.warmed_heads > 1 ||
+            (parsed.hidden_count != 0 && parsed.hidden_count != parsed.feature_width) ||
+            (flags & ~1u) != 0 || parsed.context_state_size == 0) {
+        message = "MTP section dimensions or flags differ from the engine";
+        return LLAMA_SPECULATIVE_STATE_INCOMPATIBLE;
+    }
+    if (!position_from_wire(read_i64(payload + 16), parsed.sequence_start_position) ||
+            !position_from_wire(read_i64(payload + 24), parsed.next_position) ||
+            parsed.sequence_start_position < 0 || parsed.next_position < parsed.sequence_start_position ||
+            parsed.sequence_start_position != header_sequence_start || parsed.next_position != header_next ||
+            (parsed.prefix_complete && parsed.next_position > parsed.sequence_start_position &&
+             (parsed.hidden_count != parsed.feature_width || parsed.warmed_heads != 1))) {
+        message = "MTP section positions or prefix coverage are invalid";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+
+    uint64_t hidden_bytes = 0;
+    uint64_t expected_size = STATE_MTP_PREFIX_SIZE;
+    if (!checked_multiply(parsed.hidden_count, sizeof(float), hidden_bytes) ||
+            !checked_add(expected_size, hidden_bytes, expected_size) ||
+            !checked_add(expected_size, parsed.context_state_size, expected_size) || expected_size != section_size) {
+        message = "MTP section length is invalid";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+    parsed.hidden = payload + STATE_MTP_PREFIX_SIZE;
+    parsed.context_state = parsed.hidden + hidden_bytes;
+    const auto digest = sha256_mtp_payload(payload, (size_t) section_size);
+    if (!std::equal(digest.begin(), digest.end(), payload + 40)) {
+        message = "MTP state checksum differs";
+        return LLAMA_SPECULATIVE_STATE_CORRUPT;
+    }
+    for (uint32_t i = 0; i < parsed.hidden_count; ++i) {
+        if (!std::isfinite(read_f32(parsed.hidden + (uint64_t) i * sizeof(float)))) {
+            message = "MTP state contains a non-finite hidden value";
+            return LLAMA_SPECULATIVE_STATE_CORRUPT;
+        }
+    }
+    parsed.total_size = state_size;
+    parsed.ready = parsed.prefix_complete && parsed.hidden_count == parsed.feature_width && parsed.warmed_heads == 1;
+    return LLAMA_SPECULATIVE_OK;
+}
+
 bool state_from_session(
         llama_speculative_session & session,
         common_speculative_dflash_state_view & view,
@@ -827,7 +1064,78 @@ bool state_from_session(
             state.sequence_start_position == session.sequence_start_position;
 }
 
-bool fill_engine_metadata(llama_speculative_engine & engine, std::string & error) {
+bool mtp_state_from_session(
+        llama_speculative_session & session,
+        common_speculative_mtp_state_view & view,
+        std::vector<uint8_t> & context_state,
+        parsed_mtp_state & state,
+        uint64_t & required_size) {
+    if (!common_speculative_mtp_state_get_view(session.speculative, 0, view) ||
+            view.target_hidden_count > UINT32_MAX || view.warmed_heads < 0 || view.warmed_heads > 1) {
+        LLAMA_LOG_ERROR("%s: invalid live MTP hidden-state view (count=%zu, warmed=%d)\n",
+                __func__, view.target_hidden_count, view.warmed_heads);
+        return false;
+    }
+    if (view.target_hidden_count != 0 &&
+            (view.target_hidden_count != (size_t) session.engine->feature_width || view.target_hidden == nullptr)) {
+        LLAMA_LOG_ERROR("%s: MTP hidden width differs from engine (count=%zu, expected=%d, data=%p)\n",
+                __func__, view.target_hidden_count, session.engine->feature_width,
+                (const void *) view.target_hidden);
+        return false;
+    }
+    for (size_t i = 0; i < view.target_hidden_count; ++i) {
+        if (!std::isfinite(view.target_hidden[i])) {
+            LLAMA_LOG_ERROR("%s: live MTP hidden row contains a non-finite value at %zu\n", __func__, i);
+            return false;
+        }
+    }
+
+    llama_context * companion = common_speculative_get_companion_ctx(session.speculative);
+    if (companion == nullptr) {
+        return false;
+    }
+    const size_t context_size = llama_state_seq_get_size(companion, 0, 0);
+    if (context_size == 0 || context_size == SIZE_MAX) {
+        LLAMA_LOG_ERROR("%s: could not size live MTP companion state\n", __func__);
+        return false;
+    }
+    context_state.resize(context_size);
+    if (llama_state_seq_get_data(companion, context_state.data(), context_state.size(), 0, 0) != context_state.size()) {
+        LLAMA_LOG_ERROR("%s: live MTP companion state changed while being serialized\n", __func__);
+        return false;
+    }
+
+    uint64_t hidden_bytes = 0;
+    uint64_t payload_size = STATE_MTP_PREFIX_SIZE;
+    if (!checked_multiply(view.target_hidden_count, sizeof(float), hidden_bytes) ||
+            !checked_add(payload_size, hidden_bytes, payload_size) ||
+            !checked_add(payload_size, context_state.size(), payload_size) ||
+            !checked_add(STATE_HEADER_SIZE + STATE_SECTION_ENTRY_SIZE, payload_size, required_size) ||
+            required_size > UINT32_MAX) {
+        LLAMA_LOG_ERROR("%s: live MTP canonical-state length overflows\n", __func__);
+        return false;
+    }
+
+    state = {};
+    state.feature_width = (uint32_t) session.engine->feature_width;
+    state.warmed_heads = (uint32_t) view.warmed_heads;
+    state.hidden_count = (uint32_t) view.target_hidden_count;
+    state.sequence_start_position = session.sequence_start_position;
+    state.next_position = session.next_position;
+    state.context_state_size = context_state.size();
+    state.total_size = required_size;
+    state.prefix_complete = session.mtp_prefix_complete;
+    state.ready = state.prefix_complete && state.hidden_count == state.feature_width && state.warmed_heads == 1;
+    const bool valid = (!state.prefix_complete || state.next_position == state.sequence_start_position || state.ready) &&
+        state.next_position >= state.sequence_start_position;
+    if (!valid) {
+        LLAMA_LOG_ERROR("%s: inconsistent live MTP readiness (prefix=%d, ready=%d, hidden=%u, warmed=%u)\n",
+                __func__, state.prefix_complete, state.ready, state.hidden_count, state.warmed_heads);
+    }
+    return valid;
+}
+
+bool fill_dspark_engine_metadata(llama_speculative_engine & engine, std::string & error) {
     if (!dflash_vocab_compatible(engine.target_model, engine.draft_model, error)) {
         return false;
     }
@@ -946,21 +1254,112 @@ bool fill_engine_metadata(llama_speculative_engine & engine, std::string & error
     return true;
 }
 
-common_params_speculative make_common_params(const llama_speculative_engine & engine) {
+bool fill_mtp_engine_metadata(llama_speculative_engine & engine, std::string & error) {
+    const char * target_arch = llama_model_arch_string(engine.target_model);
+    const char * companion_arch = llama_model_arch_string(engine.draft_model);
+    if (target_arch == nullptr || companion_arch == nullptr ||
+            std::strcmp(target_arch, "qwen4exp") != 0 || std::strcmp(companion_arch, "qwen4exp") != 0) {
+        error = "mtp bridge stage requires Qwen3.8 qwen4exp target and companion models";
+        return false;
+    }
+    const llama_mtp_package target_package = llama_model_mtp_package(engine.target_model);
+    if (target_package != LLAMA_MTP_PACKAGE_TARGET_ONLY && target_package != LLAMA_MTP_PACKAGE_EMBEDDED) {
+        error = "MTP target is a companion or invalid package";
+        return false;
+    }
+    if (llama_model_mtp_package(engine.draft_model) != LLAMA_MTP_PACKAGE_COMPANION) {
+        error = "MTP draft binding must be a predictor-only companion package";
+        return false;
+    }
+    if (llama_model_n_nextn_layer(engine.draft_model) != 1 || engine.stage.mtp_heads > 1) {
+        error = "Qwen3.8 MTP requires exactly one predictor layer and heads=0 or heads=1";
+        return false;
+    }
+    if (!mtp_vocab_compatible(engine.target_model, engine.draft_model, error)) {
+        return false;
+    }
+
+    const int32_t target_width = llama_model_n_embd(engine.target_model);
+    const int32_t companion_width = llama_model_n_embd(engine.draft_model);
+    const uint32_t target_feature_width = llama_model_mtp_feature_width(engine.target_model);
+    const uint32_t companion_feature_width = llama_model_mtp_feature_width(engine.draft_model);
+    if (target_width <= 0 || target_width != companion_width || target_feature_width == 0 ||
+            target_feature_width > INT32_MAX || target_feature_width != companion_feature_width) {
+        error = "Qwen3.8 target and companion embedding or MTP feature widths differ";
+        return false;
+    }
+    engine.feature_width = (int32_t) target_feature_width;
+    engine.decode_tokens = engine.stage.n_max + 1;
+
+    std::ostringstream layout;
+    layout << "llama-speculative-state-layout" << '\0'
+           << "container=1" << '\0'
+           << "stage=0:mtp" << '\0'
+           << "binding=draft" << '\0'
+           << "canonical-schema=mtp-1.0" << '\0'
+           << "arch=qwen4exp" << '\0'
+           << "n_embd=" << target_width << '\0'
+           << "feature_width=" << engine.feature_width << '\0'
+           << "heads=1" << '\0'
+           << "draft_context=" << engine.draft_context_size << '\0'
+           << "vocab=" << llama_vocab_n_tokens(llama_model_get_vocab(engine.target_model));
+    engine.state_layout_id = sha256(layout.str());
+
+    engine.capabilities.flags = LLAMA_SPECULATIVE_CAP_FIXED_SEED_TARGET_IDENTITY |
+            LLAMA_SPECULATIVE_CAP_CANONICAL_STATE |
+            LLAMA_SPECULATIVE_CAP_PORTABLE_CANONICAL_STATE |
+            LLAMA_SPECULATIVE_CAP_TOKEN_INPUT |
+            LLAMA_SPECULATIVE_CAP_REQUIRES_TARGET_MTP_OUTPUT;
+    engine.capabilities.required_target_sequence_count = 1;
+    engine.capabilities.minimum_target_batch_tokens = (uint32_t) engine.stage.n_max + 1;
+    engine.capabilities.minimum_target_ubatch_tokens = (uint32_t) engine.stage.n_max + 1;
+    engine.capabilities.history_requirement = LLAMA_SPECULATIVE_HISTORY_COMPLETE_PREFIX;
+    engine.capabilities.history_lookback_tokens = 0;
+    engine.capabilities.configured_max_draft_tokens = (uint32_t) engine.stage.n_max;
+    engine.capabilities.state_section_count = 1;
+    engine.capabilities.maximum_canonical_state_bytes = UINT32_MAX;
+    engine.capabilities.maximum_derived_state_bytes = 0;
+    engine.capabilities.maximum_quality_key_bytes = STATE_QUALITY_KEY_SIZE;
+    return true;
+}
+
+bool fill_engine_metadata(llama_speculative_engine & engine, std::string & error) {
+    return engine.stage.type == bridge_stage_type::MTP
+        ? fill_mtp_engine_metadata(engine, error)
+        : fill_dspark_engine_metadata(engine, error);
+}
+
+common_params_speculative make_common_params(
+        const llama_speculative_engine & engine,
+        const llama_context * target_context) {
     common_params_speculative params;
-    params.type = COMMON_SPECULATIVE_TYPE_DSPARK;
+    const bool mtp = engine.stage.type == bridge_stage_type::MTP;
+    params.type = mtp ? COMMON_SPECULATIVE_TYPE_MTP : COMMON_SPECULATIVE_TYPE_DSPARK;
     params.spec_ckpt_mode = engine.checkpoint_mode;
     params.n_threads = engine.draft_threads;
     params.n_threads_batch = engine.draft_batch_threads;
     params.n_max = engine.stage.n_max;
     params.n_min = 0;
     params.p_min = engine.stage.p_min;
+    params.mtp_heads = engine.stage.mtp_heads;
     params.dflash_cross_ctx = engine.stage.cross_ctx;
     params.model_dft = engine.draft_model;
     params.cparams_dft = llama_context_default_params();
-    params.cparams_dft.n_ctx = engine.draft_context_size;
-    params.cparams_dft.n_batch = (uint32_t) engine.decode_tokens;
-    params.cparams_dft.n_ubatch = (uint32_t) engine.decode_tokens;
+    if (mtp) {
+        params.cparams_dft.n_ctx = engine.draft_context_size != 0
+            ? engine.draft_context_size
+            : llama_n_ctx(target_context);
+        params.cparams_dft.n_batch = llama_n_batch(target_context);
+        params.cparams_dft.n_ubatch = llama_n_ubatch(target_context);
+        params.cparams_dft.n_seq_max = 1;
+        params.cparams_dft.embeddings = true;
+        params.cparams_dft.mtp = true;
+        params.cparams_dft.mtp_op_type = MTP_OP_WARMUP;
+    } else {
+        params.cparams_dft.n_ctx = engine.draft_context_size;
+        params.cparams_dft.n_batch = (uint32_t) engine.decode_tokens;
+        params.cparams_dft.n_ubatch = (uint32_t) engine.decode_tokens;
+    }
     if (engine.draft_threads > 0) {
         params.cparams_dft.n_threads = (uint32_t) engine.draft_threads;
     }
@@ -968,10 +1367,11 @@ common_params_speculative make_common_params(const llama_speculative_engine & en
         params.cparams_dft.n_threads_batch = (uint32_t) engine.draft_batch_threads;
     }
     common_speculative_stage_params stage;
-    stage.type = COMMON_SPECULATIVE_TYPE_DSPARK;
+    stage.type = mtp ? COMMON_SPECULATIVE_TYPE_MTP : COMMON_SPECULATIVE_TYPE_DSPARK;
     stage.n_max = engine.stage.n_max;
     stage.n_min = 0;
     stage.p_min = engine.stage.p_min;
+    stage.mtp_heads = engine.stage.mtp_heads;
     stage.dflash_cross_ctx = engine.stage.cross_ctx;
     params.stages.push_back(stage);
     return params;
@@ -1070,7 +1470,7 @@ bool materialize_primary_batch(
     }
 
     const size_t token_count = (size_t) batch.n_tokens;
-    materialized.positions.resize(token_count);
+    materialized.positions.resize(token_count * 4);
     materialized.sequence_counts.assign(token_count, 1);
     materialized.sequence_ids.assign(token_count, 0);
     materialized.sequence_id_pointers.resize(token_count);
@@ -1089,6 +1489,9 @@ bool materialize_primary_batch(
             return false;
         }
         materialized.positions[(size_t) i] = (llama_pos) position;
+        materialized.positions[token_count + (size_t) i] = (llama_pos) position;
+        materialized.positions[2 * token_count + (size_t) i] = (llama_pos) position;
+        materialized.positions[3 * token_count + (size_t) i] = 0;
         materialized.sequence_id_pointers[(size_t) i] = &materialized.sequence_ids[(size_t) i];
         materialized.logits[(size_t) i] = batch.logits != nullptr ? batch.logits[i] : 0;
     }
@@ -1134,6 +1537,23 @@ llama_speculative_status check_session_call(
                 "speculative session is detached", position);
     }
     return LLAMA_SPECULATIVE_OK;
+}
+
+bool reset_session_conditioning(
+        llama_speculative_session & session,
+        llama_pos boundary) {
+    if (session.engine->stage.type == bridge_stage_type::MTP) {
+        const bool reset = common_speculative_mtp_state_reset(session.speculative, 0);
+        if (reset) {
+            session.mtp_prefix_complete = boundary == session.sequence_start_position;
+        }
+        return reset;
+    }
+    return common_speculative_dflash_state_reset(
+        session.speculative,
+        session.sequence_start_position,
+        boundary,
+        boundary);
 }
 
 void poison_session(
@@ -1186,6 +1606,19 @@ bool round_copy_output_state(llama_speculative_round & round) {
         round.hidden_rows);
 }
 
+void round_set_verify_token_count(llama_speculative_round & round, int32_t token_count) {
+    GGML_ASSERT(token_count >= 0 && (size_t) token_count <= round.verify_scalar_positions.size());
+    const size_t count = (size_t) token_count;
+    for (size_t i = 0; i < count; ++i) {
+        const llama_pos position = round.verify_scalar_positions[i];
+        round.verify_positions[i] = position;
+        round.verify_positions[count + i] = position;
+        round.verify_positions[2 * count + i] = position;
+        round.verify_positions[3 * count + i] = 0;
+    }
+    round.verify_batch.n_tokens = token_count;
+}
+
 bool round_restore_target(llama_speculative_round & round, uint64_t prefix_count) noexcept {
     try {
         llama_speculative_session & session = *round.session;
@@ -1207,7 +1640,7 @@ bool round_restore_target(llama_speculative_round & round, uint64_t prefix_count
         }
 
         if (restore == LLAMA_SPEC_CKPT_RESTORE_BASE_REPLAY_REQUIRED && prefix_count != 0) {
-            round.verify_batch.n_tokens = (int32_t) prefix_count;
+            round_set_verify_token_count(round, (int32_t) prefix_count);
             if (llama_decode(session.target_context, round.verify_batch) != 0) {
                 llama_spec_ckpt_discard(session.target_context);
                 round.checkpoint_saved = false;
@@ -1215,6 +1648,19 @@ bool round_restore_target(llama_speculative_round & round, uint64_t prefix_count
             }
             session.metrics.target_decode_calls++;
             session.metrics.target_decode_tokens += prefix_count;
+            if (session.engine->stage.type == bridge_stage_type::MTP) {
+                const std::vector<int32_t> committed_outputs(
+                    round.output_indices.begin(), round.output_indices.begin() + (size_t) prefix_count);
+                if (!common_speculative_copy_output_hidden_rows(
+                        session.speculative,
+                        session.target_context,
+                        committed_outputs,
+                        round.hidden_rows)) {
+                    llama_spec_ckpt_discard(session.target_context);
+                    round.checkpoint_saved = false;
+                    return false;
+                }
+            }
         }
 
         llama_spec_ckpt_discard(session.target_context);
@@ -1239,6 +1685,34 @@ bool round_restore_target(llama_speculative_round & round, uint64_t prefix_count
         round.checkpoint_saved = false;
         return false;
     }
+}
+
+enum class companion_tail_result {
+    UNCHANGED,
+    CLEARED,
+    FAILED,
+};
+
+companion_tail_result round_discard_companion_tail(
+        llama_speculative_round & round,
+        bool keep_boundary_row = false) noexcept {
+    if (!round.companion_draft_tail_open) {
+        return companion_tail_result::UNCHANGED;
+    }
+    round.companion_draft_tail_open = false;
+    try {
+        const llama_pos discard_position = round.view.initial_position + (keep_boundary_row ? 1 : 0);
+        if (common_speculative_mtp_discard_draft_tail(
+                round.session->speculative, 0, discard_position)) {
+            return companion_tail_result::UNCHANGED;
+        }
+        if (common_speculative_mtp_state_reset(round.session->speculative, 0)) {
+            round.session->mtp_prefix_complete = false;
+            return companion_tail_result::CLEARED;
+        }
+    } catch (...) {
+    }
+    return companion_tail_result::FAILED;
 }
 
 void finish_round(llama_speculative_round ** round) {
@@ -1293,11 +1767,11 @@ llama_speculative_status llama_speculative_engine_create(
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "unknown engine requirement flag");
     }
     if (params->auxiliary_model_count != 1 || params->auxiliary_models == nullptr) {
-        return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "DSpark v1 requires exactly one auxiliary model");
+        return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "speculative bridge v1 requires exactly one auxiliary model");
     }
     const llama_speculative_model_binding & binding = params->auxiliary_models[0];
     if (binding.name == nullptr || std::strcmp(binding.name, "draft") != 0 || binding.model == nullptr || binding.flags != 0) {
-        return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "DSpark v1 requires one unflagged binding named draft");
+        return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "speculative bridge v1 requires one unflagged binding named draft");
     }
     if (binding.threads < -1 || binding.batch_threads < -1) {
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "draft thread counts must be -1, zero, or positive");
@@ -1322,6 +1796,12 @@ llama_speculative_status llama_speculative_engine_create(
         if (!fill_engine_metadata(*engine, message)) {
             return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, message);
         }
+        if (((params->flags & LLAMA_SPECULATIVE_ENGINE_REQUIRE_CANONICAL_STATE) != 0 &&
+             (engine->capabilities.flags & LLAMA_SPECULATIVE_CAP_CANONICAL_STATE) == 0) ||
+                ((params->flags & LLAMA_SPECULATIVE_ENGINE_REQUIRE_FIXED_SEED_TARGET_IDENTITY) != 0 &&
+                 (engine->capabilities.flags & LLAMA_SPECULATIVE_CAP_FIXED_SEED_TARGET_IDENTITY) == 0)) {
+            return fail(error, LLAMA_SPECULATIVE_UNSUPPORTED, "speculative backend does not satisfy engine requirements");
+        }
 
         {
             std::lock_guard<std::mutex> lock(ownership_mutex);
@@ -1330,16 +1810,18 @@ llama_speculative_status llama_speculative_engine_create(
             }
             draft_reserved = true;
         }
-        if (!llama_model_share_dflash_io_tensors(engine->draft_model, engine->target_model)) {
-            release_draft_model(engine->draft_model);
-            draft_reserved = false;
-            return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "could not establish DSpark target IO sharing");
-        }
-        if (llama_model_dflash_io_mode(engine->draft_model, engine->target_model) == LLAMA_DFLASH_IO_MODE_INVALID ||
-                llama_model_dflash_io_mode(engine->draft_model, engine->target_model) == LLAMA_DFLASH_IO_MODE_MIXED) {
-            release_draft_model(engine->draft_model);
-            draft_reserved = false;
-            return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "DSpark target IO sharing is incomplete");
+        if (engine->stage.type == bridge_stage_type::DSPARK) {
+            if (!llama_model_share_dflash_io_tensors(engine->draft_model, engine->target_model)) {
+                release_draft_model(engine->draft_model);
+                draft_reserved = false;
+                return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "could not establish DSpark target IO sharing");
+            }
+            if (llama_model_dflash_io_mode(engine->draft_model, engine->target_model) == LLAMA_DFLASH_IO_MODE_INVALID ||
+                    llama_model_dflash_io_mode(engine->draft_model, engine->target_model) == LLAMA_DFLASH_IO_MODE_MIXED) {
+                release_draft_model(engine->draft_model);
+                draft_reserved = false;
+                return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "DSpark target IO sharing is incomplete");
+            }
         }
 
         *out_engine = engine.release();
@@ -1615,6 +2097,12 @@ llama_speculative_status llama_speculative_session_create(
         return fail_call(result, error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE,
                 "target context belongs to another model", initial_position);
     }
+    if (engine->stage.type == bridge_stage_type::MTP &&
+            (!llama_mtp_state_enabled(params->target_context) ||
+             llama_mtp_state_n_embd(params->target_context) != (uint32_t) engine->feature_width)) {
+        return fail_call(result, error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE,
+                "MTP target context was not created with llama_context_params.mtp=true", initial_position);
+    }
     if (llama_n_seq_max(params->target_context) < engine->capabilities.required_target_sequence_count ||
             llama_n_batch(params->target_context) < engine->capabilities.minimum_target_batch_tokens ||
             llama_n_ubatch(params->target_context) < engine->capabilities.minimum_target_ubatch_tokens) {
@@ -1640,26 +2128,46 @@ llama_speculative_status llama_speculative_session_create(
         session->owner_thread = std::this_thread::get_id();
         session->authoritative_logits.resize((size_t) llama_vocab_n_tokens(llama_model_get_vocab(engine->target_model)));
 
-        common_params_speculative common_params = make_common_params(*engine);
-        session->speculative = common_speculative_init_prepared(common_params, params->target_context);
+        common_params_speculative common_params = make_common_params(*engine, params->target_context);
+        session->speculative = engine->stage.type == bridge_stage_type::MTP
+            ? common_speculative_init(common_params, params->target_context)
+            : common_speculative_init_prepared(common_params, params->target_context);
         if (session->speculative == nullptr) {
             llama_spec_ckpt_release(params->target_context);
             release_target_context(params->target_context);
             return fail_call(result, error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE,
-                    "could not initialize DSpark session state", initial_position);
+                    "could not initialize speculative session state", initial_position);
         }
-        if (!common_speculative_dflash_state_reset(
+        if (engine->stage.type == bridge_stage_type::MTP) {
+            const llama_context * companion_context =
+                common_speculative_get_companion_ctx(session->speculative);
+            if (companion_context == nullptr ||
+                    llama_n_ctx(companion_context) < llama_n_ctx(params->target_context)) {
+                common_speculative_free(session->speculative);
+                session->speculative = nullptr;
+                llama_spec_ckpt_release(params->target_context);
+                release_target_context(params->target_context);
+                return fail_call(result, error, LLAMA_SPECULATIVE_UNSUPPORTED,
+                        "MTP companion context is smaller than the target context", initial_position);
+            }
+        }
+        const bool state_reset = engine->stage.type == bridge_stage_type::MTP
+            ? common_speculative_mtp_state_reset(session->speculative, 0)
+            : common_speculative_dflash_state_reset(
                 session->speculative,
                 params->sequence_start_position,
                 params->next_position,
-                params->next_position)) {
+                params->next_position);
+        if (!state_reset) {
             common_speculative_free(session->speculative);
             session->speculative = nullptr;
             llama_spec_ckpt_release(params->target_context);
             release_target_context(params->target_context);
             return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
-                    "could not establish empty DSpark conditioning state", initial_position);
+                    "could not establish empty speculative conditioning state", initial_position);
         }
+        session->mtp_prefix_complete = engine->stage.type == bridge_stage_type::MTP &&
+            params->next_position == params->sequence_start_position;
         session->attached = true;
         engine->child_count.fetch_add(1);
         *out_session = session.release();
@@ -1792,23 +2300,30 @@ llama_speculative_status llama_speculative_session_generation_begin(
         return fail_call(result, error, LLAMA_SPECULATIVE_INVALID_ARGUMENT,
                 "generation token-history view does not match the target boundary", session->next_position);
     }
-    try {
-        const llama_tokens prompt;
-        common_speculative_begin(session->speculative, prompt);
-    } catch (const std::bad_alloc &) {
-        return fail_call(result, error, LLAMA_SPECULATIVE_OUT_OF_MEMORY,
-                "could not begin speculative generation", session->next_position);
-    } catch (const std::exception & exception) {
-        return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
-                exception.what(), session->next_position);
-    } catch (...) {
-        return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
-                "unknown generation-begin failure", session->next_position);
+    if (session->engine->stage.type == bridge_stage_type::DSPARK) {
+        try {
+            const llama_tokens prompt;
+            common_speculative_begin(session->speculative, prompt);
+        } catch (const std::bad_alloc &) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_OUT_OF_MEMORY,
+                    "could not begin speculative generation", session->next_position);
+        } catch (const std::exception & exception) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                    exception.what(), session->next_position);
+        } catch (...) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                    "unknown generation-begin failure", session->next_position);
+        }
     }
     session->sampler = params->sampler;
     session->sampler->bound = true;
     session->generation_open = true;
-    return finish_call(result, LLAMA_SPECULATIVE_OK, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
+    const llama_speculative_status status = session->engine->stage.type == bridge_stage_type::MTP &&
+            (!session->mtp_prefix_complete ||
+             !common_speculative_has_sequence_hidden(session->speculative, 0))
+        ? LLAMA_SPECULATIVE_HISTORY_INSUFFICIENT
+        : LLAMA_SPECULATIVE_OK;
+    return finish_call(result, status, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
             LLAMA_SPECULATIVE_BOUNDARY_POST_CALL_COMMITTED, 0, session->next_position);
 }
 
@@ -1904,26 +2419,26 @@ llama_speculative_status llama_speculative_session_decode(
         const bool prompt_warmup = params->phase != LLAMA_SPECULATIVE_DECODE_GENERATED_REPLAY;
         capture_failed = common_speculative_on_target_seq_batch(
             session->speculative, session->target_context, materialized.batch, 0, prompt_warmup) != 0;
+        if (!capture_failed && session->engine->stage.type == bridge_stage_type::MTP) {
+            capture_failed = !common_speculative_mtp_discard_draft_tail(
+                session->speculative, 0, session->next_position);
+        }
     } catch (...) {
         capture_failed = true;
     }
     if (capture_failed) {
         bool reset = false;
         try {
-            reset = common_speculative_dflash_state_reset(
-                session->speculative,
-                session->sequence_start_position,
-                session->next_position,
-                session->next_position);
+            reset = reset_session_conditioning(*session, session->next_position);
         } catch (...) {
             reset = false;
         }
         if (!reset) {
             poison_session(*session, result, LLAMA_SPECULATIVE_POISONED);
             return fail(error, LLAMA_SPECULATIVE_POISONED,
-                    "target decode committed, but DSpark state could not be reset at the committed boundary");
+                    "target decode committed, but speculative state could not be reset at the committed boundary");
         }
-        set_error(error, LLAMA_SPECULATIVE_OK, "target decode committed, but DSpark feature capture was cleared");
+        set_error(error, LLAMA_SPECULATIVE_OK, "target decode committed, but speculative conditioning was cleared");
         return finish_call(result, LLAMA_SPECULATIVE_OK,
                 LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID,
                 LLAMA_SPECULATIVE_BOUNDARY_POST_CALL_COMMITTED,
@@ -1951,18 +2466,14 @@ llama_speculative_status llama_speculative_session_clear_conditioning(
     }
     bool reset = false;
     try {
-        reset = common_speculative_dflash_state_reset(
-            session->speculative,
-            session->sequence_start_position,
-            session->next_position,
-            session->next_position);
+        reset = reset_session_conditioning(*session, session->next_position);
     } catch (...) {
         reset = false;
     }
     if (!reset) {
         poison_session(*session, result, LLAMA_SPECULATIVE_POISONED);
         return fail(error, LLAMA_SPECULATIVE_POISONED,
-                "DSpark conditioning could not be reset at the committed boundary");
+                "speculative conditioning could not be reset at the committed boundary");
     }
     return finish_call(result, LLAMA_SPECULATIVE_OK,
             LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID,
@@ -1985,7 +2496,7 @@ llama_speculative_status llama_speculative_session_trim(
                 "invalid trim boundary or active generation", session->next_position);
     }
     return fail_call(result, error, LLAMA_SPECULATIVE_UNSUPPORTED,
-            "DSpark v1 does not support transactional target-context trimming", session->next_position);
+            "speculative bridge v1 does not support transactional target-context trimming", session->next_position);
 }
 
 llama_speculative_status llama_speculative_session_context_shift(
@@ -2008,7 +2519,7 @@ llama_speculative_status llama_speculative_session_context_shift(
                 "invalid context-shift boundary or active generation", session->next_position);
     }
     return fail_call(result, error, LLAMA_SPECULATIVE_UNSUPPORTED,
-            "DSpark v1 does not support transactional target-context shifting", session->next_position);
+            "speculative bridge v1 does not support transactional target-context shifting", session->next_position);
 }
 
 llama_speculative_status llama_speculative_round_begin(
@@ -2032,13 +2543,25 @@ llama_speculative_status llama_speculative_round_begin(
     }
 
     const llama_pos initial_position = session->next_position;
+    std::unique_ptr<llama_speculative_round> prepared;
     const auto fail_pre_call = [&](llama_speculative_status status, const char * message) {
-        finish_call(result, status, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
+        llama_speculative_effect effect = LLAMA_SPECULATIVE_EFFECT_UNCHANGED;
+        if (prepared != nullptr) {
+            const companion_tail_result tail_result = round_discard_companion_tail(*prepared);
+            if (tail_result == companion_tail_result::FAILED) {
+                poison_session(*session, result, LLAMA_SPECULATIVE_INTERNAL_ERROR);
+                return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                        "speculative round failed and the MTP draft tail could not be discarded");
+            }
+            if (tail_result == companion_tail_result::CLEARED) {
+                effect = LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID;
+            }
+        }
+        finish_call(result, status, effect,
                 LLAMA_SPECULATIVE_BOUNDARY_PRE_CALL, 0, initial_position);
         return fail(error, status, message);
     };
 
-    std::unique_ptr<llama_speculative_round> prepared;
     try {
         prepared = std::make_unique<llama_speculative_round>();
         prepared->session = session;
@@ -2069,6 +2592,11 @@ llama_speculative_status llama_speculative_round_begin(
                 (params->flags & LLAMA_SPECULATIVE_ROUND_FORCE_TARGET_ONLY) != 0) {
             // Multi-token verification can use numerically different target kernels. Preserve
             // fixed-seed target-stream identity through the canonical one-token path.
+            maximum_draft = 0;
+        }
+        if (session->engine->stage.type == bridge_stage_type::MTP &&
+                (!session->mtp_prefix_complete ||
+                 !common_speculative_has_sequence_hidden(session->speculative, 0))) {
             maximum_draft = 0;
         }
         if (maximum_draft > (uint64_t) std::numeric_limits<int32_t>::max()) {
@@ -2122,13 +2650,15 @@ llama_speculative_status llama_speculative_round_begin(
         prepared->committable_tokens.push_back(first);
         prepared->prefix_rng.push_back(prepared->provisional.rng);
 
-        common_params_speculative common_params = make_common_params(*session->engine);
+        common_params_speculative common_params = make_common_params(*session->engine, session->target_context);
         common_params.n_max = (int32_t) maximum_draft;
         for (auto & stage : common_params.stages) {
             stage.n_max = (int32_t) maximum_draft;
         }
         common_speculative_draft_result draft_result = {};
         if (maximum_draft != 0) {
+            prepared->companion_draft_tail_open =
+                session->engine->stage.type == bridge_stage_type::MTP;
             const llama_tokens empty_history;
             draft_result = common_speculative_draft_ex(
                 session->speculative,
@@ -2140,8 +2670,10 @@ llama_speculative_status llama_speculative_round_begin(
                 0);
         }
         llama_tokens & draft = draft_result.tokens;
+        prepared->companion_boundary_row_retained =
+            prepared->companion_draft_tail_open && !draft.empty();
         if (draft.size() > maximum_draft) {
-            return fail_pre_call(LLAMA_SPECULATIVE_INTERNAL_ERROR, "DSpark returned too many draft tokens");
+            return fail_pre_call(LLAMA_SPECULATIVE_INTERNAL_ERROR, "speculative backend returned too many draft tokens");
         }
 
         const size_t output_count = draft.size() + 1;
@@ -2156,24 +2688,28 @@ llama_speculative_status llama_speculative_round_begin(
         prepared->hidden_rows.reserve((size_t) hidden_floats);
         prepared->output_indices.resize(output_count);
         prepared->verify_batch = llama_batch_init((int32_t) output_count, 0, 1);
+        prepared->verify_owned_positions = prepared->verify_batch.pos;
         if (prepared->verify_batch.token == nullptr || prepared->verify_batch.pos == nullptr ||
                 prepared->verify_batch.n_seq_id == nullptr || prepared->verify_batch.seq_id == nullptr ||
                 prepared->verify_batch.logits == nullptr) {
             return fail_pre_call(LLAMA_SPECULATIVE_OUT_OF_MEMORY, "could not allocate target verification batch");
         }
+        prepared->verify_scalar_positions.resize(output_count);
+        prepared->verify_positions.resize(output_count * 4);
+        prepared->verify_batch.pos = prepared->verify_positions.data();
         for (size_t i = 0; i < output_count; ++i) {
             if (prepared->verify_batch.seq_id[i] == nullptr) {
                 return fail_pre_call(LLAMA_SPECULATIVE_OUT_OF_MEMORY,
                         "could not allocate target verification sequence IDs");
             }
             prepared->verify_batch.token[i] = i == 0 ? first : draft[i - 1];
-            prepared->verify_batch.pos[i] = initial_position + (llama_pos) i;
+            prepared->verify_scalar_positions[i] = initial_position + (llama_pos) i;
             prepared->verify_batch.n_seq_id[i] = 1;
             prepared->verify_batch.seq_id[i][0] = 0;
             prepared->verify_batch.logits[i] = true;
             prepared->output_indices[i] = (int32_t) i;
         }
-        prepared->verify_batch.n_tokens = (int32_t) output_count;
+        round_set_verify_token_count(*prepared, (int32_t) output_count);
 
         const int checkpoint_mode = llama_spec_ckpt_init(
             session->target_context, session->engine->checkpoint_mode, (int) output_count);
@@ -2273,9 +2809,7 @@ llama_speculative_status llama_speculative_round_begin(
             poison_session(*session, result, LLAMA_SPECULATIVE_POISONED);
             return fail(error, LLAMA_SPECULATIVE_POISONED, "round preparation failed and rollback could not be proven");
         }
-        finish_call(result, LLAMA_SPECULATIVE_INTERNAL_ERROR, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
-                LLAMA_SPECULATIVE_BOUNDARY_PRE_CALL, 0, initial_position);
-        return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, exception.what());
+        return fail_pre_call(LLAMA_SPECULATIVE_INTERNAL_ERROR, exception.what());
     } catch (...) {
         if (prepared != nullptr && prepared->checkpoint_saved && !round_restore_target(*prepared, 0)) {
             poison_session(*session, result, LLAMA_SPECULATIVE_POISONED);
@@ -2334,30 +2868,54 @@ llama_speculative_status llama_speculative_round_commit(
     }
 
     llama_speculative_effect effect = LLAMA_SPECULATIVE_EFFECT_UNCHANGED;
+    const bool mtp = session.engine->stage.type == bridge_stage_type::MTP;
+    const bool keep_companion_boundary = mtp && prefix_count != 0 && round.companion_boundary_row_retained;
+    const companion_tail_result tail_result = round_discard_companion_tail(round, keep_companion_boundary);
+    if (tail_result == companion_tail_result::FAILED) {
+        poison_session(session, &result->call, LLAMA_SPECULATIVE_INTERNAL_ERROR);
+        finish_round(round_pointer);
+        return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                "target boundary restored, but MTP draft tail could not be discarded");
+    }
+    if (tail_result == companion_tail_result::CLEARED) {
+        effect = LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID;
+    }
     if (prefix_count != 0) {
-        bool conditioning_committed = false;
-        try {
-            round.commit_ids.resize((size_t) prefix_count);
-            round.hidden_rows.resize((size_t) prefix_count * (size_t) session.engine->feature_width);
-            conditioning_committed = common_speculative_commit_accepted_hidden_rows(
-                session.speculative,
-                COMMON_SPECULATIVE_TYPE_DSPARK,
-                0,
-                round.view.initial_position + 1,
-                round.committable_tokens[0],
-                round.commit_ids,
-                round.hidden_rows);
-        } catch (...) {
-            conditioning_committed = false;
+        bool conditioning_committed = tail_result != companion_tail_result::CLEARED;
+        if (conditioning_committed) {
+            try {
+                round.hidden_rows.resize((size_t) prefix_count * (size_t) session.engine->feature_width);
+                if (mtp) {
+                    round.commit_ids.assign(
+                        round.committable_tokens.begin(),
+                        round.committable_tokens.begin() + (size_t) prefix_count);
+                } else {
+                    round.commit_ids.resize((size_t) prefix_count);
+                }
+                conditioning_committed = mtp
+                    ? common_speculative_mtp_commit_prefix(
+                        session.speculative,
+                        0,
+                        round.view.initial_position,
+                        round.commit_ids,
+                        round.hidden_rows,
+                        keep_companion_boundary)
+                    : common_speculative_commit_accepted_hidden_rows(
+                        session.speculative,
+                        COMMON_SPECULATIVE_TYPE_DSPARK,
+                        0,
+                        round.view.initial_position + 1,
+                        round.committable_tokens[0],
+                        round.commit_ids,
+                        round.hidden_rows);
+            } catch (...) {
+                conditioning_committed = false;
+            }
         }
-        if (!conditioning_committed) {
+        if (!conditioning_committed && tail_result != companion_tail_result::CLEARED) {
             bool reset = false;
             try {
-                reset = common_speculative_dflash_state_reset(
-                    session.speculative,
-                    session.sequence_start_position,
-                    committed_position,
-                    committed_position);
+                reset = reset_session_conditioning(session, committed_position);
             } catch (...) {
                 reset = false;
             }
@@ -2365,7 +2923,7 @@ llama_speculative_status llama_speculative_round_commit(
                 poison_session(session, &result->call, LLAMA_SPECULATIVE_INTERNAL_ERROR);
                 finish_round(round_pointer);
                 return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
-                        "accepted target prefix committed, but DSpark conditioning could not be reset");
+                        "accepted target prefix committed, but speculative conditioning could not be reset");
             }
             effect = LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID;
         }
@@ -2387,11 +2945,7 @@ llama_speculative_status llama_speculative_round_commit(
     } catch (...) {
         bool reset = false;
         try {
-            reset = common_speculative_dflash_state_reset(
-                session.speculative,
-                session.sequence_start_position,
-                session.next_position,
-                session.next_position);
+            reset = reset_session_conditioning(session, session.next_position);
         } catch (...) {
             reset = false;
         }
@@ -2441,7 +2995,17 @@ llama_speculative_status llama_speculative_round_abort(
         finish_round(round_pointer);
         return fail(error, LLAMA_SPECULATIVE_ROLLBACK_FAILED, "could not restore the pre-round target boundary");
     }
-    finish_call(result, LLAMA_SPECULATIVE_OK, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
+    const companion_tail_result tail_result = round_discard_companion_tail(round);
+    if (tail_result == companion_tail_result::FAILED) {
+        poison_session(session, result, LLAMA_SPECULATIVE_INTERNAL_ERROR);
+        finish_round(round_pointer);
+        return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                "target boundary restored, but MTP draft tail could not be discarded");
+    }
+    const llama_speculative_effect effect = tail_result == companion_tail_result::CLEARED
+        ? LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID
+        : LLAMA_SPECULATIVE_EFFECT_UNCHANGED;
+    finish_call(result, LLAMA_SPECULATIVE_OK, effect,
             LLAMA_SPECULATIVE_BOUNDARY_PRE_CALL, 0, session.next_position);
     finish_round(round_pointer);
     return LLAMA_SPECULATIVE_OK;
@@ -2465,6 +3029,24 @@ llama_speculative_status llama_speculative_session_state_size(
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "quiescent attached session and state outputs are required");
     }
     auto & session = *const_cast<llama_speculative_session *>(const_session);
+    if (session.engine->stage.type == bridge_stage_type::MTP) {
+        try {
+            common_speculative_mtp_state_view view;
+            std::vector<uint8_t> context_state;
+            parsed_mtp_state state;
+            if (!mtp_state_from_session(session, view, context_state, state, *required_size)) {
+                return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, "could not inspect live MTP canonical state");
+            }
+            fill_state_info(*session.engine, state, info);
+            return LLAMA_SPECULATIVE_OK;
+        } catch (const std::bad_alloc &) {
+            return fail(error, LLAMA_SPECULATIVE_OUT_OF_MEMORY, "could not allocate MTP canonical state view");
+        } catch (const std::exception & exception) {
+            return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, exception.what());
+        } catch (...) {
+            return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, "unknown MTP canonical state inspection failure");
+        }
+    }
     common_speculative_dflash_state_view view;
     parsed_dspark_state state;
     if (!state_from_session(session, view, state, *required_size)) {
@@ -2494,6 +3076,72 @@ llama_speculative_status llama_speculative_session_state_save(
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "quiescent attached session and state outputs are required");
     }
     auto & session = *const_cast<llama_speculative_session *>(const_session);
+    if (session.engine->stage.type == bridge_stage_type::MTP) {
+        try {
+            common_speculative_mtp_state_view view;
+            std::vector<uint8_t> context_state;
+            parsed_mtp_state state;
+            uint64_t required_size = 0;
+            if (!mtp_state_from_session(session, view, context_state, state, required_size)) {
+                return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, "could not inspect live MTP canonical state");
+            }
+            *written_size = required_size;
+            fill_state_info(*session.engine, state, info);
+            if (destination == nullptr || capacity < required_size) {
+                return LLAMA_SPECULATIVE_BUFFER_TOO_SMALL;
+            }
+
+            auto * bytes = static_cast<uint8_t *>(destination);
+            std::memcpy(bytes, STATE_MAGIC.data(), STATE_MAGIC.size());
+            write_u32(bytes + 8, STATE_HEADER_SIZE);
+            write_u32(bytes + 12, (uint32_t) required_size);
+            std::memcpy(bytes + 16, session.engine->state_layout_id.data(), session.engine->state_layout_id.size());
+            write_i64(bytes + 48, state.sequence_start_position);
+            write_i64(bytes + 56, state.next_position);
+            write_u32(bytes + 64, 0);
+            write_u32(bytes + 68, 1);
+
+            uint8_t * section = bytes + STATE_HEADER_SIZE;
+            write_u32(section, 0);
+            write_u32(section + 4, STATE_SECTION_MTP);
+            write_u16(section + 8, 1);
+            write_u16(section + 10, 0);
+            write_u32(section + 12, STATE_SECTION_REQUIRED);
+            write_u64(section + 16, STATE_HEADER_SIZE + STATE_SECTION_ENTRY_SIZE);
+            write_u64(section + 24, required_size - STATE_HEADER_SIZE - STATE_SECTION_ENTRY_SIZE);
+
+            uint8_t * payload = section + STATE_SECTION_ENTRY_SIZE;
+            write_u32(payload, state.feature_width);
+            write_u32(payload + 4, state.warmed_heads);
+            write_u32(payload + 8, state.hidden_count);
+            write_u32(payload + 12, state.prefix_complete ? 1u : 0u);
+            write_i64(payload + 16, state.sequence_start_position);
+            write_i64(payload + 24, state.next_position);
+            write_u64(payload + 32, state.context_state_size);
+
+            uint8_t * cursor = payload + STATE_MTP_PREFIX_SIZE;
+            for (uint32_t i = 0; i < state.hidden_count; ++i) {
+                write_f32(cursor, view.target_hidden[i]);
+                cursor += sizeof(float);
+            }
+            std::memcpy(cursor, context_state.data(), context_state.size());
+            cursor += context_state.size();
+            const auto digest = sha256_mtp_payload(payload, (size_t) (cursor - payload));
+            std::memcpy(payload + 40, digest.data(), digest.size());
+            if ((uint64_t) (cursor - bytes) != required_size) {
+                return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, "MTP serialization length invariant failed");
+            }
+            session.metrics.state_saves++;
+            session.metrics.state_save_bytes += required_size;
+            return LLAMA_SPECULATIVE_OK;
+        } catch (const std::bad_alloc &) {
+            return fail(error, LLAMA_SPECULATIVE_OUT_OF_MEMORY, "could not allocate MTP canonical state");
+        } catch (const std::exception & exception) {
+            return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, exception.what());
+        } catch (...) {
+            return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, "unknown MTP canonical state save failure");
+        }
+    }
     common_speculative_dflash_state_view view;
     parsed_dspark_state state;
     uint64_t required_size = 0;
@@ -2569,6 +3217,29 @@ llama_speculative_status llama_speculative_engine_state_inspect(
             (params->quality_key_capacity != 0 && params->quality_key == nullptr)) {
         return fail(error, LLAMA_SPECULATIVE_INVALID_ARGUMENT, "engine, state inspection input, and output are required");
     }
+    if (engine->stage.type == bridge_stage_type::MTP) {
+        parsed_mtp_state state;
+        std::string message;
+        llama_speculative_status status = LLAMA_SPECULATIVE_INTERNAL_ERROR;
+        try {
+            status = parse_mtp_state(*engine, params->state, params->state_size, state, message);
+        } catch (const std::bad_alloc &) {
+            return fail(error, LLAMA_SPECULATIVE_OUT_OF_MEMORY, "could not inspect MTP speculative state");
+        } catch (const std::exception & exception) {
+            return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, exception.what());
+        } catch (...) {
+            return fail(error, LLAMA_SPECULATIVE_INTERNAL_ERROR, "unknown MTP state inspection failure");
+        }
+        if (status != LLAMA_SPECULATIVE_OK) {
+            return fail(error, status, message);
+        }
+        fill_state_info(*engine, state, info);
+        if (params->quality_key == nullptr || params->quality_key_capacity < STATE_QUALITY_KEY_SIZE) {
+            return LLAMA_SPECULATIVE_BUFFER_TOO_SMALL;
+        }
+        make_quality_key(state, params->quality_key);
+        return LLAMA_SPECULATIVE_OK;
+    }
     parsed_dspark_state state;
     std::string message;
     llama_speculative_status status = LLAMA_SPECULATIVE_INTERNAL_ERROR;
@@ -2605,6 +3276,82 @@ llama_speculative_status llama_speculative_session_state_load(
     if (session->generation_open || session->round_open) {
         return fail_call(result, error, LLAMA_SPECULATIVE_BUSY,
                 "state load requires an idle attached session", session->next_position);
+    }
+
+    if (session->engine->stage.type == bridge_stage_type::MTP) {
+        parsed_mtp_state parsed;
+        std::string message;
+        llama_speculative_status parsed_status = LLAMA_SPECULATIVE_INTERNAL_ERROR;
+        try {
+            parsed_status = parse_mtp_state(*session->engine, state_bytes, state_size, parsed, message);
+        } catch (const std::bad_alloc &) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_OUT_OF_MEMORY,
+                    "could not parse MTP speculative state", session->next_position);
+        } catch (const std::exception & exception) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                    exception.what(), session->next_position);
+        } catch (...) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                    "unknown MTP state parsing failure", session->next_position);
+        }
+        if (parsed_status != LLAMA_SPECULATIVE_OK) {
+            finish_call(result, parsed_status, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
+                    LLAMA_SPECULATIVE_BOUNDARY_PRE_CALL, 0, session->next_position);
+            return fail(error, parsed_status, message);
+        }
+        if (parsed.sequence_start_position != session->sequence_start_position ||
+                parsed.next_position != session->next_position) {
+            finish_call(result, LLAMA_SPECULATIVE_STATE_INCOMPATIBLE, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
+                    LLAMA_SPECULATIVE_BOUNDARY_PRE_CALL, 0, session->next_position);
+            return fail(error, LLAMA_SPECULATIVE_STATE_INCOMPATIBLE,
+                    "MTP speculative state boundary differs from the target session");
+        }
+
+        try {
+            std::vector<float> hidden(parsed.hidden_count);
+            for (uint32_t i = 0; i < parsed.hidden_count; ++i) {
+                hidden[i] = read_f32(parsed.hidden + (uint64_t) i * sizeof(float));
+            }
+            const common_speculative_mtp_state_import_status imported = common_speculative_mtp_state_import(
+                session->speculative,
+                0,
+                hidden.empty() ? nullptr : hidden.data(),
+                hidden.size(),
+                (int32_t) parsed.warmed_heads,
+                parsed.context_state,
+                (size_t) parsed.context_state_size);
+            if (imported != COMMON_SPECULATIVE_MTP_STATE_IMPORT_OK) {
+                const llama_speculative_effect effect =
+                    imported == COMMON_SPECULATIVE_MTP_STATE_IMPORT_FAILED_CLEARED
+                    ? LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID
+                    : LLAMA_SPECULATIVE_EFFECT_UNCHANGED;
+                if (effect == LLAMA_SPECULATIVE_EFFECT_SPEC_STATE_CLEARED_TARGET_VALID) {
+                    session->mtp_prefix_complete = false;
+                }
+                finish_call(result, LLAMA_SPECULATIVE_STATE_CORRUPT, effect,
+                        effect == LLAMA_SPECULATIVE_EFFECT_UNCHANGED
+                        ? LLAMA_SPECULATIVE_BOUNDARY_PRE_CALL
+                        : LLAMA_SPECULATIVE_BOUNDARY_POST_CALL_COMMITTED,
+                        0, session->next_position);
+                return fail(error, LLAMA_SPECULATIVE_STATE_CORRUPT,
+                        "MTP companion sequence state could not be restored");
+            }
+        } catch (const std::bad_alloc &) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_OUT_OF_MEMORY,
+                    "could not allocate MTP canonical state", session->next_position);
+        } catch (const std::exception & exception) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                    exception.what(), session->next_position);
+        } catch (...) {
+            return fail_call(result, error, LLAMA_SPECULATIVE_INTERNAL_ERROR,
+                    "unknown MTP state import failure", session->next_position);
+        }
+
+        session->mtp_prefix_complete = parsed.prefix_complete;
+        session->metrics.state_loads++;
+        session->metrics.state_load_bytes += state_size;
+        return finish_call(result, LLAMA_SPECULATIVE_OK, LLAMA_SPECULATIVE_EFFECT_UNCHANGED,
+                LLAMA_SPECULATIVE_BOUNDARY_POST_CALL_COMMITTED, 0, session->next_position);
     }
 
     parsed_dspark_state parsed;

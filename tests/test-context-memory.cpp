@@ -235,6 +235,9 @@ int main() {
     ctx.dsv4.raw.sinfo_write.idxs.resize(1);
     ctx.dsv4.raw.sinfo_write.idxs[0].reserve(5);
     ctx.dsv4.cache.csa_k.reserve(2);
+    ctx.inp_qsa.reserve(3);
+    ctx.qwen4_mtp_qsa_topk.reserve(7);
+    ctx.qwen4_mtp_qsa_valid.reserve(11);
     ctx.swa_compact_buf.reserve(19);
     ctx.embd_seq[42].reserve(6);
 
@@ -269,6 +272,9 @@ int main() {
             ctx.dsv4.raw.sinfo_write.idxs[0].capacity()*
                     sizeof(ctx.dsv4.raw.sinfo_write.idxs[0][0]) +
             ctx.dsv4.cache.csa_k.capacity()*sizeof(ctx.dsv4.cache.csa_k[0]) +
+            ctx.inp_qsa.capacity()*sizeof(ctx.inp_qsa[0]) +
+            ctx.qwen4_mtp_qsa_topk.capacity()*sizeof(ctx.qwen4_mtp_qsa_topk[0]) +
+            ctx.qwen4_mtp_qsa_valid.capacity()*sizeof(ctx.qwen4_mtp_qsa_valid[0]) +
             ctx.swa_compact_buf.capacity()*sizeof(ctx.swa_compact_buf[0]) +
             ctx.embd_seq[42].capacity()*sizeof(ctx.embd_seq[42][0]);
     CHECK(auxiliaries.host_bytes == extended.info.host_bytes + expected_auxiliary_delta);

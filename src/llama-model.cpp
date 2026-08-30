@@ -532,6 +532,13 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE_SHEXP,       "blk.%d.ffn_gate_shexp" },
             { LLM_TENSOR_FFN_DOWN_SHEXP,       "blk.%d.ffn_down_shexp" },
             { LLM_TENSOR_FFN_UP_SHEXP,         "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_NEXTN_E_PROJ,         "blk.%d.nextn.e_proj" },
+            { LLM_TENSOR_NEXTN_H_PROJ,         "blk.%d.nextn.h_proj" },
+            { LLM_TENSOR_NEXTN_ENORM,          "blk.%d.nextn.enorm" },
+            { LLM_TENSOR_NEXTN_HNORM,          "blk.%d.nextn.hnorm" },
+            { LLM_TENSOR_NEXTN_HC_NORM,        "blk.%d.nextn.hc_norm" },
+            { LLM_TENSOR_NEXTN_HC_DOWN,        "blk.%d.nextn.hc_down" },
+            { LLM_TENSOR_NEXTN_HC_UP,          "blk.%d.nextn.hc_up" },
         },
     },
     {
@@ -2403,6 +2410,7 @@ enum llama_mtp_package llama_model_mtp_package(const llama_model * model) {
     const bool has_common_package_contract =
         llama_model_is_step35(model) || llama_model_is_deepseek4(model) ||
         llama_model_is_qwen35_family(model) ||
+        model->arch == LLM_ARCH_QWEN4EXP ||
         llama_model_is_gemma4_mtp_assistant(model);
     if (!has_common_package_contract) {
         return n_nextn > 0 ? LLAMA_MTP_PACKAGE_EMBEDDED : LLAMA_MTP_PACKAGE_NONE;
@@ -2410,9 +2418,10 @@ enum llama_mtp_package llama_model_mtp_package(const llama_model * model) {
 
     if (n_nextn == 0) {
         if (llama_model_is_step35(model) || llama_model_is_deepseek4(model) ||
-            llama_model_is_qwen35_family(model)) {
+            llama_model_is_qwen35_family(model) || model->arch == LLM_ARCH_QWEN4EXP) {
             for (const auto & layer : model->layers) {
-                if (layer.attn_norm != nullptr) {
+                if (layer.attn_norm != nullptr ||
+                    (model->arch == LLM_ARCH_QWEN4EXP && layer.hc_attn_norm != nullptr)) {
                     return LLAMA_MTP_PACKAGE_TARGET_ONLY;
                 }
             }
@@ -2429,11 +2438,13 @@ enum llama_mtp_package llama_model_mtp_package(const llama_model * model) {
     // A Qwen3.5 NextN block loads eh_proj, attn_q and the MLP as optional, so none of them
     // marks a predictor tail on its own; enorm is required and is present in all of them.
     const bool has_tail = model->layers[first].nextn.eh_proj != nullptr ||
-        (llama_model_is_qwen35_family(model) && model->layers[first].nextn.enorm != nullptr);
+        ((llama_model_is_qwen35_family(model) || model->arch == LLM_ARCH_QWEN4EXP) &&
+         model->layers[first].nextn.enorm != nullptr);
 
     bool has_trunk = false;
     for (size_t il = 0; il < first; ++il) {
-        if (model->layers[il].attn_norm != nullptr) {
+        if (model->layers[il].attn_norm != nullptr ||
+            (model->arch == LLM_ARCH_QWEN4EXP && model->layers[il].hc_attn_norm != nullptr)) {
             has_trunk = true;
             break;
         }
@@ -2497,8 +2508,10 @@ bool llama_model_is_split_mode_graph(const struct llama_model * model) {
 }
 
 bool llama_model_supports_ctx_shift(const struct llama_model * model) {
-    // openPangu and DeepSeek4 keep position-dependent private state outside the generic KV cache.
-    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4;
+    // These architectures keep position-dependent state outside the generic KV cache or use
+    // multi-axis positions whose shift semantics are not represented by the public API.
+    return model && model->arch != LLM_ARCH_OPENPANGU && model->arch != LLM_ARCH_DEEPSEEK4 &&
+            model->arch != LLM_ARCH_QWEN4EXP;
 }
 
 bool llama_model_supports_partial_kv_reuse(const struct llama_model * model) {

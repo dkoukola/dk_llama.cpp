@@ -232,8 +232,14 @@ struct clip_hparams {
     void set_limit_image_tokens(int n_tokens_min, int n_tokens_max) {
         const int cur_merge = n_merge == 0 ? 1 : n_merge;
         const int patch_area = patch_size * patch_size * cur_merge * cur_merge;
-        image_min_pixels = (custom_image_min_tokens > 0 ? custom_image_min_tokens : n_tokens_min) * patch_area;
-        image_max_pixels = (custom_image_max_tokens > 0 ? custom_image_max_tokens : n_tokens_max) * patch_area;
+        set_limit_image_pixels(n_tokens_min * patch_area, n_tokens_max * patch_area);
+    }
+
+    void set_limit_image_pixels(int n_pixels_min, int n_pixels_max) {
+        const int cur_merge = n_merge == 0 ? 1 : n_merge;
+        const int patch_area = patch_size * patch_size * cur_merge * cur_merge;
+        image_min_pixels = custom_image_min_tokens > 0 ? custom_image_min_tokens * patch_area : n_pixels_min;
+        image_max_pixels = custom_image_max_tokens > 0 ? custom_image_max_tokens * patch_area : n_pixels_max;
         warmup_image_size = static_cast<int>(std::sqrt(image_max_pixels));
     }
 
@@ -3355,8 +3361,16 @@ struct clip_model_loader {
                         hparams.n_merge = 2; // default value for Qwen 2 and 2.5
                         get_u32(KEY_SPATIAL_MERGE_SIZE, hparams.n_merge, false);
                         get_u32(KEY_WIN_ATTN_PATTERN, hparams.n_wa_pattern, model.proj_type == PROJECTOR_TYPE_QWEN25VL); // only 2.5 requires it
-                        // ref: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/preprocessor_config.json
-                        hparams.set_limit_image_tokens(8, 4096);
+                        int image_min_pixels = -1;
+                        int image_max_pixels = -1;
+                        get_u32(KEY_IMAGE_MIN_PIXELS, image_min_pixels, false);
+                        get_u32(KEY_IMAGE_MAX_PIXELS, image_max_pixels, false);
+                        if (image_min_pixels > 0 && image_max_pixels > 0) {
+                            hparams.set_limit_image_pixels(image_min_pixels, image_max_pixels);
+                        } else {
+                            // Legacy Qwen-VL mmproj files do not carry processor pixel limits.
+                            hparams.set_limit_image_tokens(8, 4096);
+                        }
                         hparams.set_warmup_n_tokens(46*46); // avoid OOM on warmup
                         const int warn_min_pixels = 1024 * hparams.n_merge * hparams.n_merge * hparams.patch_size * hparams.patch_size;
                         if (hparams.image_min_pixels < warn_min_pixels) {
@@ -5746,6 +5760,10 @@ bool clip_is_qwen2vl(const struct clip_ctx * ctx) {
     return ctx->proj_type() == PROJECTOR_TYPE_QWEN2VL
         || ctx->proj_type() == PROJECTOR_TYPE_QWEN25VL
         || ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL;
+}
+
+bool clip_is_qwen3vl(const struct clip_ctx * ctx) {
+    return ctx->proj_type() == PROJECTOR_TYPE_QWEN3VL;
 }
 
 bool clip_is_llava(const struct clip_ctx * ctx) {

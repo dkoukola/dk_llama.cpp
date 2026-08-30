@@ -2,6 +2,7 @@
 #include "iqk/iqk_mul_mat.h"
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -157,6 +158,47 @@ bool check_task_owners() {
     return true;
 }
 
+bool check_short_inner_dimension() {
+    constexpr int nx = 8;
+    constexpr int ny = 1;
+    constexpr int k = 4;
+    std::array<float, nx*k + k> weights = {};
+    std::array<float, ny*k + k> input = { 0.5f, -1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f };
+    for (int row = 0; row < nx; ++row) {
+        for (int column = 0; column < k; ++column) {
+            weights[(size_t) row*k + column] = (float) ((row + 1)*(column + 1))/8.0f;
+        }
+    }
+    for (int column = 0; column < k; ++column) {
+        weights[(size_t) nx*k + column] = (float) (column + 9);
+    }
+
+    std::array<float, nx*ny> output;
+    output.fill(std::numeric_limits<float>::quiet_NaN());
+    if (!iqk_mul_mat(
+            nx, ny, k,
+            GGML_TYPE_F32, weights.data(), k*sizeof(float),
+            GGML_TYPE_F32, input.data(), k*sizeof(float),
+            output.data(), nx, 0, 1)) {
+        std::fprintf(stderr, "IQK F32 multiplication rejected a four-column input\n");
+        return false;
+    }
+
+    for (int row = 0; row < nx; ++row) {
+        float expected = 0.0f;
+        for (int column = 0; column < k; ++column) {
+            expected += weights[(size_t) row*k + column]*input[column];
+        }
+        if (!std::isfinite(output[row]) || std::abs(output[row] - expected) > 1e-6f) {
+            std::fprintf(stderr,
+                "IQK short F32 result mismatch at row %d: got %.9g, expected %.9g\n",
+                row, output[row], expected);
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 int main() {
@@ -166,6 +208,9 @@ int main() {
     }
     if (!available) {
         return 0;
+    }
+    if (!check_short_inner_dimension()) {
+        return 1;
     }
     return check_task_owners() ? 0 : 1;
 }

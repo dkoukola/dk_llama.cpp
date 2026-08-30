@@ -134,9 +134,14 @@ enum e_model {
 
 struct llama_layer_nextn {
     struct ggml_tensor * eh_proj          = nullptr;
+    struct ggml_tensor * e_proj           = nullptr;
+    struct ggml_tensor * h_proj           = nullptr;
     struct ggml_tensor * embed_tokens     = nullptr;
     struct ggml_tensor * enorm            = nullptr;
     struct ggml_tensor * hnorm            = nullptr;
+    struct ggml_tensor * hc_norm          = nullptr;
+    struct ggml_tensor * hc_down          = nullptr;
+    struct ggml_tensor * hc_up            = nullptr;
     struct ggml_tensor * shared_head_head = nullptr;
     struct ggml_tensor * shared_head_norm = nullptr;
 };
