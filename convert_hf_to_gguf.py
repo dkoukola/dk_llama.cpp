@@ -2507,6 +2507,12 @@ class Qwen4ExpModel(Qwen2MoeModel):
                     continue
             yield name, data_torch
 
+    def set_vocab(self):
+        super().set_vocab()
+        if self.mtp_only and gguf.Keys.Tokenizer.BOS_ID not in self.gguf_writer.kv_data[0]:
+            if (bos_token_id := self.hparams.get("bos_token_id")) is not None:
+                self.gguf_writer.add_bos_token_id(int(bos_token_id))
+
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hp = self.hparams

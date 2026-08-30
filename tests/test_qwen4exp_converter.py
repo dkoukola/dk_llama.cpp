@@ -243,6 +243,30 @@ def test_qwen4exp_embeds_one_mtp_tail_in_block_metadata(tmp_path):
     assert metadata["qwen4exp.attention.compress_ratios"].value == [0, 0, 0, 2, 2]
 
 
+def test_qwen4exp_standalone_mtp_fills_missing_bos_from_text_config(tmp_path, monkeypatch):
+    config = minimal_config()
+    config["text_config"]["bos_token_id"] = 7
+    config["text_config"]["mtp_num_hidden_layers"] = 1
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    monkeypatch.setattr(Qwen2MoeModel, "set_vocab", lambda self: None)
+
+    Qwen4ExpModel.mtp_only = True
+    try:
+        model = Qwen4ExpModel(
+            tmp_path,
+            gguf.LlamaFileType.MOSTLY_F16,
+            tmp_path / "mtp.gguf",
+        )
+        model.set_vocab()
+        assert model.gguf_writer.kv_data[0]["tokenizer.ggml.bos_token_id"].value == 7
+
+        model.gguf_writer.add_bos_token_id(3)
+        model.set_vocab()
+        assert model.gguf_writer.kv_data[0]["tokenizer.ggml.bos_token_id"].value == 3
+    finally:
+        Qwen4ExpModel.mtp_only = False
+
+
 def test_qwen4exp_standalone_mtp_selects_only_io_and_predictor_tensors(tmp_path):
     config = minimal_config()
     config["text_config"]["mtp_num_hidden_layers"] = 1
