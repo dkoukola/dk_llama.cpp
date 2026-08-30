@@ -1,11 +1,63 @@
-# NUMA-mirrored ik_llama.cpp
+# dk_llama.cpp
 
-This is a fork of [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp) — itself a
-performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp) (see the
-original README below) — that adds a **`--numa mirror`** mode for fast CPU inference on
-multi-socket / multi-NUMA-node servers.
+`dk_llama.cpp` is a maintained downstream fork of
+[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), which is itself a
+performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp). It regularly
+merges `upstream/main` while carrying additional CPU, NUMA, state-management, speculative
+decoding, and model-integration work used in production deployments.
 
-## What it does
+## What this fork adds
+
+- **NUMA-scaled CPU inference:** `--numa mirror` provides node-local copies of model weights
+  and the KV cache, NUMA-local thread placement, selective `weights`/`kv` mirroring, and a
+  hierarchical token-generation barrier.
+- **An installable speculative-decoding API:** optional `libllama-speculative` builds expose
+  speculative sessions, checkpoint/rollback state, generation and acceptance metrics, and
+  companion draft-model integration to external runtimes.
+- **DeepSeek-V4 and DSpark integration:** additional DSpark runtime support, verifier-token
+  handling, and compact whole-context state persistence.
+- **Qwen3.8 Flash Next extensions:** text-model and image-projector conversion, canonical
+  PLE/QSA/M-RoPE cache state, embedded and companion MTP packages, speculative-bridge
+  integration, and tested CPU and CUDA execution paths.
+- **Runtime observability and hardening:** context allocation reporting plus additional CPU,
+  IQK, NUMA, state-restore, quantization, and speculative-decoding correctness and performance
+  work.
+
+These are downstream extensions, not an ABI or behavioral compatibility guarantee. Pin a
+commit for reproducible deployments and build consumers against the matching revision.
+
+## Upstream synchronization
+
+The canonical upstream is [ikawrakow/ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp).
+Its `main` branch is merged periodically while downstream commits and their attribution are
+retained. Synchronization is best effort rather than continuous.
+
+## Lineage and credit
+
+NUMA mirror mode—per-node weight/KV replication, NUMA-local thread placement, and the
+hierarchical token-generation barrier—was originally designed, implemented, and benchmarked
+by [Mike Chambers (@mikechambers84)](https://github.com/mikechambers84), based on his
+[original `numa-mirror` branch](https://github.com/mikechambers84/ik_llama.cpp/tree/numa-mirror).
+The work began with
+[weight mirroring](https://github.com/mikechambers84/ik_llama.cpp/commit/4f5eddf40cc299a8a8a8ebe95dde0ef64db8b411),
+then added KV mirroring, the hierarchical barrier, component selection, benchmarks, and
+[state/KV coherence hardening](https://github.com/mikechambers84/ik_llama.cpp/commit/ffa517ec8c0fe76b0170c9c9af3395d904af42dc).
+
+This fork has since extended that foundation with affinity and decode-threading fixes,
+high-thread projection balancing, memory reporting, and model-specific exclusions while
+preserving the original commit authorship. Thanks also to ikawrakow and every upstream
+`ik_llama.cpp` and `llama.cpp` contributor whose work this repository builds upon.
+
+## Get this fork
+
+```bash
+git clone https://github.com/dkoukola/dk_llama.cpp
+cd dk_llama.cpp
+```
+
+## NUMA mirror
+
+### How it works
 
 On a multi-socket machine, plain CPU inference scales poorly: the model weights live on one
 NUMA node, so threads running on another socket read them *remotely* over the inter-socket
@@ -13,25 +65,26 @@ link (UPI / Infinity Fabric). That cross-socket traffic becomes the bottleneck �
 second socket's cores often gives little speedup, and can even make **token generation
 slower** than using a single socket.
 
-`--numa mirror` fixes this by keeping one **full, node-local copy** of the read-mostly data
-on **every NUMA node**:
+`--numa mirror` fixes this by keeping a node-local copy of the selected read-mostly data on
+every NUMA node:
 
 - **Model weights** are duplicated once per node.
 - **The KV cache** is duplicated once per node (writes are replicated to all copies; reads
   stay local).
-- **Inference threads are pinned per node** and only ever touch their node-local copies, so
-  no model data is read across the inter-socket link.
+- **Inference threads are pinned per node** and read mirrored weights and KV data from their
+  node-local copies; other runtime data can remain shared.
 - A **NUMA-aware hierarchical barrier** keeps the per-op thread synchronization (otherwise a
   major cross-socket cost during token generation) from becoming the new bottleneck.
 
-Each socket then runs at its full *local* memory bandwidth, so a multi-socket box can
-actually put all of its sockets to work. The gain is largest for **token generation**
-(memory-bandwidth bound) and more modest for prompt processing (compute bound).
+Each socket can then serve mirrored weight/KV reads from local memory and contribute its
+memory bandwidth. The measured gain is largest for **token generation** (memory-bandwidth
+bound) and more modest for prompt processing (compute bound).
 
-The trade-off is memory: mirroring uses **N× RAM** (N = number of NUMA nodes), so the model
-has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`.
+The trade-off is memory: with N NUMA nodes, selected components occupy roughly N copies, or
+about `(N - 1) ×` their size in additional memory. Weight mirroring requires owned writable
+buffers and therefore forces `--no-mmap`; KV-only mirroring does not duplicate weights.
 
-## How to use it
+### How to use it
 
 ```
 # auto-detect the NUMA nodes and mirror weights + KV across all of them
@@ -44,15 +97,15 @@ has to fit that many times. Because of this, `--numa mirror` implies `--no-mmap`
   `none` — e.g. `--numa-mirror weights` to mirror only the weights. This component selector is
   available in the main tools (`llama-cli`, `llama-server`, …); `llama-bench` accepts
   `--numa mirror` only and always mirrors everything (`weights` + `kv`).
-- **Requirements:** Linux, more than one NUMA node, and enough RAM to hold the model N times.
-  For best results, disable kernel auto-balancing:
+- **Requirements:** Linux, more than one NUMA node, and enough RAM for the selected mirrored
+  components on every node. For best results, disable kernel auto-balancing:
   `echo 0 | sudo tee /proc/sys/kernel/numa_balancing`.
 - **Thread count:** token generation is memory-bandwidth bound and may peak *below* the full
   physical-core count; it can be worth sweeping `-t` to find the sweet spot for your machine.
 
 See [`examples/main/README.md`](examples/main/README.md) for the full list of `--numa` modes.
 
-# NUMA mode benchmarks
+### NUMA mode benchmarks
 
 How much does **`--numa mirror`** speed up CPU inference on a dual-socket server, versus
 running on a single socket?
@@ -62,9 +115,9 @@ single NUMA node's RAM — which every model below does on this machine (384 GB/
 `isolate` is the usual recommended mode, because it keeps all memory access node-local.
 (`--numa distribute` exists for models too large to fit in one node; that's not the case
 here, so it isn't included.) `mirror` keeps a full local copy of the weights and KV cache on
-*each* node, so both sockets can run while still reading only local memory.
+*each* node, so both sockets can read mirrored weights and KV data locally.
 
-## Test setup
+#### Test setup
 
 - **Operating System:**
   - Debian 13 "Trixie" with `numa_balancing` disabled during benchmarking
@@ -84,7 +137,7 @@ here, so it isn't included.) `mirror` keeps a full local copy of the weights and
 
 All throughput numbers are tokens/second (higher is better).
 
-## Token generation (tg128)
+#### Token generation (tg128)
 
 | Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
 |---|--:|--:|--:|
@@ -95,7 +148,7 @@ All throughput numbers are tokens/second (higher is better).
 | Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 24.70 | **31.56** | 1.28× |
 | Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 10.00 | **14.46** | 1.45× |
 
-## Prompt processing (pp512)
+#### Prompt processing (pp512)
 
 | Model | isolate (1 socket, 24t) | **mirror (2 sockets, 48t)** | mirror vs isolate |
 |---|--:|--:|--:|
@@ -106,7 +159,7 @@ All throughput numbers are tokens/second (higher is better).
 | Qwen3.6-35B-A3B (MoE, UD-Q5_K_M) | 153.68 | **193.21** | 1.26× |
 | Qwen3.5-122B-A10B (MoE, UD-Q3_K_XL) | 57.17 | **83.01** | 1.45× |
 
-## Takeaways
+#### Takeaways
 
 - **`mirror` puts the second socket to work.** Across dense and MoE models (3.4 GB → 53 GB),
   it beats a single socket on every model for both metrics — the lone exception being prompt
@@ -118,11 +171,11 @@ All throughput numbers are tokens/second (higher is better).
 - **Prompt processing: ~1.0–1.65× `isolate`.** PP is more compute-bound (it amortizes weight
   reads across the batch), so the gain is generally smaller than TG, but still a solid win on
   the larger models where there's enough work to feed both sockets.
-- **Trade-off:** `mirror` keeps one copy of the weights + KV cache per NUMA node, i.e.
-  **N× RAM** (here 2×). It's the right mode when the model fits a node's RAM with room to
-  spare; if it doesn't, that's the case `--numa distribute` is for.
+- **Trade-off:** the default `all` mode keeps one copy of mirrored weights and KV data per
+  NUMA node (two copies on this machine). It is appropriate when those components fit each
+  node's RAM with room to spare; otherwise use `--numa distribute` or select fewer components.
 
-### Raw `llama-bench` output
+#### Raw `llama-bench` output
 
 Each run used `-rtr 1 -b 16 -ub 16 -p 512 -n 128 -r 3` with the mode-specific `--numa` and
 `-t` settings above.
@@ -144,7 +197,12 @@ Each run used `-rtr 1 -b 16 -ub 16 -p 512 -n 128 -r 3` with the mode-specific `-
 
 ---
 
-# ik_llama.cpp: llama.cpp fork with better CPU performance
+# Upstream ik_llama.cpp documentation
+
+> [!IMPORTANT]
+> The remainder is inherited from canonical `ik_llama.cpp`. Its clone URLs, release links,
+> and published container images refer to the upstream project and do not include this fork's
+> downstream additions. Use [Get this fork](#get-this-fork) above for this repository.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
