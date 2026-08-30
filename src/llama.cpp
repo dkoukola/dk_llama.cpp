@@ -12004,59 +12004,77 @@ struct llama_data_read {
         }
     }
 
-    void read_output_ids(struct llama_context * ctx) {
+    void read_outputs(struct llama_context * ctx) {
         std::vector<int32_t> output_pos;
 
         uint32_t n_outputs;
         read_to(&n_outputs, sizeof(n_outputs));
-
-        if (n_outputs > llama_output_reserve(*ctx, n_outputs)) {
+        if (n_outputs > INT32_MAX || n_outputs > ctx->cparams.n_batch ||
+            n_outputs > llama_output_reserve(*ctx, n_outputs)) {
             throw std::runtime_error("could not reserve outputs");
         }
-
         if (n_outputs) {
             output_pos.resize(n_outputs);
             read_to(output_pos.data(), n_outputs * sizeof(int32_t));
-
-            for (int32_t i = 0; i < (int32_t) output_pos.size(); ++i) {
-                int32_t id = output_pos[i];
+            for (size_t i = 0; i < output_pos.size(); ++i) {
+                const int32_t id = output_pos[i];
                 if ((uint32_t) id >= ctx->cparams.n_batch) {
                     throw std::runtime_error(format("invalid output id, %d does not fit in batch size of %u", id, ctx->cparams.n_batch));
                 }
-                ctx->output_ids[id] = i;
             }
-
-            ctx->n_outputs = n_outputs;
         }
-    }
 
-    void read_logits(struct llama_context * ctx) {
         uint64_t logits_size;
         read_to(&logits_size, sizeof(logits_size));
-
-        if (ctx->logits_size < logits_size) {
+        const uint64_t max_logits_size = (uint64_t) n_outputs * ctx->model.hparams.n_vocab;
+        if (logits_size > max_logits_size || logits_size > SIZE_MAX / sizeof(float) ||
+            ctx->logits_size < logits_size) {
             throw std::runtime_error("logits buffer too small");
         }
-
         if (logits_size) {
             read_to(ctx->logits, logits_size * sizeof(float));
         }
-    }
 
-    void read_embeddings(struct llama_context * ctx) {
         uint64_t embeddings_size;
         read_to(&embeddings_size, sizeof(embeddings_size));
-
-        if (ctx->embd_size < embeddings_size) {
-            throw std::runtime_error("embeddings buffer too small");
-        }
 
         const uint64_t row_width = llama_output_embd_width(*ctx);
         if (row_width == 0 || (embeddings_size % row_width) != 0) {
             throw std::runtime_error("invalid embeddings payload size");
         }
 
-        ctx->n_outputs_embd = embeddings_size / row_width;
+        const uint64_t n_outputs_embd = embeddings_size / row_width;
+        if (n_outputs_embd > INT32_MAX || n_outputs_embd > ctx->cparams.n_batch ||
+            embeddings_size > SIZE_MAX / sizeof(float)) {
+            throw std::runtime_error("too many embedding outputs");
+        }
+        const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
+        std::vector<float> logits;
+        if (ctx->output_size < required_outputs || ctx->embd_size < embeddings_size) {
+            if (logits_size) {
+                logits.assign(ctx->logits, ctx->logits + logits_size);
+            }
+            if (required_outputs > llama_output_reserve(*ctx, required_outputs)) {
+                throw std::runtime_error("could not reserve outputs");
+            }
+            if (ctx->logits_size < logits_size) {
+                throw std::runtime_error("logits buffer too small");
+            }
+        }
+        if (ctx->embd_size < embeddings_size) {
+            throw std::runtime_error("embeddings buffer too small");
+        }
+
+        for (size_t i = 0; i < output_pos.size(); ++i) {
+            const int32_t id = output_pos[i];
+            ctx->output_ids[id] = (int32_t) i;
+        }
+        ctx->n_outputs = (int32_t) n_outputs;
+        if (!logits.empty()) {
+            memcpy(ctx->logits, logits.data(), logits_size * sizeof(float));
+        }
+
+        ctx->n_outputs_embd = (int32_t) n_outputs_embd;
 
         if (embeddings_size) {
             read_to(ctx->embd, embeddings_size * sizeof(float));
@@ -13211,9 +13229,7 @@ static size_t llama_state_set_data_internal(struct llama_context * ctx, llama_da
     data_ctx.read_rng(ctx->sampling.rng);
 
     // set outputs
-    data_ctx.read_output_ids(ctx);
-    data_ctx.read_logits(ctx);
-    data_ctx.read_embeddings(ctx);
+    data_ctx.read_outputs(ctx);
 
     data_ctx.read_kv_cache(ctx);
 

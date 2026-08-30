@@ -58,17 +58,30 @@ static model_ptr load_model(const char * path) {
     return model_ptr(llama_model_load_from_file(path, params), llama_free_model);
 }
 
-static context_ptr make_context(llama_model * model) {
+static llama_context_params make_context_params(uint32_t n_seq_max) {
     llama_context_params params = llama_context_default_params();
     const uint32_t hardware_threads = std::thread::hardware_concurrency();
     const uint32_t test_threads = std::min<uint32_t>(hardware_threads > 0 ? hardware_threads : 8, 64);
     params.n_ctx           = TEST_CONTEXT_SIZE;
     params.n_batch         = TEST_BATCH_SIZE;
     params.n_ubatch        = TEST_BATCH_SIZE;
-    params.n_seq_max       = TEST_N_SEQ;
+    params.n_seq_max       = n_seq_max;
     params.n_threads       = test_threads;
     params.n_threads_batch = test_threads;
     params.flash_attn      = true;
+    return params;
+}
+
+static context_ptr make_context(llama_model * model) {
+    llama_context_params params = make_context_params(TEST_N_SEQ);
+    return context_ptr(llama_init_from_model(model, params), llama_free);
+}
+
+static context_ptr make_mtp_context(llama_model * model, bool embeddings) {
+    llama_context_params params = make_context_params(1);
+    params.embeddings  = embeddings;
+    params.mtp         = true;
+    params.mtp_op_type = MTP_OP_NONE;
     return context_ptr(llama_init_from_model(model, params), llama_free);
 }
 
@@ -189,6 +202,20 @@ static void check_logits_equal(const std::vector<float> & expected, const std::v
     std::abort();
 }
 
+static std::vector<float> copy_embeddings(
+        llama_context * ctx, int32_t n_outputs, uint32_t width) {
+    CHECK(n_outputs >= 0);
+    std::vector<float> result;
+    result.reserve((size_t) n_outputs * width);
+    for (int32_t i = 0; i < n_outputs; ++i) {
+        const int32_t index = i - n_outputs;
+        const float * data = llama_get_embeddings_ith(ctx, index);
+        CHECK(data != nullptr);
+        result.insert(result.end(), data, data + width);
+    }
+    return result;
+}
+
 static std::vector<uint8_t> save_state(llama_context * ctx) {
     const size_t size = llama_state_get_size(ctx);
     CHECK(size > 0);
@@ -264,6 +291,49 @@ static void check_continuation(
         decode_tokens(ctx, { continuation[i] }, pos + (llama_pos) i, seq_id, false);
         check_logits_equal(expected_logits[i], copy_logits(ctx, 0, n_vocab));
     }
+}
+
+static void check_mtp_whole_state_round_trip(
+        llama_model * model,
+        const std::vector<llama_token> & prompt,
+        llama_token continuation,
+        int32_t n_vocab,
+        bool embeddings) {
+    const uint32_t width = llama_model_mtp_feature_width(model);
+    CHECK(width > 0);
+
+    context_ptr original = make_mtp_context(model, embeddings);
+    CHECK(original != nullptr);
+    decode_tokens(original.get(), prompt, 0, 0, false);
+    CHECK(original->n_outputs == 1);
+    CHECK(original->n_outputs_embd == (int32_t) prompt.size());
+
+    const int32_t prompt_output = (int32_t) prompt.size() - 1;
+    const std::vector<float> prompt_logits = copy_logits(original.get(), prompt_output, n_vocab);
+    const std::vector<float> prompt_embeddings =
+            copy_embeddings(original.get(), original->n_outputs_embd, width);
+    const std::vector<uint8_t> whole_state = save_state(original.get());
+
+    decode_tokens(original.get(), { continuation }, (llama_pos) prompt.size(), 0, false);
+    const std::vector<float> continuation_logits = copy_logits(original.get(), 0, n_vocab);
+    const std::vector<float> continuation_embeddings =
+            copy_embeddings(original.get(), original->n_outputs_embd, width);
+
+    context_ptr restored = make_mtp_context(model, embeddings);
+    CHECK(restored != nullptr);
+    CHECK(restored->output_size < prompt.size());
+    CHECK(llama_state_set_data(
+            restored.get(), whole_state.data(), whole_state.size()) == whole_state.size());
+    CHECK(restored->n_outputs == 1);
+    CHECK(restored->n_outputs_embd == (int32_t) prompt.size());
+    check_logits_equal(prompt_logits, copy_logits(restored.get(), prompt_output, n_vocab));
+    CHECK(copy_embeddings(restored.get(), restored->n_outputs_embd, width) == prompt_embeddings);
+    CHECK(save_state(restored.get()) == whole_state);
+
+    decode_tokens(restored.get(), { continuation }, (llama_pos) prompt.size(), 0, false);
+    check_logits_equal(continuation_logits, copy_logits(restored.get(), 0, n_vocab));
+    CHECK(copy_embeddings(restored.get(), restored->n_outputs_embd, width) == continuation_embeddings);
+    CHECK(tokens_for_seq(restored.get(), 0) == tokens_for_seq(original.get(), 0));
 }
 
 static void check_lifecycle(llama_context * ctx, const std::vector<llama_token> & prompt) {
@@ -373,6 +443,11 @@ int main(int argc, char ** argv) {
             all_tokens.begin() + TEST_PROMPT_SIZE,
             all_tokens.begin() + TEST_PROMPT_SIZE + TEST_NEXT_SIZE);
 
+    const int32_t n_vocab = llama_n_vocab(model.get());
+    // MTP requires hidden outputs regardless of the ordinary embeddings flag.
+    check_mtp_whole_state_round_trip(model.get(), prompt, continuation[0], n_vocab, false);
+    check_mtp_whole_state_round_trip(model.get(), prompt, continuation[0], n_vocab, true);
+
     context_ptr original = make_context(model.get());
     CHECK(original != nullptr);
     CHECK(llama_supports_full_state_io(original.get()));
@@ -399,7 +474,6 @@ int main(int argc, char ** argv) {
     CHECK(llama_state_seq_save_file(
             original.get(), sequence_file.path.string().c_str(), 0, prompt.data(), prompt.size()) > 0);
 
-    const int32_t n_vocab = llama_n_vocab(model.get());
     std::vector<std::vector<float>> expected_logits;
     expected_logits.reserve(continuation.size());
     for (size_t i = 0; i < continuation.size(); ++i) {
