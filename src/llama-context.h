@@ -233,6 +233,7 @@ struct llama_kv_cache {
         bool qwen4exp_per_step_invalid = false;
         int32_t qwen4exp_per_step_max_tokens = 0;
         int32_t qwen4exp_per_step_n_tokens = 0;
+        uint32_t qwen4exp_per_step_numa_threads = 0;
         llama_seq_id qwen4exp_per_step_seq_id = -1;
         llama_pos qwen4exp_per_step_first_pos = -1;
         size_t qwen4exp_per_step_base_bytes = 0;

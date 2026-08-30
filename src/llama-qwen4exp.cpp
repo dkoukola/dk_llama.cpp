@@ -8,10 +8,16 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#if defined(__gnu_linux__)
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -25,6 +31,121 @@ static bool qwen4exp_is_target_context(const llama_context & ctx) {
     return ctx.model.arch == LLM_ARCH_QWEN4EXP &&
             ctx.cparams.mtp_op_type == MTP_OP_NONE &&
             llama_model_mtp_package(&ctx.model) != LLAMA_MTP_PACKAGE_COMPANION;
+}
+
+// Per-step checkpoint writers partition every logical step into contiguous
+// work units. Keep each node's units local to the threads that fill them. Bind
+// only complete pages so a tensor boundary shared with a base shadow remains
+// on the node where it was first touched.
+static size_t qwen4exp_numa_bind_step_tensor(
+        ggml_tensor * tensor,
+        int32_t n_steps,
+        uint32_t n_threads,
+        size_t unit_bytes) {
+#if defined(__gnu_linux__)
+    if (!ggml_numa_mirror_active() || tensor == nullptr || n_steps <= 0 || n_threads == 0 ||
+            unit_bytes == 0 ||
+            tensor->data == nullptr || tensor->buffer == nullptr ||
+            !ggml_backend_buffer_is_host(tensor->buffer)) {
+        return 0;
+    }
+
+    const int32_t n_nodes = ggml_numa_node_count();
+    const long page_size_value = sysconf(_SC_PAGESIZE);
+    const size_t n_bytes = ggml_nbytes(tensor);
+    if (n_nodes <= 1 || page_size_value <= 0 || n_bytes % (size_t) n_steps != 0) {
+        return 0;
+    }
+
+    const size_t page_size = (size_t) page_size_value;
+    const size_t step_bytes = n_bytes / (size_t) n_steps;
+    if (step_bytes % unit_bytes != 0) {
+        return 0;
+    }
+    const size_t work_units = step_bytes / unit_bytes;
+    const size_t units_per_thread = (work_units + n_threads - 1) / n_threads;
+    const uintptr_t tensor_begin = (uintptr_t) tensor->data;
+    size_t bound_bytes = 0;
+
+    for (int32_t step = 0; step < n_steps; ++step) {
+        const size_t step_begin = (size_t) step * step_bytes;
+        for (int32_t node = 0; node < n_nodes; ++node) {
+            const size_t first_thread =
+                    ((size_t) node * n_threads + (size_t) n_nodes - 1) / (size_t) n_nodes;
+            const size_t last_thread =
+                    ((size_t) (node + 1) * n_threads + (size_t) n_nodes - 1) / (size_t) n_nodes;
+            const size_t first_unit = std::min(first_thread * units_per_thread, work_units);
+            const size_t last_unit = std::min(last_thread * units_per_thread, work_units);
+            uintptr_t begin = tensor_begin + step_begin + first_unit * unit_bytes;
+            uintptr_t end = tensor_begin + step_begin + last_unit * unit_bytes;
+            const uintptr_t begin_remainder = begin % page_size;
+            if (begin_remainder != 0) {
+                begin += page_size - begin_remainder;
+            }
+            end -= end % page_size;
+            if (begin >= end) {
+                continue;
+            }
+            ggml_numa_bind((void *) begin, (size_t) (end - begin), node);
+            bound_bytes += (size_t) (end - begin);
+        }
+    }
+    return bound_bytes;
+#else
+    (void) tensor;
+    (void) n_steps;
+    (void) n_threads;
+    (void) unit_bytes;
+    return 0;
+#endif
+}
+
+static size_t qwen4exp_numa_bind_step_checkpoints(
+        llama_context & ctx,
+        uint32_t n_threads) {
+    auto & ckpt = ctx.kv_self.ckpt;
+    const llama_hparams & hparams = ctx.model.hparams;
+    const size_t head_v = (size_t) hparams.ssm_d_inner / (size_t) hparams.ssm_dt_rank;
+    const size_t ssm_unit_bytes = head_v * head_v * sizeof(float);
+    const size_t conv_unit_bytes = (size_t) (hparams.ssm_d_conv - 1) * sizeof(float);
+    size_t bound_bytes = 0;
+    for (const auto & layer : ckpt.per_step_ssm) {
+        for (ggml_tensor * tensor : layer) {
+            bound_bytes += qwen4exp_numa_bind_step_tensor(
+                    tensor, ckpt.per_step_max_allocated - 1, n_threads, ssm_unit_bytes);
+        }
+    }
+    for (const auto & layer : ckpt.per_step_conv) {
+        for (ggml_tensor * tensor : layer) {
+            bound_bytes += qwen4exp_numa_bind_step_tensor(
+                    tensor, ckpt.per_step_max_allocated, n_threads, conv_unit_bytes);
+        }
+    }
+    for (ggml_tensor * tensor : ckpt.qwen4exp_per_step_ple) {
+        bound_bytes += qwen4exp_numa_bind_step_tensor(
+                tensor, ckpt.qwen4exp_per_step_max_tokens - 1, n_threads, sizeof(float));
+    }
+    return bound_bytes;
+}
+
+static void qwen4exp_numa_ensure_step_checkpoint_layout(llama_context & ctx) {
+    auto & ckpt = ctx.kv_self.ckpt;
+    const uint32_t n_threads = ctx.cparams.n_threads_batch;
+    if (!ggml_numa_mirror_active() || n_threads == 0 ||
+            ckpt.qwen4exp_per_step_numa_threads == n_threads) {
+        return;
+    }
+    if (ctx.sched != nullptr) {
+        ggml_backend_sched_synchronize(ctx.sched);
+    }
+    const size_t requested_bytes = qwen4exp_numa_bind_step_checkpoints(ctx, n_threads);
+    ckpt.qwen4exp_per_step_numa_threads = n_threads;
+    if (requested_bytes > 0) {
+        LLAMA_LOG_INFO("%s: requested NUMA-local placement for %8.2f MiB of per-step checkpoint pages "
+                "across %d nodes using %u threads\n",
+                __func__, requested_bytes / (1024.0 * 1024.0),
+                ggml_numa_node_count(), n_threads);
+    }
 }
 
 static bool qwen4exp_batch_seq_id(
@@ -343,6 +464,7 @@ void llama_kv_cache::gpu_checkpoint::release_qwen4exp_per_step() {
     qwen4exp_per_step_invalid = false;
     qwen4exp_per_step_max_tokens = 0;
     qwen4exp_per_step_n_tokens = 0;
+    qwen4exp_per_step_numa_threads = 0;
     qwen4exp_per_step_seq_id = -1;
     qwen4exp_per_step_first_pos = -1;
     qwen4exp_per_step_base_bytes = 0;
@@ -493,8 +615,13 @@ bool llama_qwen4exp_spec_ckpt_save(llama_context * ctx, llama_seq_id seq_id) {
     ckpt.qwen4exp_per_step_n_tokens = 0;
     ckpt.qwen4exp_per_step_first_pos = -1;
     ckpt.qwen4exp_per_step_seq_id = seq_id;
-    if (!ckpt.qwen4exp_per_step_allocated || seq_id < 0 ||
-            !qwen4exp_copy_base(*ctx, false)) {
+    if (!ckpt.qwen4exp_per_step_allocated || seq_id < 0) {
+        ckpt.qwen4exp_per_step_seq_id = -1;
+        ckpt.qwen4exp_per_step_first_pos = -1;
+        return false;
+    }
+    qwen4exp_numa_ensure_step_checkpoint_layout(*ctx);
+    if (!qwen4exp_copy_base(*ctx, false)) {
         ckpt.qwen4exp_per_step_seq_id = -1;
         ckpt.qwen4exp_per_step_first_pos = -1;
         return false;
@@ -541,6 +668,7 @@ bool llama_qwen4exp_spec_ckpt_begin_capture(llama_context * ctx, const llama_bat
         }
     }
 
+    qwen4exp_numa_ensure_step_checkpoint_layout(*ctx);
     ckpt.qwen4exp_per_step_invalid = false;
     ckpt.qwen4exp_per_step_first_pos = first_pos;
     return true;
