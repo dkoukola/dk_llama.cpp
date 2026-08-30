@@ -12044,8 +12044,7 @@ struct llama_data_read {
         }
 
         const uint64_t n_outputs_embd = embeddings_size / row_width;
-        if (n_outputs_embd > INT32_MAX || n_outputs_embd > ctx->cparams.n_batch ||
-            embeddings_size > SIZE_MAX / sizeof(float)) {
+        if (n_outputs_embd > INT32_MAX || embeddings_size > SIZE_MAX / sizeof(float)) {
             throw std::runtime_error("too many embedding outputs");
         }
         const size_t required_outputs = std::max<size_t>(n_outputs, n_outputs_embd);
