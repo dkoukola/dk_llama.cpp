@@ -245,6 +245,27 @@ bool indexed_fa_compatible(
         indexed_fa_types_supported(type_k, type_v, Dk, Dv) && indexed_fa_dims_supported(Dk, Dv) &&
         (neq1 != 1 || neq2 <= 256);
 }
+
+// Qwen3.8-Next decode has up to 65 selected 32-row blocks and 32 workers per KV head.
+inline bool indexed_qwen_scalar_split_k(
+        ggml_type type_k,
+        ggml_type type_v,
+        int neq2,
+        int neq1,
+        int nek2,
+        int nev2,
+        int Dk,
+        int Dv,
+        int index_width,
+        int nth) {
+    const bool supported_types =
+        (type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16) ||
+        (type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q8_0);
+    return supported_types &&
+        neq2 == 24 && neq1 == 1 && nek2 == 2 && nev2 == 2 &&
+        Dk == 256 && Dv == 256 && nth == 64 &&
+        index_width == 2080;
+}
 }
 
 size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
@@ -263,9 +284,16 @@ size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
         auto row_size_k = ggml_row_size(K->type, K->ne[0]);
         auto row_size_v = ggml_row_size(V->type, V->ne[0]);
         if (Q->ne[1] == 1) {
-            return (row_size_k * K->ne[2] + row_size_v * V->ne[2] +
-                    sizeof(ggml_fp16_t) * K->ne[2]) * indexer->ne[0]
-                + 512 * sizeof(float);
+            const size_t packed_size = (row_size_k * K->ne[2] + row_size_v * V->ne[2] +
+                    sizeof(ggml_fp16_t) * K->ne[2]) * indexer->ne[0];
+            if (indexed_qwen_scalar_split_k(
+                        K->type, V->type,
+                        Q->ne[2], Q->ne[1], K->ne[2], V->ne[2],
+                        K->ne[0], V->ne[0], indexer->ne[0], nth)) {
+                return packed_size +
+                    size_t(V->ne[0] + 16)*(Q->ne[2]/K->ne[2])*nth*sizeof(float);
+            }
+            return packed_size + 512*sizeof(float);
         }
         return (row_size_k + row_size_v + sizeof(ggml_fp16_t)) * indexer->ne[0] * nth;
     }
@@ -354,11 +382,11 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 team_rank = ith - team_first;
             }
 
-            auto pack_head = [&](int ikv, int first_j, int step_j) {
+            auto pack_head = [&](int ikv, int first_j, int last_j, int step_j) {
                 auto head_k = work_k + row_size_k*ikv*index_width;
                 auto head_v = work_v + row_size_v*ikv*index_width;
                 auto head_m = work_m + ikv*index_width;
-                for (int j = first_j; j < index_width; j += step_j) {
+                for (int j = first_j; j < last_j; j += step_j) {
                     if (idx[j] >= 0) {
                         GGML_ASSERT(idx[j] < nek1);
                         std::memcpy(head_k + row_size_k*j,
@@ -378,11 +406,87 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 }
             };
 
+            const int packed_rows = last_found < 0 ? 0 : GGML_PAD(last_found + 1, 32);
+            const bool split_k = team_size > 0 && indexed_qwen_scalar_split_k(
+                    ggml_type(int_type_k_in), ggml_type(int_type_v),
+                    neq2, neq1, nek2, nev2, Dk, Dv, index_width, nth) &&
+                packed_rows/32 >= team_size;
+            if (split_k) {
+                const int n_blocks = packed_rows/32;
+                const int blocks_per_thread = n_blocks/team_size;
+                const int extra_blocks = n_blocks % team_size;
+                const int first_block = team_rank*blocks_per_thread +
+                    std::min(team_rank, extra_blocks);
+                const int block_count = blocks_per_thread + (team_rank < extra_blocks);
+                const int first_row = 32*first_block;
+                const int this_rows = 32*block_count;
+                pack_head(team_head, first_row, first_row + this_rows, 1);
+
+                const size_t packed_size = (row_size_k*nek2 + row_size_v*nev2 +
+                        sizeof(ggml_fp16_t)*nek2)*index_width;
+                const size_t partial_stride = size_t(Dv + 16)*q_per_kv;
+                auto result_buffer = (float *) ((char *) work_buffer_in + packed_size);
+                auto partial = result_buffer + ith*partial_stride;
+                auto partial_m = partial + Dv*q_per_kv;
+                auto partial_s = partial_m + q_per_kv;
+                auto partial_status = partial_s + q_per_kv;
+                const int query_first = team_head*q_per_kv;
+                const auto this_q = (const char *) q + query_first*nbq2;
+                const auto this_k = work_k + row_size_k*(team_head*index_width + first_row);
+                const auto this_v = k == v ? this_k :
+                    work_v + row_size_v*(team_head*index_width + first_row);
+                const auto this_m = work_m + team_head*index_width + first_row;
+                partial_status[0] = iqk_flash_attn_impl(
+                        int_type_k_in, int_type_v,
+                        Dk, Dv, q_per_kv, this_rows,
+                        nbq2, row_size_k, row_size_v, 0, Dv,
+                        (const float *) this_q, this_k, this_v, this_m, nullptr, 0,
+                        scale, softcap, partial, partial_m, partial_s) ? 1.0f : 0.0f;
+
+                barrier(barrier_data);
+                for (int thread = 0; thread < nth; ++thread) {
+                    if (result_buffer[thread*partial_stride + (Dv + 2)*q_per_kv] == 0.0f) {
+                        return false;
+                    }
+                }
+
+                if (team_rank < q_per_kv) {
+                    const int query = team_rank;
+                    const int global_query = query_first + query;
+                    auto Racc = qkv + global_query*nb1/sizeof(float);
+                    std::memset(Racc, 0, Dv*sizeof(float));
+                    float max_value = -INFINITY;
+                    float sum = 0.0f;
+                    for (int rank = 0; rank < team_size; ++rank) {
+                        const int thread = team_first + rank;
+                        const auto this_partial = result_buffer + thread*partial_stride;
+                        const auto R = this_partial + query*Dv;
+                        const auto partial_max = this_partial + Dv*q_per_kv;
+                        const auto partial_sum = partial_max + q_per_kv;
+                        accumulate_qkv(Dv, max_value, sum,
+                                partial_max[query], partial_sum[query], Racc, R);
+                    }
+                    if (sinks) {
+                        const float sink = ((const float *) sinks)[global_query];
+                        if (sink > max_value) {
+                            const float factor = expf(max_value - sink);
+                            for (int i = 0; i < Dv; ++i) Racc[i] *= factor;
+                            sum = sum*factor + 1.0f;
+                        } else {
+                            sum += expf(sink - max_value);
+                        }
+                    }
+                    const float norm = sum > 0.0f ? 1.0f/sum : 1.0f;
+                    for (int i = 0; i < Dv; ++i) Racc[i] *= norm;
+                }
+                return true;
+            }
+
             if (nth >= nek2) {
-                pack_head(team_head, team_rank, team_size);
+                pack_head(team_head, team_rank, index_width, team_size);
             } else {
                 for (int ikv = ith; ikv < nek2; ikv += nth) {
-                    pack_head(ikv, 0, 1);
+                    pack_head(ikv, 0, index_width, 1);
                 }
             }
             barrier(barrier_data);
@@ -407,7 +511,6 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
                 return true;
             }
 
-            const int packed_rows = GGML_PAD(last_found + 1, 32);
             auto compute_head = [&](int ikv, int query_first, int query_count) {
                 const auto this_q = (const char *) q + query_first*nbq2;
                 auto this_qkv = qkv + query_first*nb1/sizeof(float);

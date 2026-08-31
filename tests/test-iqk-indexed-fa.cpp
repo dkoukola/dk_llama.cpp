@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -26,11 +27,17 @@ struct selection_data {
     std::vector<ggml_fp16_t> mask;
     std::vector<int32_t> indices;
     int64_t mask_rows = 0;
+    int64_t kv_rows = kKvRows;
+    int64_t index_width = kIndexWidth;
 };
 
 struct attention_result {
     std::vector<float> dense;
     std::vector<float> indexed;
+    size_t dense_work = 0;
+    size_t indexed_work = 0;
+    double compute_us = 0.0;
+    bool split_k_executed = false;
 };
 
 float query_value(int64_t dimension, int64_t token, int64_t global_head) {
@@ -104,19 +111,44 @@ selection_data make_selection(int64_t n_tokens) {
     return result;
 }
 
-selection_data make_uniform_selection(int64_t n_tokens, int64_t selected_rows) {
+selection_data make_uniform_selection(
+        int64_t n_tokens,
+        int64_t selected_rows,
+        int64_t kv_rows = kKvRows,
+        int64_t index_width = kIndexWidth) {
     selection_data result;
     result.mask_rows = GGML_PAD(n_tokens, GGML_KQ_MASK_PAD);
-    result.mask.assign((size_t) kKvRows*result.mask_rows,
+    result.kv_rows = kv_rows;
+    result.index_width = index_width;
+    result.mask.assign((size_t) kv_rows*result.mask_rows,
             ggml_fp32_to_fp16(-INFINITY));
-    result.indices.assign((size_t) kIndexWidth*n_tokens, -1);
+    result.indices.assign((size_t) index_width*n_tokens, -1);
 
     for (int64_t token = 0; token < n_tokens; ++token) {
         for (int32_t row = 0; row < selected_rows; ++row) {
-            result.mask[(size_t) token*kKvRows + row] =
+            result.mask[(size_t) token*kv_rows + row] =
                 ggml_fp32_to_fp16(0.0f);
-            result.indices[(size_t) token*kIndexWidth + row] = row;
+            result.indices[(size_t) token*index_width + row] = row;
         }
+    }
+    return result;
+}
+
+selection_data make_qwen_split_k_selection(bool all_masked) {
+    constexpr int64_t kv_rows = 2144;
+    constexpr int64_t index_width = 2080;
+    constexpr int64_t selected_rows = 2051;
+    selection_data result = make_uniform_selection(1, 0, kv_rows, index_width);
+
+    for (int32_t j = 0; j < selected_rows; ++j) {
+        const int32_t row = j + j/32;
+        result.indices[(size_t) j] = row;
+        if (!all_masked && (j < 96 || j >= 160) && j != 1024 && j != 2048) {
+            result.mask[(size_t) row] = ggml_fp32_to_fp16(0.0f);
+        }
+    }
+    if (!all_masked) {
+        result.mask[(size_t) result.indices[511]] = ggml_fp32_to_fp16(-0.5f);
     }
     return result;
 }
@@ -199,7 +231,10 @@ bool compute_attention(
         ggml_type key_type = GGML_TYPE_F16,
         ggml_type value_type = GGML_TYPE_F16,
         int64_t key_size = kHeadSize,
-        int64_t value_size = kHeadSize) {
+        int64_t value_size = kHeadSize,
+        bool use_sinks = false,
+        bool include_dense = true,
+        int compute_repeats = 1) {
     const ggml_init_params params = {
         /* .mem_size   = */ kContextSize,
         /* .mem_buffer = */ nullptr,
@@ -214,22 +249,22 @@ bool compute_attention(
     ggml_tensor * query = ggml_new_tensor_4d(
             ctx, GGML_TYPE_F32, key_size, n_tokens, n_query_heads, 1);
     ggml_tensor * key = ggml_new_tensor_4d(
-            ctx, key_type, key_size, kKvRows, n_kv_heads, 1);
+            ctx, key_type, key_size, selection.kv_rows, n_kv_heads, 1);
     ggml_tensor * value = ggml_new_tensor_4d(
-            ctx, value_type, value_size, kKvRows, n_kv_heads, 1);
+            ctx, value_type, value_size, selection.kv_rows, n_kv_heads, 1);
     ggml_tensor * mask = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_F16, kKvRows, selection.mask_rows);
+            ctx, GGML_TYPE_F16, selection.kv_rows, selection.mask_rows);
     ggml_tensor * indices = ggml_new_tensor_2d(
-            ctx, GGML_TYPE_I32, kIndexWidth, n_tokens);
+            ctx, GGML_TYPE_I32, selection.index_width, n_tokens);
 
     const size_t key_row_size = ggml_row_size(key_type, key_size);
     const size_t value_row_size = ggml_row_size(value_type, value_size);
     key->nb[1] = key_row_size*n_kv_heads;
     key->nb[2] = key_row_size;
-    key->nb[3] = key_row_size*n_kv_heads*kKvRows;
+    key->nb[3] = key_row_size*n_kv_heads*selection.kv_rows;
     value->nb[1] = value_row_size*n_kv_heads;
     value->nb[2] = value_row_size;
-    value->nb[3] = value_row_size*n_kv_heads*kKvRows;
+    value->nb[3] = value_row_size*n_kv_heads*selection.kv_rows;
 
     initialize_query(query, global_query_head_offset);
     initialize_cache(key, value, global_kv_head_offset);
@@ -237,20 +272,45 @@ bool compute_attention(
     std::memcpy(indices->data, selection.indices.data(), ggml_nbytes(indices));
 
     const float scale = 1.0f/std::sqrt((float) key_size);
-    ggml_tensor * dense = ggml_flash_attn_ext(
-            ctx, query, key, value, mask, scale, 0.0f, 0.0f);
+    ggml_tensor * dense = include_dense ? ggml_flash_attn_ext(
+            ctx, query, key, value, mask, scale, 0.0f, 0.0f) : nullptr;
     ggml_tensor * indexed = ggml_flash_attn_ext(
             ctx, query, key, value, mask, scale, 0.0f, 0.0f);
     indexed->src[5] = indices;
+    if (use_sinks) {
+        ggml_tensor * sinks = ggml_new_tensor_1d(
+                ctx, GGML_TYPE_F32, n_query_heads);
+        float * sink_data = static_cast<float *>(sinks->data);
+        for (int64_t head = 0; head < n_query_heads; ++head) {
+            sink_data[head] = head % 2 == 0 ?
+                4.0f + 0.05f*head : -4.0f - 0.05f*head;
+        }
+        if (dense != nullptr) {
+            ggml_flash_attn_ext_add_sinks(dense, sinks);
+        }
+        ggml_flash_attn_ext_add_sinks(indexed, sinks);
+    }
 
-    const size_t dense_work = iqk_fa_work_buffer_size(dense, n_threads);
+    const size_t dense_work = dense == nullptr ? 0 :
+        iqk_fa_work_buffer_size(dense, n_threads);
     const size_t indexed_work = iqk_fa_work_buffer_size(indexed, n_threads);
-    const size_t expected = n_tokens == 1 ?
+    size_t expected = n_tokens == 1 ?
         (key_row_size*n_kv_heads + value_row_size*n_kv_heads +
             sizeof(ggml_fp16_t)*n_kv_heads)*
-            kIndexWidth + 512*sizeof(float) :
+            selection.index_width + 512*sizeof(float) :
         (key_row_size + value_row_size + sizeof(ggml_fp16_t))*
-            kIndexWidth*n_threads;
+            selection.index_width*n_threads;
+    const bool split_k_planned = n_tokens == 1 &&
+        ((key_type == GGML_TYPE_F16 && value_type == GGML_TYPE_F16) ||
+            (key_type == GGML_TYPE_Q8_0 && value_type == GGML_TYPE_Q8_0)) &&
+        n_query_heads == 24 && n_kv_heads == 2 &&
+        key_size == 256 && value_size == 256 && n_threads == 64 &&
+        selection.index_width == 2080;
+    if (split_k_planned) {
+        expected -= 512*sizeof(float);
+        expected += (size_t) (value_size + 16)*(n_query_heads/n_kv_heads)*
+            n_threads*sizeof(float);
+    }
     if (indexed_work != expected) {
         std::fprintf(stderr,
                 "%s: indexed work size is %zu, expected %zu "
@@ -259,24 +319,59 @@ bool compute_attention(
         ggml_free(ctx);
         return false;
     }
+    result.dense_work = dense_work;
+    result.indexed_work = indexed_work;
 
     ggml_cgraph * graph = ggml_new_graph(ctx);
-    ggml_build_forward_expand(graph, dense);
+    if (dense != nullptr) {
+        ggml_build_forward_expand(graph, dense);
+    }
     ggml_build_forward_expand(graph, indexed);
     ggml_cplan plan = ggml_graph_plan(graph, n_threads);
     std::vector<uint8_t> work(plan.work_size);
     plan.work_data = work.empty() ? nullptr : work.data();
-    const ggml_status status = ggml_graph_compute(graph, &plan);
+    ggml_status status = GGML_STATUS_SUCCESS;
+    const auto compute_start = std::chrono::steady_clock::now();
+    for (int repeat = 0; repeat < compute_repeats; ++repeat) {
+        status = ggml_graph_compute(graph, &plan);
+        if (status != GGML_STATUS_SUCCESS) {
+            break;
+        }
+    }
+    const auto compute_end = std::chrono::steady_clock::now();
+    result.compute_us = std::chrono::duration<double, std::micro>(
+            compute_end - compute_start).count()/compute_repeats;
     if (status != GGML_STATUS_SUCCESS) {
         std::fprintf(stderr, "%s: graph compute failed: %s\n",
                 label, ggml_status_to_string(status));
         ggml_free(ctx);
         return false;
     }
+    result.split_k_executed = false;
+    if (split_k_planned) {
+        const size_t packed_size = (key_row_size*n_kv_heads +
+                value_row_size*n_kv_heads +
+                sizeof(ggml_fp16_t)*n_kv_heads)*selection.index_width;
+        const size_t partial_stride = (size_t) (value_size + 16)*
+            (n_query_heads/n_kv_heads);
+        const float * partials = reinterpret_cast<const float *>(
+                work.data() + packed_size);
+        result.split_k_executed = true;
+        for (int thread = 0; thread < n_threads; ++thread) {
+            const size_t status_index = thread*partial_stride +
+                (value_size + 2)*(n_query_heads/n_kv_heads);
+            if (partials[status_index] != 1.0f) {
+                result.split_k_executed = false;
+                break;
+            }
+        }
+    }
 
-    result.dense.resize((size_t) ggml_nelements(dense));
+    result.dense.resize(dense == nullptr ? 0 : (size_t) ggml_nelements(dense));
     result.indexed.resize((size_t) ggml_nelements(indexed));
-    std::memcpy(result.dense.data(), dense->data, ggml_nbytes(dense));
+    if (dense != nullptr) {
+        std::memcpy(result.dense.data(), dense->data, ggml_nbytes(dense));
+    }
     std::memcpy(result.indexed.data(), indexed->data, ggml_nbytes(indexed));
     ggml_free(ctx);
     return true;
@@ -398,6 +493,164 @@ bool check_asymmetric_quantized_case(int64_t n_tokens, int n_threads) {
         check_close(result.indexed, result.dense, label.c_str());
 }
 
+bool check_qwen_scalar_split_k() {
+    constexpr size_t packed_work = 4268160;
+    constexpr size_t split_work = 5103744;
+    constexpr size_t unsplit_work = 4270208;
+    const selection_data selection = make_qwen_split_k_selection(false);
+    attention_result unsplit;
+    attention_result split;
+    if (!compute_attention("Qwen scalar unsplit reference", 1,
+                kQueryHeads, kKvHeads, 0, 0, 1, selection, unsplit,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize, true) ||
+            !compute_attention("Qwen scalar 64-thread split-K", 1,
+                kQueryHeads, kKvHeads, 0, 0, 64, selection, split,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize,
+                true, false)) {
+        return false;
+    }
+    if (unsplit.indexed_work != unsplit_work ||
+            split.indexed_work != split_work ||
+            split.indexed_work - packed_work != 835584) {
+        std::fprintf(stderr,
+                "Qwen split-K work sizes differ: unsplit=%zu split=%zu\n",
+                unsplit.indexed_work, split.indexed_work);
+        return false;
+    }
+    if (!split.split_k_executed) {
+        std::fputs("Qwen F16 split-K branch did not execute\n", stderr);
+        return false;
+    }
+    if (!check_close(split.indexed, unsplit.dense,
+                "Qwen scalar split-K vs dense") ||
+            !check_close(split.indexed, unsplit.indexed,
+                "Qwen scalar split-K vs unsplit indexed")) {
+        return false;
+    }
+
+    attention_result quantized_unsplit;
+    attention_result quantized_split;
+    if (!compute_attention("Qwen Q8_0 scalar unsplit reference", 1,
+                kQueryHeads, kKvHeads, 0, 0, 1, selection, quantized_unsplit,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, kHeadSize, kHeadSize, true) ||
+            !compute_attention("Qwen Q8_0 scalar 64-thread split-K", 1,
+                kQueryHeads, kKvHeads, 0, 0, 64, selection, quantized_split,
+                GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, kHeadSize, kHeadSize,
+                true, false)) {
+        return false;
+    }
+    if (!quantized_split.split_k_executed) {
+        std::fputs("Qwen Q8_0 split-K branch did not execute\n", stderr);
+        return false;
+    }
+    return check_close(quantized_split.indexed, quantized_unsplit.dense,
+                "Qwen Q8_0 scalar split-K vs dense") &&
+        check_close(quantized_split.indexed, quantized_unsplit.indexed,
+                "Qwen Q8_0 scalar split-K vs unsplit indexed");
+}
+
+bool check_qwen_scalar_split_k_all_masked() {
+    const selection_data selection = make_qwen_split_k_selection(true);
+    attention_result result;
+    if (!compute_attention("Qwen scalar split-K all masked", 1,
+                kQueryHeads, kKvHeads, 0, 0, 64, selection, result,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize,
+                true, false)) {
+        return false;
+    }
+    if (!result.split_k_executed) {
+        std::fputs("Qwen all-masked split-K branch did not execute\n", stderr);
+        return false;
+    }
+    for (size_t i = 0; i < result.indexed.size(); ++i) {
+        if (result.indexed[i] != 0.0f) {
+            std::fprintf(stderr,
+                    "Qwen all-masked split-K output at %zu is %.9g\n",
+                    i, result.indexed[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+bool check_qwen_scalar_split_k_boundary() {
+    constexpr int64_t selected_rows = 31*32;
+    const selection_data selection = make_uniform_selection(
+            1, selected_rows, 2144, 2080);
+    attention_result reference;
+    attention_result candidate;
+    if (!compute_attention("Qwen 31-block grouped reference", 1,
+                kQueryHeads, kKvHeads, 0, 0, 1, selection, reference,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize, true) ||
+            !compute_attention("Qwen 31-block 64-thread fallback", 1,
+                kQueryHeads, kKvHeads, 0, 0, 64, selection, candidate,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize,
+                true, false)) {
+        return false;
+    }
+    if (candidate.split_k_executed) {
+        std::fputs("Qwen 31-block selection unexpectedly used split-K\n",
+                stderr);
+        return false;
+    }
+    return check_close(candidate.indexed, reference.dense,
+                "Qwen 31-block fallback vs dense") &&
+        check_close(candidate.indexed, reference.indexed,
+                "Qwen 31-block fallback vs grouped indexed");
+}
+
+bool check_qwen_scalar_mixed_types_stay_grouped() {
+    const selection_data selection = make_qwen_split_k_selection(false);
+    attention_result result;
+    if (!compute_attention("Qwen mixed F16/Q8_0 grouped", 1,
+                kQueryHeads, kKvHeads, 0, 0, 64, selection, result,
+                GGML_TYPE_F16, GGML_TYPE_Q8_0, kHeadSize, kHeadSize,
+                true)) {
+        return false;
+    }
+    if (result.split_k_executed) {
+        std::fputs("Qwen mixed F16/Q8_0 unexpectedly used split-K\n",
+                stderr);
+        return false;
+    }
+    return check_close(result.indexed, result.dense,
+            "Qwen mixed F16/Q8_0 grouped vs dense");
+}
+
+bool benchmark_qwen_scalar_split_k() {
+    constexpr int repeats = 50;
+    const selection_data selection = make_qwen_split_k_selection(false);
+    attention_result grouped_24;
+    attention_result grouped_63;
+    attention_result split_64;
+    if (!compute_attention("Qwen scalar benchmark 24-thread grouped", 1,
+                kQueryHeads, kKvHeads, 0, 0, 24, selection, grouped_24,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize,
+                false, false, repeats) ||
+            !compute_attention("Qwen scalar benchmark 63-thread grouped", 1,
+                kQueryHeads, kKvHeads, 0, 0, 63, selection, grouped_63,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize,
+                false, false, repeats) ||
+            !compute_attention("Qwen scalar benchmark 64-thread split-K", 1,
+                kQueryHeads, kKvHeads, 0, 0, 64, selection, split_64,
+                GGML_TYPE_F16, GGML_TYPE_F16, kHeadSize, kHeadSize,
+                false, false, repeats)) {
+        return false;
+    }
+    std::printf(
+            "Qwen scalar indexed FA: 24-thread grouped %.1f us, "
+            "63-thread grouped %.1f us, 64-thread split-K %.1f us\n",
+            grouped_24.compute_us, grouped_63.compute_us, split_64.compute_us);
+    if (!split_64.split_k_executed) {
+        std::fputs("Qwen benchmark split-K branch did not execute\n", stderr);
+        return false;
+    }
+    return check_close(split_64.indexed, grouped_24.indexed,
+                "Qwen scalar benchmark split-K vs 24-thread grouped") &&
+        check_close(split_64.indexed, grouped_63.indexed,
+                "Qwen scalar benchmark split-K vs 63-thread grouped");
+}
+
 bool check_unsupported_pair_uses_dense_planner() {
     const ggml_init_params params = {
         /* .mem_size   = */ kContextSize,
@@ -500,6 +753,10 @@ int main() {
             !check_special_selection(4, 64, 0, "empty prompt selection") ||
             !check_special_selection(1, 64, 40, "64-row decode boundary") ||
             !check_special_selection(4, 64, 40, "64-row prompt boundary") ||
+            !check_qwen_scalar_split_k() ||
+            !check_qwen_scalar_split_k_all_masked() ||
+            !check_qwen_scalar_split_k_boundary() ||
+            !check_qwen_scalar_mixed_types_stay_grouped() ||
             !check_unsupported_pair_uses_dense_planner() ||
             !check_mask_to_index_exact_capacity()) {
         return 1;
@@ -510,6 +767,10 @@ int main() {
                 return 1;
             }
         }
+    }
+    if (std::getenv("IQK_INDEXED_FA_BENCH") != nullptr &&
+            !benchmark_qwen_scalar_split_k()) {
+        return 1;
     }
     std::puts("IQK indexed flash-attention differential tests passed");
     return 0;
