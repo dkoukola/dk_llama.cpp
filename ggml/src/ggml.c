@@ -2932,6 +2932,8 @@ struct ggml_context_container {
     struct ggml_context context;
 };
 
+struct ggml_numa_barrier;
+
 struct ggml_compute_state_shared {
     const struct ggml_cgraph * cgraph;
     const struct ggml_cplan * cplan;
@@ -2942,6 +2944,7 @@ struct ggml_compute_state_shared {
     // synchronization primitives
     atomic_int n_barrier;
     atomic_int n_barrier_passed;
+    struct ggml_numa_barrier * numa_barrier;
 
     ggml_abort_callback abort_callback; // abort ggml_graph_compute when true
     void * abort_callback_data;
@@ -4697,10 +4700,11 @@ inline static void ggml_critical_section_start(void) {
 // multi-socket box that line ping-pongs across the interconnect on every op, and profiling
 // shows it consuming ~half of all cycles during token generation with 48 cross-socket threads.
 // When NUMA mirroring is active (threads pinned per node), this 2-level barrier instead syncs
-// threads within a node on a *node-local* line, then has one leader per node do a small
-// cross-node sync — cutting cross-socket contention from O(threads) to O(nodes).
+// threads within a node on a cache line private to that node's logical group, then has one
+// leader per node do a small cross-node sync — cutting cross-socket contention from O(threads)
+// to O(nodes).
 // ---------------------------------------------------------------------------
-#define GGML_NUMA_BARRIER_LINE 64
+#define GGML_NUMA_BARRIER_LINE CACHE_LINE_SIZE
 struct ggml_numa_barrier_node {
     atomic_int arrive;
     char pad0[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
@@ -4708,15 +4712,17 @@ struct ggml_numa_barrier_node {
     char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
 };
 
-static struct {
-    struct ggml_numa_barrier_node * node[GGML_NUMA_MAX_NODES]; // node[k] lives in node-k memory
+struct ggml_numa_barrier {
+    struct ggml_numa_barrier_node node[GGML_NUMA_MAX_NODES];
     atomic_int global_arrive;
-    char pad[GGML_NUMA_BARRIER_LINE];
+    char pad0[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
     atomic_int global_release;
+    char pad1[GGML_NUMA_BARRIER_LINE - sizeof(atomic_int)];
     int node_nth[GGML_NUMA_MAX_NODES];
     int n_leaders;
     int active;
-} g_numa_barrier;
+    char pad2[GGML_NUMA_BARRIER_LINE - sizeof(int) * (GGML_NUMA_MAX_NODES + 2)];
+};
 
 static GGML_THREAD_LOCAL int tl_numa_node = 0; // this thread's NUMA node (set in set_numa_thread_affinity)
 
@@ -4728,13 +4734,14 @@ static inline void ggml_numa_spin_pause(void) {
 #endif
 }
 
-static void ggml_numa_hier_barrier(void) {
+static void ggml_numa_hier_barrier(struct ggml_compute_state_shared * shared) {
+    struct ggml_numa_barrier * barrier = shared->numa_barrier;
     const int node    = tl_numa_node;
-    const int node_nth = g_numa_barrier.node_nth[node];
+    const int node_nth = barrier->node_nth[node];
 
-    // ---- intra-node level (node-local cache line) ----
+    // ---- intra-node level (cache line private to this compute team and node) ----
     if (node_nth > 1) {
-        struct ggml_numa_barrier_node * nb = g_numa_barrier.node[node];
+        struct ggml_numa_barrier_node * nb = &barrier->node[node];
         const int rel_old = atomic_load(&nb->release);
         if (atomic_fetch_add(&nb->arrive, 1) != node_nth - 1) {
             // follower: wait for this node's leader to release us
@@ -4748,14 +4755,14 @@ static void ggml_numa_hier_barrier(void) {
     }
 
     // ---- cross-node level (only one leader per node participates) ----
-    const int n_leaders = g_numa_barrier.n_leaders;
+    const int n_leaders = barrier->n_leaders;
     if (n_leaders > 1) {
-        const int g_old = atomic_load(&g_numa_barrier.global_release);
-        if (atomic_fetch_add(&g_numa_barrier.global_arrive, 1) == n_leaders - 1) {
-            atomic_store(&g_numa_barrier.global_arrive, 0);
-            atomic_fetch_add(&g_numa_barrier.global_release, 1); // release all leaders
+        const int g_old = atomic_load(&barrier->global_release);
+        if (atomic_fetch_add(&barrier->global_arrive, 1) == n_leaders - 1) {
+            atomic_store(&barrier->global_arrive, 0);
+            atomic_fetch_add(&barrier->global_release, 1); // release all leaders
         } else {
-            while (atomic_load(&g_numa_barrier.global_release) == g_old) {
+            while (atomic_load(&barrier->global_release) == g_old) {
                 ggml_numa_spin_pause();
             }
         }
@@ -4763,7 +4770,7 @@ static void ggml_numa_hier_barrier(void) {
 
     // release this node's followers
     if (node_nth > 1) {
-        atomic_fetch_add(&g_numa_barrier.node[node]->release, 1);
+        atomic_fetch_add(&barrier->node[node].release, 1);
     }
 }
 
@@ -4809,12 +4816,12 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     // prompt processing (large batch) is compute-bound; keep its original barrier. Only token
     // generation (small batch) was barrier-bound, so that's the only path the hierarchical
     // barrier replaces — applying it to PP just adds 2-level latency with no contention to save.
-    if (shared && shared->n_batch > 32) {
+    if (shared->n_batch > 32) {
         ggml_barrier_impl(shared);
         return;
     }
-    if (g_numa_barrier.active) {
-        ggml_numa_hier_barrier();
+    if (shared->numa_barrier->active) {
+        ggml_numa_hier_barrier(shared);
         return;
     }
     #pragma omp barrier
@@ -4824,8 +4831,8 @@ static void ggml_barrier(struct ggml_compute_state_shared * shared) {
     if (shared->n_threads == 1) {
         return;
     }
-    if (g_numa_barrier.active && !(shared && shared->n_batch > 32)) {
-        ggml_numa_hier_barrier();
+    if (shared->numa_barrier->active && shared->n_batch <= 32) {
+        ggml_numa_hier_barrier(shared);
         return;
     }
     ggml_barrier_impl(shared);
@@ -5082,47 +5089,35 @@ void ggml_numa_bind(void * ptr, size_t size, int node) {
 #endif
 }
 
-// Configure the hierarchical barrier for the given thread count. Called single-threaded from
-// ggml_graph_compute before workers start. Allocates the node-local counter lines once.
-// Activates only when NUMA mirroring is on (threads are pinned per node, matching the block split
-// used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
-static void ggml_numa_barrier_setup(int n_threads) {
+// Configure the compute team's hierarchical barrier for the given thread count. Called
+// single-threaded before workers start. Keeping all mutable counters and topology metadata in
+// the team's shared state lets independent contexts compute concurrently without mixing barrier
+// generations. Activates only when NUMA mirroring is on (threads are pinned per node, matching
+// the block split used by ggml_numa_node_for_thread); otherwise leaves the flat barrier in place.
+static void ggml_numa_barrier_setup(struct ggml_numa_barrier * barrier, int n_threads) {
     if (g_state.numa.numa_strategy != GGML_NUMA_STRATEGY_MIRROR || g_state.numa.n_nodes < 2 || n_threads <= 1) {
-        g_numa_barrier.active = 0;
+        barrier->active = 0;
         return;
     }
     const int n = (int) g_state.numa.n_nodes;
-    if (g_numa_barrier.node[0] == NULL) {
-        for (int k = 0; k < n; ++k) {
-            // node-local so the intra-node sync never crosses the interconnect (mmap is zeroed)
-            g_numa_barrier.node[k] = (struct ggml_numa_barrier_node *)
-                ggml_numa_alloc(sizeof(struct ggml_numa_barrier_node), k);
-            if (g_numa_barrier.node[k] == NULL) {
-                // allocation failed: undo and fall back to the flat barrier instead of risking
-                // a NULL deref in ggml_numa_hier_barrier()
-                for (int j = 0; j < k; ++j) {
-                    ggml_numa_free(g_numa_barrier.node[j], sizeof(struct ggml_numa_barrier_node));
-                    g_numa_barrier.node[j] = NULL;
-                }
-                g_numa_barrier.active = 0;
-                return;
-            }
-        }
-        atomic_store(&g_numa_barrier.global_arrive, 0);
-        atomic_store(&g_numa_barrier.global_release, 0);
+    atomic_store(&barrier->global_arrive, 0);
+    atomic_store(&barrier->global_release, 0);
+    for (int k = 0; k < n; ++k) {
+        atomic_store(&barrier->node[k].arrive, 0);
+        atomic_store(&barrier->node[k].release, 0);
     }
     int leaders = 0;
     for (int k = 0; k < n; ++k) {
         // contiguous block split, identical to ggml_numa_node_for_thread(ith,nth) = (ith*n)/nth
         const int first_k  = ( k      * n_threads + n - 1) / n;
         const int first_k1 = ((k + 1) * n_threads + n - 1) / n;
-        g_numa_barrier.node_nth[k] = first_k1 - first_k;
-        if (g_numa_barrier.node_nth[k] > 0) {
+        barrier->node_nth[k] = first_k1 - first_k;
+        if (barrier->node_nth[k] > 0) {
             ++leaders;
         }
     }
-    g_numa_barrier.n_leaders = leaders;
-    g_numa_barrier.active = 1;
+    barrier->n_leaders = leaders;
+    barrier->active = 1;
 }
 
 void ggml_numa_tensor_set_mirror(struct ggml_tensor * tensor, void * const * node_data) {
@@ -29749,6 +29744,12 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     int n_threads = cplan->n_threads;
 
+#if defined(_MSC_VER)
+    __declspec(align(GGML_NUMA_BARRIER_LINE))
+#else
+    _Alignas(GGML_NUMA_BARRIER_LINE)
+#endif
+    struct ggml_numa_barrier numa_barrier = { 0 };
     struct ggml_compute_state_shared state_shared = {
         /*.cgraph                  =*/ cgraph,
         /*.cgraph_plan             =*/ cplan,
@@ -29756,6 +29757,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         /*.n_batch                 =*/ cgraph->n_batch,
         /*.n_barrier               =*/ 0,
         /*.n_barrier_passed        =*/ 0,
+        /*.numa_barrier            =*/ &numa_barrier,
         /*.abort_callback          =*/ NULL,
         /*.abort_callback_data     =*/ NULL,
         /*.current_chunk           =*/ 0,
@@ -29776,7 +29778,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 state_shared.n_threads = n_threads;
                 // configure the NUMA-aware barrier for this thread count (single-threaded here;
                 // the implicit barrier ending this 'single' publishes it to all workers)
-                ggml_numa_barrier_setup(n_threads);
+                ggml_numa_barrier_setup(&numa_barrier, n_threads);
             }
 
             struct ggml_compute_state worker = {
@@ -29809,7 +29811,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         };
     }
 
-    ggml_numa_barrier_setup(n_threads); // configure NUMA-aware barrier before workers start
+    ggml_numa_barrier_setup(&numa_barrier, n_threads); // configure NUMA-aware barrier before workers start
 
     // create thread pool
     for (int j = 1; j < n_threads; ++j) {

@@ -204,6 +204,12 @@ llama_build_and_test(test-regex-partial.cpp)
 
 llama_build_and_test(test-iqk-mul-multi-add.cpp)
 target_include_directories(test-iqk-mul-multi-add PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+
+add_executable(test-numa-barrier-concurrency test-numa-barrier-concurrency.cpp)
+target_link_libraries(test-numa-barrier-concurrency PRIVATE ggml)
+llama_test(test-numa-barrier-concurrency)
+set_tests_properties(test-numa-barrier-concurrency PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+
 if (GGML_IQK_MUL_MAT AND GGML_IQK_FLASH_ATTENTION)
     llama_build_and_test(test-iqk-fa-work-buffer.cpp)
     target_include_directories(test-iqk-fa-work-buffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
