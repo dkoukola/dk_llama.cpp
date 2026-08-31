@@ -4,7 +4,7 @@
 [ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp), which is itself a
 performance-focused fork of [llama.cpp](https://github.com/ggerganov/llama.cpp). It regularly
 merges `upstream/main` while carrying additional CPU, NUMA, state-management, speculative
-decoding, and model-integration work used in production deployments.
+decoding, and model-integration work.
 
 ## What this fork adds
 
@@ -13,7 +13,7 @@ decoding, and model-integration work used in production deployments.
   hierarchical token-generation barrier.
 - **An installable speculative-decoding API:** optional `libllama-speculative` builds expose
   speculative sessions, checkpoint/rollback state, generation and acceptance metrics, and
-  companion draft-model integration to external runtimes.
+  companion draft-model integration.
 - **DeepSeek-V4 and DSpark integration:** additional DSpark runtime support, verifier-token
   handling, and compact whole-context state persistence.
 - **Qwen3.8 Flash Next extensions:** text-model and image-projector conversion, canonical
@@ -24,7 +24,7 @@ decoding, and model-integration work used in production deployments.
   work.
 
 These are downstream extensions, not an ABI or behavioral compatibility guarantee. Pin a
-commit for reproducible deployments and build consumers against the matching revision.
+commit for reproducible builds and build consumers against the matching revision.
 
 ## Upstream synchronization
 
