@@ -25237,15 +25237,19 @@ static void ggml_compute_forward_mask_to_idx(const struct ggml_compute_params * 
             const uint16_t * x = (const uint16_t *)((const char *)src->data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]);
             int idx = 0;
             for (int j = 0; j < ne00; ++j) {
-                assert(idx < ne0);
-                if (x[j] == 0) y[idx++] = j;
+                if (x[j] == 0) {
+                    assert(idx < ne0);
+                    y[idx++] = j;
+                }
             }
         } else {
             const float * x = (const float *)((const char *)src->data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3]);
             int idx = 0;
             for (int j = 0; j < ne00; ++j) {
-                assert(idx < ne0);
-                if (x[j] == 0.0f) y[idx++] = j;
+                if (x[j] == 0.0f) {
+                    assert(idx < ne0);
+                    y[idx++] = j;
+                }
             }
         }
     }

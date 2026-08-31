@@ -263,7 +263,12 @@ static ggml_tensor * qwen4exp_ple(
 
 // a query keeps a budget of whole blocks plus the incomplete tail it sits in, where a block is
 // compress_ratio consecutive cells scored through the mean of its members' indexer keys
-static ggml_tensor * qwen4exp_qsa_mask(
+struct qwen4exp_qsa_result {
+    ggml_tensor * mask;
+    ggml_tensor * fa_index;
+};
+
+static qwen4exp_qsa_result qwen4exp_qsa_mask(
         llm_build_context & bctx,
         ggml_context      * ctx0,
         llama_context     & lctx,
@@ -280,7 +285,7 @@ static ggml_tensor * qwen4exp_qsa_mask(
     ggml_tensor * kr_cache = il < (int) kv_self.kr_l.size() ? kv_self.kr_l[il] : nullptr;
     ggml_tensor * kp_cache = il < (int) kv_self.kp_l.size() ? kv_self.kp_l[il] : nullptr;
     if (!kr_cache || !kp_cache || !model.layers[il].indexer_k_proj) {
-        return KQ_mask;
+        return { KQ_mask, nullptr };
     }
 
     const int32_t idx_dim  = hparams.indexer_head_size;
@@ -394,6 +399,23 @@ static ggml_tensor * qwen4exp_qsa_mask(
     const int32_t block_top_k = top_k_cells/r;
     const int64_t width = (int64_t) block_top_k*r + r - 1;
 
+    // IQK indexed FA gathers K/V in index order, while the QSA top-k is score ordered.
+    // Re-index the sparse mask to retain the CPU physical-cache order used by dense FA.
+    // IQK consumes selected rows in groups of 32; unsupported backends retain dense FA.
+    auto finish_mask = [&](ggml_tensor * mask, int64_t n_selected) {
+        const int64_t index_width = GGML_PAD(n_selected, 32);
+        // Packing copies every selected K/V row before attention. Keep the dense path until
+        // that copy is amortized by eliminating at least half of the cache rows.
+        if (!lctx.cparams.flash_attn || 2*index_width >= n_kv) {
+            return qwen4exp_qsa_result { mask, nullptr };
+        }
+
+        ggml_tensor * active_mask = ggml_view_2d(ctx0, mask, n_kv, n_tokens, mask->nb[1], 0);
+        ggml_tensor * fa_index = ggml_mask_to_index(ctx0, active_mask, (int) index_width);
+        cb(fa_index, "qsa_fa_index", il);
+        return qwen4exp_qsa_result { mask, fa_index };
+    };
+
     // Qwen MTP freezes the sparse selection produced by the preceding draft-extend
     // (warmup/update) pass. Every draft token, including draft step 0, updates the raw and
     // compressed indexer caches above but must reuse that carried selection. A context used
@@ -413,12 +435,12 @@ static ggml_tensor * qwen4exp_qsa_mask(
 
         ggml_tensor * mask = ggml_indexer_mask(ctx0, KQ_mask, inp->reuse_topk);
         cb(mask, "qsa_mask", il);
-        return mask;
+        return finish_mask(mask, n_selected);
     }
 
     if (width >= n_kv) {
         ggml_build_forward_expand(gf, kp_all);
-        return KQ_mask;
+        return { KQ_mask, nullptr };
     }
 
     auto finish_cells = [&](ggml_tensor * selected) {
@@ -432,7 +454,7 @@ static ggml_tensor * qwen4exp_qsa_mask(
 
         ggml_tensor * mask = ggml_indexer_mask(ctx0, KQ_mask, selected);
         cb(mask, "qsa_mask", il);
-        return mask;
+        return finish_mask(mask, selected->ne[0]);
     };
 
     if (block_top_k == 0) {
@@ -546,12 +568,13 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
                 layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up,
                 layer.hc_attn_inject, &inject, n_embd, il, cb);
 
-        ggml_tensor * mask = hparams.is_qsa(il)
+        qwen4exp_qsa_result qsa = hparams.is_qsa(il)
             ? qwen4exp_qsa_mask(*this, ctx0, lctx, gf, cur, inp_pos, KQ_mask, il, cb)
-            : KQ_mask;
+            : qwen4exp_qsa_result { KQ_mask, nullptr };
         cur = build_std_attention(gf, nullptr, cur, inp_pos, nullptr, nullptr,
-                mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false,
-                /* add_input */ false, /* is_norm */ false, /* is_multi */ true);
+                qsa.mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false,
+                /* add_input */ false, /* is_norm */ false, /* is_multi */ true,
+                nullptr, -1, 0.0f, nullptr, /* fa_index */ qsa.fa_index);
         res_hc = qwen4exp_hc_combine(ctx0, hparams, res_hc, cur, inject, n_embd, il, cb);
 
         cur = qwen4exp_hc_mix(*this, ctx0, lctx, hparams, res_hc,
@@ -647,13 +670,14 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         } else {
             // the indexer reads the same block input as q/k/v, and returns the causal mask
             // itself when the layer carries no compression ratio
-            ggml_tensor * mask = hparams.is_qsa(il)
+            qwen4exp_qsa_result qsa = hparams.is_qsa(il)
                 ? qwen4exp_qsa_mask(*this, ctx0, lctx, gf, cur, inp_pos, KQ_mask, il, cb)
-                : KQ_mask;
+                : qwen4exp_qsa_result { KQ_mask, nullptr };
 
             cur = build_std_attention(gf, nullptr, cur, inp_pos, nullptr, nullptr,
-                    mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false,
-                    /* add_input */ false, /* is_norm */ false, /* is_multi */ true);
+                    qsa.mask, nullptr, nullptr, KQ_scale, 0.0f, 0, il, true, false,
+                    /* add_input */ false, /* is_norm */ false, /* is_multi */ true,
+                    nullptr, -1, 0.0f, nullptr, /* fa_index */ qsa.fa_index);
         }
 
         res_hc = qwen4exp_hc_combine(ctx0, hparams, res_hc, cur, inject, n_embd, il, cb);

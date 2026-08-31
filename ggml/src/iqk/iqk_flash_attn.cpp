@@ -141,33 +141,6 @@ inline void accumulate_qkv(int Dv, float& M, float& S, float Mj, float Sj, float
         for (int i = 0; i < Dv; ++i) Racc[i] += c*R[i];
     }
 }
-}
-
-size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
-    auto Q = dst->src[0];
-    auto K = dst->src[1];
-    auto V = dst->src[2];
-    auto indexer = dst->src[5];
-    if (indexer && indexer->type == GGML_TYPE_I32 && indexer->ne[0] < K->ne[1] &&
-        Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && K->ne[2] == 1) {
-        auto row_size_k = ggml_row_size(K->type, K->ne[0]);
-        auto row_size_v = ggml_row_size(V->type, V->ne[0]);
-        auto work_size  = (row_size_k + row_size_v + 64) * indexer->ne[0];
-        size_t result = work_size * nth;
-        if (Q->ne[1]== 1) result += 512*sizeof(float);
-        return result;
-        //return work_size * nth;
-    }
-    size_t size = 0;
-    if (Q->ne[1] >= 8 && K->type == GGML_TYPE_Q8_0) {
-        size = ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) * K->ne[1]*K->ne[2]*K->ne[3];
-    }
-    if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1) {
-        size += max_split_k_work_size(dst, nth);
-        return size;
-    }
-    return size;
-}
 
 static inline const std::unordered_set<ggml_type> & supported_kv_types() {
 #ifdef GGML_IQK_FA_ALL_QUANTS
@@ -197,6 +170,114 @@ static inline bool are_kv_types_supported(ggml_type type_k, ggml_type type_v) {
     auto it_k = supported.find(type_k);
     auto it_v = supported.find(type_v);
     return it_k != supported.end() && it_v != supported.end();
+}
+
+bool indexed_fa_dims_supported(int Dk, int Dv) {
+    return (Dk == 576 && Dv == 512) ||
+        (Dk == 512 && Dv == 512) ||
+        (Dk == 320 && Dv == 256) ||
+        (Dk == 192 && Dv == 128) ||
+        (Dk == 192 && Dv == 192) ||
+        (Dk == 256 && Dv == 256) ||
+        (Dk == 128 && Dv == 128) ||
+        (Dk == 96  && Dv == 96)  ||
+        (Dk == 64  && Dv == 64);
+}
+
+bool indexed_fa_types_supported(ggml_type type_k, ggml_type type_v, int Dk, int Dv) {
+    if (type_k == GGML_TYPE_BF16 || type_v == GGML_TYPE_BF16) {
+#ifdef __AVX512BF16__
+        return type_k == GGML_TYPE_BF16 && type_v == GGML_TYPE_BF16;
+#else
+        return false;
+#endif
+    }
+
+    const bool unequal_head_sizes = Dk != Dv;
+    if (unequal_head_sizes && type_k != type_v) {
+        return false;
+    }
+
+    const bool supported_k = type_k == GGML_TYPE_F16 ||
+        type_k == GGML_TYPE_Q8_0 || type_k == GGML_TYPE_Q6_0
+#ifdef GGML_IQK_FA_ALL_QUANTS
+        || type_k == GGML_TYPE_Q8_KV || type_k == GGML_TYPE_Q4_0 ||
+        type_k == GGML_TYPE_Q4_1 || type_k == GGML_TYPE_IQ4_NL
+#endif
+        ;
+    const bool supported_v = type_v == GGML_TYPE_F16 ||
+        type_v == GGML_TYPE_Q8_0 || type_v == GGML_TYPE_Q8_KV ||
+        type_v == GGML_TYPE_Q6_0
+#ifdef GGML_IQK_FA_ALL_QUANTS
+        || type_v == GGML_TYPE_Q4_0 || type_v == GGML_TYPE_Q4_1 ||
+        type_v == GGML_TYPE_IQ4_NL
+#endif
+        ;
+    return supported_k && supported_v;
+}
+
+bool indexed_fa_compatible(
+        const ggml_tensor * indexer,
+        int type_q,
+        int type_mask,
+        float max_bias,
+        int neq3,
+        int neq2,
+        int neq1,
+        int nek3,
+        int nek2,
+        int nek1,
+        int nev3,
+        int nev2,
+        ggml_type type_k,
+        ggml_type type_v,
+        int Dk,
+        int Dv,
+        bool have_mask) {
+    return indexer != nullptr &&
+        indexer->type == GGML_TYPE_I32 &&
+        indexer->ne[0] > 0 && indexer->ne[0] < nek1 && indexer->ne[0] % 32 == 0 &&
+        indexer->ne[1] >= neq1 && indexer->ne[2] == 1 && indexer->ne[3] == 1 &&
+        indexer->nb[0] == sizeof(int32_t) && indexer->nb[1] >= (size_t) indexer->ne[0] * sizeof(int32_t) &&
+        type_q == GGML_TYPE_F32 && type_mask == GGML_TYPE_F16 && max_bias <= 0.0f && have_mask &&
+        neq3 == 1 && nek3 == 1 && nev3 == 1 &&
+        nek2 > 0 && nek2 == nev2 && neq2 % nek2 == 0 &&
+        indexed_fa_types_supported(type_k, type_v, Dk, Dv) && indexed_fa_dims_supported(Dk, Dv) &&
+        (neq1 != 1 || neq2 <= 256);
+}
+}
+
+size_t iqk_fa_work_buffer_size(const struct ggml_tensor * dst, int nth) {
+    auto Q = dst->src[0];
+    auto K = dst->src[1];
+    auto V = dst->src[2];
+    auto M = dst->src[3];
+    auto indexer = dst->src[5];
+    float max_bias = 0.0f;
+    std::memcpy(&max_bias, (const char *) dst->op_params + sizeof(float), sizeof(float));
+    if (indexed_fa_compatible(indexer,
+            Q->type, M ? M->type : GGML_TYPE_COUNT, max_bias,
+            Q->ne[3], Q->ne[2], Q->ne[1],
+            K->ne[3], K->ne[2], K->ne[1],
+            V->ne[3], V->ne[2], K->type, V->type, K->ne[0], V->ne[0], M != nullptr)) {
+        auto row_size_k = ggml_row_size(K->type, K->ne[0]);
+        auto row_size_v = ggml_row_size(V->type, V->ne[0]);
+        if (Q->ne[1] == 1) {
+            return (row_size_k * K->ne[2] + row_size_v * V->ne[2] +
+                    sizeof(ggml_fp16_t) * K->ne[2]) * indexer->ne[0]
+                + 512 * sizeof(float);
+        }
+        return (row_size_k + row_size_v + sizeof(ggml_fp16_t)) * indexer->ne[0] * nth;
+    }
+    size_t size = 0;
+    if (Q->ne[1] >= 8 && K->type == GGML_TYPE_Q8_0) {
+        size = ggml_row_size(GGML_TYPE_Q8_0, K->ne[0]) * K->ne[1]*K->ne[2]*K->ne[3];
+    }
+    if (Q->ne[1] == 1 && Q->ne[3] == 1 && Q->ne[2]/K->ne[2] > 1 && nth >= 1) {
+        size += max_split_k_work_size(dst, nth);
+        return size;
+    }
+    return size;
 }
 
 // TODO: get the ggml_type enum here without polution
@@ -229,119 +310,211 @@ extern "C" IQK_API bool iqk_flash_attn_noalibi(int type_q, int type_mask, float 
 
     if (type_q != 0 || type_mask != 1 || max_bias > 0) return false;
 
-    if (indexer && indexer->type == GGML_TYPE_I32) {
-        //if (indexer->ne[0] < nek1 && neq1 >= nth && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
-        if (indexer->ne[0] < nek1 && neq3 == 1 && nek3 == 1 && nev3 == 1 && nek2 == 1) {
-            // Workbuffer: we need
-            // * indexer->ne[0] * sizeof(ggml_half) to extract the mask for a row
-            // * indexer->ne[0] * ggml_row_size(int_type_k_in, Dk) to extract the selected K cache entries
-            // * indexer->ne[0] * ggml_row_size(int_type_v, Dv) to extract the selected V cache entries
-            auto row_size_k = ggml_row_size(ggml_type(int_type_k_in), Dk);
-            auto row_size_v = ggml_row_size(ggml_type(int_type_v   ), Dv);
-            auto work_size  = (row_size_k + row_size_v + 64) * indexer->ne[0];
-            ggml_fp16_t h_inf = ggml_fp32_to_fp16(-INFINITY);
-            int  nkv = indexer->ne[0];
-            if (neq1 == 1) {
-                GGML_ASSERT(neq2 <= 256);
-                int npt = (neq2 + nth - 1)/nth;
-                int ith_mid = nth;
-                int neq2_this_thread = npt;
-                int first = ith*npt;
-                if (npt*nth > neq2) {
-                    ith_mid = neq2 - nth*(npt - 1);
-                    if (ith >= ith_mid) {
-                        --neq2_this_thread;
-                        //if (neq2_this_thread < 1) return true;
-                        first = ith_mid*npt + (ith - ith_mid)*neq2_this_thread;
-                    }
+    if (indexed_fa_compatible(indexer,
+            type_q, type_mask, max_bias,
+            neq3, neq2, neq1,
+            nek3, nek2, nek1,
+            nev3, nev2, ggml_type(int_type_k_in), ggml_type(int_type_v), Dk, Dv, mask != nullptr)) {
+        // Each selected row needs one packed K row, one packed V row and one mask value.
+        // Query heads are grouped by KV head. Single-token decode gives each KV head a
+        // contiguous thread team and a shared packed slot, preserving NUMA locality. A
+        // multi-token batch gives each worker a private slot reused across (token, KV-head)
+        // tasks, so no synchronization is needed there.
+        const size_t row_size_k = ggml_row_size(ggml_type(int_type_k_in), Dk);
+        const size_t row_size_v = ggml_row_size(ggml_type(int_type_v), Dv);
+        const size_t work_size = (row_size_k + row_size_v + sizeof(ggml_fp16_t)) * indexer->ne[0];
+        const ggml_fp16_t h_inf = ggml_fp32_to_fp16(-INFINITY);
+        const int index_width = indexer->ne[0];
+        const int q_per_kv = neq2 / nek2;
+
+        if (neq1 == 1) {
+            const auto idx = (const int *) indexer->data;
+            const auto M = (const ggml_fp16_t *) mask;
+            auto work_k = (char *) work_buffer_in;
+            auto work_v = work_k + row_size_k*index_width*nek2;
+            auto work_m = (ggml_fp16_t *) (work_v + row_size_v*index_width*nev2);
+            int last_found = -1;
+
+            for (int j = index_width - 1; j >= 0; --j) {
+                if (idx[j] >= 0) {
+                    last_found = j;
+                    break;
                 }
-                auto idx = (const int *)indexer->data;
-                auto M = (const ggml_fp16_t *)mask;
-                auto work_k = (char *)work_buffer_in;
-                auto work_v = work_k + row_size_k*indexer->ne[0];
-                auto work_m = (ggml_fp16_t *)(work_v + row_size_v*indexer->ne[0]) + indexer->ne[0]*ith;
-                int last_found = -1;
-                for (int j = 0; j < nkv; ++j) {
+            }
+
+            int team_head = -1;
+            int team_first = 0;
+            int team_size = 0;
+            int team_rank = 0;
+            if (nth >= nek2) {
+                team_head = ith*nek2/nth;
+                team_first = (team_head*nth + nek2 - 1)/nek2;
+                const int team_last = ((team_head + 1)*nth + nek2 - 1)/nek2;
+                team_size = team_last - team_first;
+                team_rank = ith - team_first;
+            }
+
+            auto pack_head = [&](int ikv, int first_j, int step_j) {
+                auto head_k = work_k + row_size_k*ikv*index_width;
+                auto head_v = work_v + row_size_v*ikv*index_width;
+                auto head_m = work_m + ikv*index_width;
+                for (int j = first_j; j < index_width; j += step_j) {
                     if (idx[j] >= 0) {
-                        last_found = j;
-                        work_m[j] = M[idx[j]];
-                        if (j % nth == ith) {
-                            std::memcpy(work_k + row_size_k*j, ((const char *)k + idx[j]*stride_k), row_size_k);
-                            if (k != v) {
-                                std::memcpy(work_v + row_size_v*j, ((const char *)v + idx[j]*stride_v), row_size_v);
-                            }
+                        GGML_ASSERT(idx[j] < nek1);
+                        std::memcpy(head_k + row_size_k*j,
+                                (const char *) k + ikv*nbk2 + idx[j]*stride_k, row_size_k);
+                        if (k != v) {
+                            std::memcpy(head_v + row_size_v*j,
+                                    (const char *) v + ikv*nbv2 + idx[j]*stride_v, row_size_v);
                         }
+                        head_m[j] = M[idx[j]];
                     } else {
-                        work_m[j] = h_inf;
-                        if (j % nth == ith) {
-                            std::memset(work_k + row_size_k*j, 0, row_size_k);
-                            if (k != v) {
-                                std::memset(work_v + row_size_v*j, 0, row_size_v);
-                            }
+                        std::memset(head_k + row_size_k*j, 0, row_size_k);
+                        if (k != v) {
+                            std::memset(head_v + row_size_v*j, 0, row_size_v);
+                        }
+                        head_m[j] = h_inf;
+                    }
+                }
+            };
+
+            if (nth >= nek2) {
+                pack_head(team_head, team_rank, team_size);
+            } else {
+                for (int ikv = ith; ikv < nek2; ikv += nth) {
+                    pack_head(ikv, 0, 1);
+                }
+            }
+            barrier(barrier_data);
+            if (last_found < 0) {
+                if (nth >= nek2) {
+                    const int npt = (q_per_kv + team_size - 1)/team_size;
+                    const int query_offset = team_rank*npt;
+                    const int query_count = std::min(npt, q_per_kv - query_offset);
+                    for (int h = 0; h < query_count; ++h) {
+                        std::memset((char *) qkv +
+                                (team_head*q_per_kv + query_offset + h)*nb1,
+                                0, Dv*sizeof(float));
+                    }
+                } else {
+                    for (int ikv = ith; ikv < nek2; ikv += nth) {
+                        for (int h = 0; h < q_per_kv; ++h) {
+                            std::memset((char *) qkv + (ikv*q_per_kv + h)*nb1,
+                                    0, Dv*sizeof(float));
                         }
                     }
                 }
-                barrier(barrier_data);
-                if (last_found < 0 || neq2_this_thread < 1) return true;
-                ++last_found;
-                int this_nkv = 32*((last_found + 31)/32);
-                auto this_q = (const char *)q + first*nbq2;
-                auto this_qkv = qkv + first*nb1/sizeof(float);
-                if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
-                         Dk, Dv, neq2_this_thread, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
-                         (const float *)this_q, work_k, k == v ? work_k : work_v, work_m, (const float *)sinks, 1,
-                         scale, softcap,
-                         this_qkv, nullptr, nullptr)) return false;
                 return true;
             }
-            int npt = (neq1 + nth - 1)/nth;
-            int ith_mid = nth;
-            int neq1_this_thread = npt;
-            int first = ith*npt;
-            if (npt*nth > neq1) {
-                ith_mid = neq1 - nth*(npt - 1);
-                if (ith >= ith_mid) {
-                    --neq1_this_thread;
-                    if (neq1_this_thread < 1) return true;
-                    first = ith_mid*npt + (ith - ith_mid)*neq1_this_thread;
+
+            const int packed_rows = GGML_PAD(last_found + 1, 32);
+            auto compute_head = [&](int ikv, int query_first, int query_count) {
+                const auto this_q = (const char *) q + query_first*nbq2;
+                auto this_qkv = qkv + query_first*nb1/sizeof(float);
+                const auto this_k = work_k + row_size_k*ikv*index_width;
+                const auto this_v = k == v ? this_k : work_v + row_size_v*ikv*index_width;
+                const auto this_m = work_m + ikv*index_width;
+                const auto this_sinks = sinks ? (const float *) sinks + query_first : nullptr;
+                return iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                        Dk, Dv, query_count, packed_rows,
+                        nbq2, row_size_k, row_size_v, 0, Dv,
+                        (const float *) this_q, this_k, this_v, this_m, this_sinks, 1,
+                        scale, softcap, this_qkv, nullptr, nullptr);
+            };
+
+            if (nth >= nek2) {
+                const int npt = (q_per_kv + team_size - 1)/team_size;
+                const int group_offset = team_head*q_per_kv;
+                const int query_offset = team_rank*npt;
+                const int query_count = std::min(npt, q_per_kv - query_offset);
+                if (query_count > 0 && !compute_head(
+                            team_head, group_offset + query_offset, query_count)) {
+                    return false;
                 }
-            }
-            auto work_k = (char *)work_buffer_in + ith*work_size;
-            auto work_v = work_k + row_size_k*indexer->ne[0];
-            auto work_m = (ggml_fp16_t *)(work_v + row_size_v*indexer->ne[0]);
-            for (int iq = first; iq < first + neq1_this_thread; ++iq) {
-                auto idx = (const int *)((const char *)indexer->data + iq*indexer->nb[1]);
-                auto M = (const ggml_fp16_t *)((const char *)mask + iq*stride_m);
-                int last_found = -1;
-                for (int j = 0; j < nkv; ++j) {
-                    if (idx[j] >= 0) {
-                        std::memcpy(work_k + row_size_k*j, ((const char *)k + idx[j]*stride_k), row_size_k);
-                        if (k != v) {
-                            std::memcpy(work_v + row_size_v*j, ((const char *)v + idx[j]*stride_v), row_size_v);
-                        }
-                        work_m[j] = M[idx[j]];
-                        last_found = j;
-                    } else {
-                        std::memset(work_k + row_size_k*j, 0, row_size_k);
-                        if (k != v) {
-                            std::memset(work_v + row_size_v*j, 0, row_size_v);
-                        }
-                        work_m[j] = h_inf;
+            } else {
+                for (int ikv = ith; ikv < nek2; ikv += nth) {
+                    if (!compute_head(ikv, ikv*q_per_kv, q_per_kv)) {
+                        return false;
                     }
                 }
-                if (last_found < 0) continue;
-                ++last_found;
-                int this_nkv = 32*((last_found + 31)/32);
-                auto this_q = (const char *)q + iq*stride_q;
-                auto this_qkv = qkv + iq*ne1*nb1/sizeof(float);
-                if (!iqk_flash_attn_impl(int_type_k_in, int_type_v,
-                         Dk, Dv, neq2, this_nkv, nbq2, row_size_k, row_size_v, 0, Dv,
-                         (const float *)this_q, work_k, k == v ? work_k : work_v, work_m, (const float *)sinks, 1,
-                         scale, softcap,
-                         this_qkv, nullptr, nullptr)) return false;
             }
             return true;
         }
+
+        auto work_k = (char *) work_buffer_in + ith*work_size;
+        auto work_v = work_k + row_size_k*index_width;
+        auto work_m = (ggml_fp16_t *) (work_v + row_size_v*index_width);
+        auto compute_task = [&](int iq, int ikv) {
+            const auto idx = (const int *) ((const char *) indexer->data + iq*indexer->nb[1]);
+            const auto M = (const ggml_fp16_t *) ((const char *) mask + iq*stride_m);
+            int last_found = -1;
+            for (int j = 0; j < index_width; ++j) {
+                if (idx[j] >= 0) {
+                    GGML_ASSERT(idx[j] < nek1);
+                    work_m[j] = M[idx[j]];
+                    last_found = j;
+                } else {
+                    work_m[j] = h_inf;
+                }
+            }
+            if (last_found < 0) {
+                const int query_first = ikv*q_per_kv;
+                auto this_qkv = (char *) qkv + iq*ne1*nb1 + query_first*nb1;
+                for (int h = 0; h < q_per_kv; ++h) {
+                    std::memset(this_qkv + h*nb1, 0, Dv*sizeof(float));
+                }
+                return true;
+            }
+
+            const int packed_rows = GGML_PAD(last_found + 1, 32);
+            for (int j = 0; j < index_width; ++j) {
+                if (idx[j] >= 0) {
+                    std::memcpy(work_k + row_size_k*j,
+                            (const char *) k + ikv*nbk2 + idx[j]*stride_k, row_size_k);
+                    if (k != v) {
+                        std::memcpy(work_v + row_size_v*j,
+                                (const char *) v + ikv*nbv2 + idx[j]*stride_v, row_size_v);
+                    }
+                } else {
+                    std::memset(work_k + row_size_k*j, 0, row_size_k);
+                    if (k != v) {
+                        std::memset(work_v + row_size_v*j, 0, row_size_v);
+                    }
+                }
+            }
+
+            const int query_first = ikv*q_per_kv;
+            const auto this_q = (const char *) q + iq*stride_q + query_first*nbq2;
+            auto this_qkv = qkv + iq*ne1*nb1/sizeof(float) + query_first*nb1/sizeof(float);
+            const auto this_sinks = sinks ? (const float *) sinks + query_first : nullptr;
+            return iqk_flash_attn_impl(int_type_k_in, int_type_v,
+                    Dk, Dv, q_per_kv, packed_rows,
+                    nbq2, row_size_k, row_size_v, 0, Dv,
+                    (const float *) this_q, work_k, k == v ? work_k : work_v,
+                    work_m, this_sinks, 1,
+                    scale, softcap, this_qkv, nullptr, nullptr);
+        };
+
+        if (nth >= nek2) {
+            const int team_head = ith*nek2/nth;
+            const int team_first = (team_head*nth + nek2 - 1)/nek2;
+            const int team_last = ((team_head + 1)*nth + nek2 - 1)/nek2;
+            const int team_size = team_last - team_first;
+            const int team_rank = ith - team_first;
+            for (int iq = team_rank; iq < neq1; iq += team_size) {
+                if (!compute_task(iq, team_head)) {
+                    return false;
+                }
+            }
+        } else {
+            const int n_tasks = neq1*nek2;
+            for (int task = ith; task < n_tasks; task += nth) {
+                if (!compute_task(task/nek2, task % nek2)) {
+                    return false;
+                }
+            }
+        }
+        return true;
     }
 
     if (auto type_k = ggml_type(int_type_k_in), type_v = ggml_type(int_type_v); !are_kv_types_supported(type_k, type_v)) {

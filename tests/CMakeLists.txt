@@ -207,6 +207,11 @@ target_include_directories(test-iqk-mul-multi-add PRIVATE ${CMAKE_CURRENT_SOURCE
 if (GGML_IQK_MUL_MAT AND GGML_IQK_FLASH_ATTENTION)
     llama_build_and_test(test-iqk-fa-work-buffer.cpp)
     target_include_directories(test-iqk-fa-work-buffer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+
+    add_executable(test-iqk-indexed-fa test-iqk-indexed-fa.cpp)
+    target_include_directories(test-iqk-indexed-fa PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../ggml/src)
+    target_link_libraries(test-iqk-indexed-fa PRIVATE ggml)
+    llama_test(test-iqk-indexed-fa)
 endif()
 if (GGML_IQK_MUL_MAT)
     add_executable(test-iqk-dsv4-attn test-iqk-dsv4-attn.cpp)

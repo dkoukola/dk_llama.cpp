@@ -2006,7 +2006,7 @@ static ggml_tensor * llm_build_kqv(
                     int       il,
                 ggml_tensor * sinks = nullptr, int n_swa = 0, int kv_il = -1,
                 ggml_tensor ** k_cache_view = nullptr, ggml_tensor ** v_cache_view = nullptr,
-                    int32_t kv_view_offset = 0) {
+                    int32_t kv_view_offset = 0, ggml_tensor * fa_index = nullptr) {
     const llama_model   & model   = lctx.model;
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
@@ -2089,6 +2089,7 @@ static ggml_tensor * llm_build_kqv(
 
         cur = ggml_flash_attn_ext(ctx, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                 hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+        cur->src[5] = fa_index;
         cb(cur, "fa", il);
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         if (n_swa > 0) {
@@ -2269,7 +2270,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
                     float     kq_scale,
          const llm_build_cb & cb, int il, ggml_tensor * sinks, int n_swa, int kv_il,
          ggml_tensor ** k_cache_view, ggml_tensor ** v_cache_view,
-                    int32_t   swa_head) {
+                    int32_t   swa_head, ggml_tensor * fa_index) {
     const llama_hparams & hparams = lctx.model.hparams;
     const llama_cparams & cparams = lctx.cparams;
 
@@ -2310,7 +2311,7 @@ ggml_tensor * llm_build_context::llm_build_kv(
     }
 
     auto cur = llm_build_kqv(ctx, lctx, kv, graph, wo, wo_b, q_cur, kq_mask, n_tokens, n_kv_view, kq_scale, cb, il, sinks, n_swa, kv_il,
-            k_cache_view, v_cache_view, kv_view_offset);
+            k_cache_view, v_cache_view, kv_view_offset, fa_index);
     cb(cur, "kqv_out", il);
 
     return cur;
@@ -3085,7 +3086,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         ggml_tensor * input, ggml_tensor * inp_pos, ggml_tensor * inp_out_ids, ggml_tensor * rope_factors_in,
         ggml_tensor * KQ_mask, ggml_tensor * sinks, ggml_tensor * inp_attn_scale, float KQ_scale, float f_attn_scale,
         int n_swa, int il, bool do_rope, bool add_graph_split, bool add_input, bool is_norm, bool is_multi,
-        ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd) {
+        ggml_tensor * post_norm, int kv_il, float post_norm_eps, post_norm_data * pnd, ggml_tensor * fa_index) {
 
     float freq_base_l  = n_swa > 0 ? hparams.rope_freq_base_train_swa : cparams.rope_freq_base;
     float freq_scale_l = n_swa > 0 ? hparams.rope_freq_scale_train_swa : hparams.rope_freq_scale_train;
@@ -3298,6 +3299,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
 
                 cur = ggml_flash_attn_ext(ctx0, q, k, v, KQ_mask, KQ_scale, hparams.f_max_alibi_bias,
                         hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
+                cur->src[5] = fa_index;
                 cb(cur, "flash_attn", il_cb);
                 if (model.layers[il].attn_sinks && model.layers[il].attn_sinks->extra) {
                     auto split = (ggml_split_tensor_t *)model.layers[il].attn_sinks->extra;
@@ -3473,7 +3475,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                 nullptr, nullptr,
                 Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                nullptr, nullptr, swa_head);
+                nullptr, nullptr, swa_head, fa_index);
         cb(cur, "wqkv", il);
         auto gate = llm_build_lora_mm(lctx, ctx0, wqkv_gate, input_normed);
         if (model.arch == LLM_ARCH_LAGUNA) {
@@ -3515,7 +3517,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
         if (gate) {
             cur = llm_build_kv(ctx0, lctx, kv_self, gf, nullptr, nullptr,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    nullptr, nullptr, swa_head);
+                    nullptr, nullptr, swa_head, fa_index);
             if (false && cur->ne[1] == 1) { // we need to add GGML_UNARY_OP_SIGMOID to the ops supported by ggml_fused_mul_unary
                 cur = ggml_fused_mul_unary(ctx0, cur, gate, GGML_UNARY_OP_SIGMOID);
             } else {
@@ -3533,7 +3535,7 @@ ggml_tensor * llm_build_context::build_std_attention(ggml_cgraph * gf, ggml_tens
             cur = llm_build_kv(ctx0, lctx, kv_self, gf,
                     model.layers[il].wo, model.layers[il].bo,
                     Kcur, Vcur, Qcur, KQ_mask, n_tokens, kv_head, n_kv, KQ_scale, cb, il, sinks, n_swa, kv_il,
-                    nullptr, nullptr, swa_head);
+                    nullptr, nullptr, swa_head, fa_index);
         }
     }
 
