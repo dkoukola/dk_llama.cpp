@@ -394,6 +394,133 @@ static void check_lifecycle(llama_context * ctx, const std::vector<llama_token> 
     check_empty_cells_have_no_tokens(ctx);
 }
 
+static bool qsa_graph_has_full_pool_window(const llama_context * ctx) {
+    CHECK(!ctx->inp_qsa.empty());
+    for (const llama_context::qsa_input & input : ctx->inp_qsa) {
+        const int32_t n_blocks = (input.n_kv + input.ratio - 1)/input.ratio;
+        if (input.win_blocks->ne[0] != n_blocks) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static void check_qsa_window_blocks_unique(const llama_context * ctx) {
+    CHECK(!ctx->inp_qsa.empty());
+    for (const llama_context::qsa_input & input : ctx->inp_qsa) {
+        const int32_t * blocks = (const int32_t *) input.win_blocks->data;
+        std::vector<int32_t> seen;
+        for (int64_t i = 0; i < input.win_blocks->ne[0]; ++i) {
+            CHECK(std::find(seen.begin(), seen.end(), blocks[i]) == seen.end());
+            seen.push_back(blocks[i]);
+        }
+    }
+}
+
+static void check_qsa_suffix_removal(
+        llama_model * model,
+        const std::vector<llama_token> & prompt,
+        const std::vector<llama_token> & continuation,
+        int32_t n_vocab) {
+    auto make_seeded = [&]() {
+        context_ptr ctx = make_context(model);
+        CHECK(ctx != nullptr);
+        decode_tokens(ctx.get(), prompt, 0, 0, false);
+        CHECK(ctx->qsa_pooled_seq == 0);
+        CHECK(!ctx->qsa_pooled_stale);
+        CHECK(qsa_graph_has_full_pool_window(ctx.get()));
+        check_qsa_window_blocks_unique(ctx.get());
+        return ctx;
+    };
+
+    context_ptr no_op = make_seeded();
+    CHECK(llama_kv_cache_seq_rm(no_op.get(), 0, (llama_pos) prompt.size(), -1));
+    CHECK(!no_op->qsa_pooled_stale);
+    no_op->qsa_pooled_stale = true;
+    CHECK(llama_kv_cache_seq_rm(no_op.get(), 0, (llama_pos) prompt.size(), -1));
+    CHECK(no_op->qsa_pooled_stale);
+    no_op.reset();
+
+    const llama_pos aligned_suffix = (llama_pos) prompt.size() - 2;
+    context_ptr aligned = make_seeded();
+    CHECK(llama_kv_cache_seq_rm(aligned.get(), 0, aligned_suffix, -1));
+    CHECK(!aligned->qsa_pooled_stale);
+    aligned.reset();
+
+    const llama_pos partial_suffix = (llama_pos) prompt.size() - 3;
+    context_ptr suffix = make_seeded();
+    context_ptr full_repool = make_seeded();
+    CHECK(llama_kv_cache_seq_rm(suffix.get(), 0, partial_suffix, -1));
+    CHECK(llama_kv_cache_seq_rm(full_repool.get(), 0, partial_suffix, -1));
+    CHECK(!suffix->qsa_pooled_stale);
+    full_repool->qsa_pooled_stale = true;
+    for (size_t i = 0; i < 2; ++i) {
+        decode_tokens(suffix.get(), { continuation[i] }, partial_suffix + (llama_pos) i, 0, false);
+        decode_tokens(full_repool.get(), { continuation[i] }, partial_suffix + (llama_pos) i, 0, false);
+        check_logits_equal(
+                copy_logits(full_repool.get(), 0, n_vocab),
+                copy_logits(suffix.get(), 0, n_vocab));
+        CHECK(qsa_meta_for_seq(suffix.get(), 0) == qsa_meta_for_seq(full_repool.get(), 0));
+        if (i == 0) {
+            CHECK(!qsa_graph_has_full_pool_window(suffix.get()));
+            CHECK(qsa_graph_has_full_pool_window(full_repool.get()));
+            check_qsa_window_blocks_unique(suffix.get());
+            check_qsa_window_blocks_unique(full_repool.get());
+        }
+    }
+    CHECK(!qsa_graph_has_full_pool_window(suffix.get()));
+    suffix.reset();
+    full_repool.reset();
+
+    context_ptr interior = make_seeded();
+    CHECK(llama_kv_cache_seq_rm(interior.get(), 0, 2, 3));
+    CHECK(interior->qsa_pooled_stale);
+    interior.reset();
+
+    context_ptr prefix = make_seeded();
+    CHECK(llama_kv_cache_seq_rm(prefix.get(), 0, 0, 2));
+    CHECK(prefix->qsa_pooled_stale);
+    prefix.reset();
+
+    context_ptr inactive = make_seeded();
+    llama_kv_cache_seq_cp(inactive.get(), 0, 1, -1, -1);
+    inactive->qsa_pooled_stale = false;
+    CHECK(llama_kv_cache_seq_rm(inactive.get(), 1, aligned_suffix, -1));
+    CHECK(!inactive->qsa_pooled_stale);
+    decode_tokens(inactive.get(), { continuation[0] }, aligned_suffix, 1, false);
+    CHECK(inactive->qsa_pooled_seq == 1);
+    CHECK(!inactive->qsa_pooled_stale);
+    CHECK(qsa_graph_has_full_pool_window(inactive.get()));
+    inactive.reset();
+
+    context_ptr shared_suffix = make_seeded();
+    context_ptr shared_full_repool = make_seeded();
+    llama_kv_cache_seq_cp(shared_suffix.get(), 0, 1, -1, -1);
+    llama_kv_cache_seq_cp(shared_full_repool.get(), 0, 1, -1, -1);
+    shared_suffix->qsa_pooled_stale = false;
+    shared_full_repool->qsa_pooled_stale = false;
+    CHECK(llama_kv_cache_seq_rm(shared_suffix.get(), 0, aligned_suffix, -1));
+    CHECK(llama_kv_cache_seq_rm(shared_full_repool.get(), 0, aligned_suffix, -1));
+    CHECK(!shared_suffix->qsa_pooled_stale);
+    shared_full_repool->qsa_pooled_stale = true;
+    CHECK(tokens_for_seq(shared_suffix.get(), 1) == expected_tokens(prompt));
+    decode_tokens(shared_suffix.get(), { continuation[0] }, aligned_suffix, 0, false);
+    decode_tokens(shared_full_repool.get(), { continuation[0] }, aligned_suffix, 0, false);
+    check_logits_equal(
+            copy_logits(shared_full_repool.get(), 0, n_vocab),
+            copy_logits(shared_suffix.get(), 0, n_vocab));
+    CHECK(qsa_meta_for_seq(shared_suffix.get(), 0) ==
+            qsa_meta_for_seq(shared_full_repool.get(), 0));
+    shared_suffix.reset();
+    shared_full_repool.reset();
+
+    context_ptr shared_interior = make_seeded();
+    llama_kv_cache_seq_cp(shared_interior.get(), 0, 1, -1, -1);
+    shared_interior->qsa_pooled_stale = false;
+    CHECK(llama_kv_cache_seq_rm(shared_interior.get(), 0, 2, 3));
+    CHECK(shared_interior->qsa_pooled_stale);
+}
+
 static void check_speculative_direct_restore(
         llama_model * model,
         const std::vector<uint8_t> & seq_state,
@@ -606,6 +733,7 @@ int main(int argc, char ** argv) {
     CHECK(whole_restored != nullptr);
     CHECK(llama_state_set_data(
             whole_restored.get(), whole_state.data(), whole_state.size()) == whole_state.size());
+    CHECK(whole_restored->qsa_pooled_stale);
     CHECK(tokens_for_seq(whole_restored.get(), 0) == expected_tokens(prompt));
     CHECK(save_state(whole_restored.get()) == whole_state);
     check_continuation(
@@ -616,6 +744,7 @@ int main(int argc, char ** argv) {
     CHECK(seq_restored != nullptr);
     CHECK(llama_state_seq_set_data(
             seq_restored.get(), seq_state.data(), seq_state.size(), 1, 0) == seq_state.size());
+    CHECK(seq_restored->qsa_pooled_stale);
     CHECK(tokens_for_seq(seq_restored.get(), 1) == expected_tokens(prompt));
     CHECK(save_seq_state(seq_restored.get(), 1) == seq_state);
     check_continuation(
@@ -660,6 +789,7 @@ int main(int argc, char ** argv) {
             model.get(), seq_state, prompt, continuation, expected_logits, n_vocab);
     check_begin_only_base_restore(model.get(), seq_state, prompt, continuation);
     check_multi_ubatch_checkpoint_rejected(model.get());
+    check_qsa_suffix_removal(model.get(), prompt, continuation, n_vocab);
 
     context_ptr lifecycle = make_context(model.get());
     CHECK(lifecycle != nullptr);
@@ -697,6 +827,27 @@ int main(int argc, char ** argv) {
         }
     }
     CHECK(qsa_meta_for_seq(image_original.get(), 0) == expected_image_meta);
+
+    context_ptr image_suffix = make_context(model.get());
+    context_ptr image_full_repool = make_context(model.get());
+    CHECK(image_suffix != nullptr && image_full_repool != nullptr);
+    for (llama_context * ctx : { image_suffix.get(), image_full_repool.get() }) {
+        decode_tokens(ctx, { prompt[0], prompt[1] }, 0, 0, false);
+        decode_image_grid(ctx, 2, 3, 2, 0);
+        CHECK(!ctx->qsa_pooled_stale);
+        CHECK(llama_kv_cache_seq_rm(ctx, 0, 2, -1));
+    }
+    CHECK(!image_suffix->qsa_pooled_stale);
+    image_full_repool->qsa_pooled_stale = true;
+    decode_tokens(image_suffix.get(), { continuation[0] }, 5, 0, false);
+    decode_tokens(image_full_repool.get(), { continuation[0] }, 5, 0, false);
+    check_logits_equal(
+            copy_logits(image_full_repool.get(), 0, n_vocab),
+            copy_logits(image_suffix.get(), 0, n_vocab));
+    CHECK(qsa_meta_for_seq(image_suffix.get(), 0) ==
+            qsa_meta_for_seq(image_full_repool.get(), 0));
+    image_suffix.reset();
+    image_full_repool.reset();
 
     const std::vector<uint8_t> image_state = save_state(image_original.get());
     const std::vector<uint8_t> image_seq_state = save_seq_state(image_original.get(), 0);

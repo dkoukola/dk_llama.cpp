@@ -2626,12 +2626,25 @@ static void llama_kv_cache_clear(struct llama_kv_cache & cache) {
     }
 }
 
+struct llama_kv_cache_seq_rm_effect {
+    llama_seq_id qsa_pooled_seq = -1;
+    bool seq_membership_removed = false;
+    bool qsa_pool_preserved = true;
+};
+
 static bool llama_kv_cache_seq_rm(
         struct llama_kv_cache & cache,
                  llama_seq_id   seq_id,
                     llama_pos   p0,
-                    llama_pos   p1) {
+                    llama_pos   p1,
+    llama_kv_cache_seq_rm_effect * effect = nullptr) {
     uint32_t new_head = cache.size;
+
+    const llama_seq_id qsa_pooled_seq = effect != nullptr ? effect->qsa_pooled_seq : -1;
+    llama_pos qsa_max_retained = std::numeric_limits<llama_pos>::min();
+    llama_pos qsa_min_removed  = std::numeric_limits<llama_pos>::max();
+    bool qsa_member_removed = false;
+    bool qsa_position_invalid = false;
 
     if (p0 < 0) p0 = 0;
     if (p1 < 0) p1 = std::numeric_limits<llama_pos>::max();
@@ -2691,10 +2704,42 @@ static bool llama_kv_cache_seq_rm(
     const bool has_qnext_state = llama_kv_has_qnext_state_storage(cache);
 
     for (uint32_t i = 0; i < cache.size; ++i) {
-        if (cache.cells[i].pos >= p0 && cache.cells[i].pos < p1) {
+        const bool cell_used = !cache.cells[i].is_empty();
+        const bool in_range = cache.cells[i].pos >= p0 && cache.cells[i].pos < p1;
+        const bool need_target_member = cell_used && seq_id >= 0 &&
+                (in_range || (effect != nullptr && seq_id == qsa_pooled_seq));
+        const bool target_member = need_target_member && cache.cells[i].has_seq_id(seq_id);
+        const bool pooled_member = cell_used && effect != nullptr && qsa_pooled_seq >= 0 &&
+                (seq_id == qsa_pooled_seq
+                    ? target_member
+                    : cache.cells[i].has_seq_id(qsa_pooled_seq));
+        const bool removes_pooled_member = pooled_member && in_range &&
+                (seq_id < 0 || seq_id == qsa_pooled_seq);
+        if (pooled_member) {
+            if (removes_pooled_member) {
+                qsa_member_removed = true;
+                if (cache.cells[i].qsa_pos < 0) {
+                    qsa_position_invalid = true;
+                } else {
+                    qsa_min_removed = std::min(qsa_min_removed, cache.cells[i].qsa_pos);
+                }
+            } else if (cache.cells[i].qsa_pos < 0) {
+                qsa_position_invalid = true;
+            } else {
+                qsa_max_retained = std::max(qsa_max_retained, cache.cells[i].qsa_pos);
+            }
+        }
+
+        if (in_range) {
             if (seq_id < 0) {
+                if (effect != nullptr && !cache.cells[i].seq_id.empty()) {
+                    effect->seq_membership_removed = true;
+                }
                 cache.cells[i].seq_id.clear();
-            } else if (cache.cells[i].has_seq_id(seq_id)) {
+            } else if (target_member) {
+                if (effect != nullptr) {
+                    effect->seq_membership_removed = true;
+                }
                 cache.cells[i].seq_id.erase(seq_id);
             } else {
                 continue;
@@ -2715,6 +2760,16 @@ static bool llama_kv_cache_seq_rm(
                 if (new_head == cache.size) new_head = i;
             }
         }
+    }
+
+    if (effect != nullptr && effect->seq_membership_removed) {
+        // Pooled keys are indexed by logical QSA rank. Removing a logical suffix
+        // leaves every complete prefix block unchanged. A partial boundary block
+        // remains masked until the next appended token touches and repools it. A
+        // no-op or removal from another sequence leaves the pooled keys unchanged.
+        effect->qsa_pool_preserved = !compact_apply && qsa_pooled_seq >= 0 &&
+                !qsa_position_invalid &&
+                (!qsa_member_removed || qsa_max_retained < qsa_min_removed);
     }
 
     // If we freed up a slot, set head to it so searching can start there.
@@ -5954,12 +6009,12 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             }
         }
 
-        // only these blocks can have changed. A short window repeats its last entry, so the
-        // scatter writes the same correct value twice rather than an unrelated block
+        // only these blocks can have changed
         std::vector<int32_t> touched;
         touched.reserve(n_win);
+        const bool rebuild_exceeds_window = qsa_rebuild_all && n_blocks > n_win;
         if (qsa_rebuild_all) {
-            for (int32_t b = 0; b < n_blocks; ++b) {
+            for (int32_t b = 0; b < n_blocks && (int32_t) touched.size() < n_win; ++b) {
                 touched.push_back((int32_t) b);
             }
         } else
@@ -5978,8 +6033,18 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
             touched.push_back(0);
         }
 
+        // SET_ROWS partitions source rows between workers, so every destination index must be
+        // unique. Pad the graph's fixed-capacity narrow window with other blocks instead of
+        // racing identical writes to the last touched block.
+        for (int32_t b = 0; (int32_t) touched.size() < n_win && b < n_blocks; ++b) {
+            if (std::find(touched.begin(), touched.end(), b) == touched.end()) {
+                touched.push_back(b);
+            }
+        }
+        GGML_ASSERT((int32_t) touched.size() == n_win);
+
         for (int32_t w = 0; w < n_win; ++w) {
-            const int32_t b = touched[std::min<size_t>(w, touched.size() - 1)];
+            const int32_t b = touched[w];
             dst_win_blk[w] = b;
             std::copy_n(blk_cells.begin() + b*r, r, dst_win_cells + w*r);
             for (int32_t sec = 0; sec < GGML_MROPE_SECTIONS; ++sec) {
@@ -6052,8 +6117,7 @@ static void llama_set_inputs(llama_context & lctx, const llama_batch & batch) {
 
         // a reused graph was built with the narrow window, so clearing on `touched` alone would
         // leave the blocks it could not reach at zero
-        qsa_rebuild_incomplete = qsa_rebuild_incomplete ||
-                (qsa_rebuild_all && (int32_t) touched.size() > n_win);
+        qsa_rebuild_incomplete = qsa_rebuild_incomplete || rebuild_exceeds_window;
     }
     if (!lctx.inp_qsa.empty()) {
         lctx.qsa_pooled_stale = qsa_rebuild_incomplete;
@@ -11438,8 +11502,14 @@ void llama_spec_ckpt_release(struct llama_context * ctx) {
 
 bool llama_kv_cache_seq_rm(struct llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     llama_qwen4_mtp_qsa_reset(*ctx);
-    const bool result = llama_kv_cache_seq_rm(ctx->kv_self, seq_id, p0, p1);
-    if (result && ctx->kv_self.qsa) {
+    llama_kv_cache_seq_rm_effect effect;
+    effect.qsa_pooled_seq = ctx->qsa_pooled_seq;
+    const bool track_qsa_pool = ctx->kv_self.qsa && !ctx->qsa_pooled_stale &&
+            (ctx->kv_self.any_compacted() || ctx->qsa_pooled_seq < 0 ||
+             seq_id < 0 || seq_id == ctx->qsa_pooled_seq);
+    const bool result = llama_kv_cache_seq_rm(
+            ctx->kv_self, seq_id, p0, p1, track_qsa_pool ? &effect : nullptr);
+    if (result && track_qsa_pool && !effect.qsa_pool_preserved) {
         ctx->qsa_pooled_stale = true;
     }
     if (result && ctx->model.arch == LLM_ARCH_DEEPSEEK4 && p0 <= 0 && p1 < 0) {
