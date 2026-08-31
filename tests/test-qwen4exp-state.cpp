@@ -290,6 +290,48 @@ static void check_partial_defrag_remap(void) {
     CHECK(cache.remap_cell_id_after_defrag(ids, 4) == -1);
 }
 
+static void check_host_copy_paths(void) {
+    static constexpr size_t copy_size = 5 * 1024 * 1024 + 123;
+    std::vector<uint8_t> src(copy_size);
+    std::vector<uint8_t> dst(copy_size, 0);
+    for (size_t i = 0; i < src.size(); ++i) {
+        src[i] = (uint8_t) (i * 131 + 17);
+    }
+
+    const std::array<size_t, 4> offsets { 0, 777777, 3000000, copy_size };
+    std::array<llama_qwen4exp_host_copy, 3> copies;
+    for (size_t i = 0; i < copies.size(); ++i) {
+        copies[i] = {
+            src.data() + offsets[i],
+            dst.data() + offsets[i],
+            offsets[i + 1] - offsets[i],
+        };
+    }
+
+    bool parallel = false;
+    for (uint32_t thread_limit : { 0u, 1u, 2u, 4u, 8u, 16u, 32u, 64u, 80u }) {
+        std::fill(dst.begin(), dst.end(), 0);
+        CHECK(llama_qwen4exp_host_copy_rows(
+                copies.data(), copies.size(), thread_limit, &parallel));
+        if (thread_limit < 2) {
+            CHECK(!parallel);
+        }
+#if !defined(_OPENMP)
+        CHECK(!parallel);
+#endif
+        CHECK(dst == src);
+    }
+
+    std::fill(dst.begin(), dst.end(), 0xa5);
+    const std::array<llama_qwen4exp_host_copy, 2> invalid {{
+        { src.data(), dst.data(), 1024 },
+        { nullptr, dst.data() + 1024, 1 },
+    }};
+    CHECK(!llama_qwen4exp_host_copy_rows(invalid.data(), invalid.size(), 8, &parallel));
+    CHECK(!parallel);
+    CHECK(std::all_of(dst.begin(), dst.end(), [](uint8_t value) { return value == 0xa5; }));
+}
+
 static void check_continuation(
         llama_context * ctx,
         llama_seq_id seq_id,
@@ -540,6 +582,10 @@ static void check_speculative_direct_restore(
     const int mode = llama_spec_ckpt_init(ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, TEST_SPEC_SIZE);
     CHECK(mode == LLAMA_SPEC_CKPT_PER_STEP);
     CHECK(llama_spec_ckpt_save(ctx.get(), seq_id));
+    CHECK(ctx->kv_self.ckpt.qwen4exp_per_step_base_save_calls == 1);
+    CHECK(ctx->kv_self.ckpt.qwen4exp_per_step_base_save_parallel_calls <= 1);
+    CHECK(ctx->kv_self.ckpt.qwen4exp_per_step_base_save_last_parallel ==
+            (ctx->kv_self.ckpt.qwen4exp_per_step_base_save_parallel_calls == 1));
     const std::vector<uint8_t> saved_state = save_seq_state(ctx.get(), seq_id);
     CHECK(llama_spec_ckpt_restore_ex(
             ctx.get(), seq_id, (llama_pos) prompt.size(), -1) ==
@@ -655,7 +701,36 @@ static void check_multi_ubatch_checkpoint_rejected(llama_model * model) {
             ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, TEST_SPEC_SIZE) == LLAMA_SPEC_CKPT_NONE);
 }
 
+static void check_single_thread_base_copy_fallback(
+        llama_model * model,
+        const std::vector<uint8_t> & seq_state,
+        const std::vector<llama_token> & prompt,
+        const std::vector<llama_token> & continuation) {
+    llama_context_params params = make_context_params(1);
+    params.n_threads = 1;
+    params.n_threads_batch = 1;
+    context_ptr ctx(llama_init_from_model(model, params), llama_free);
+    CHECK(ctx != nullptr);
+    CHECK(llama_state_seq_set_data(
+            ctx.get(), seq_state.data(), seq_state.size(), 0, 0) == seq_state.size());
+    CHECK(llama_spec_ckpt_init(ctx.get(), LLAMA_SPEC_CKPT_PER_STEP, 2) == LLAMA_SPEC_CKPT_PER_STEP);
+    CHECK(llama_spec_ckpt_save(ctx.get(), 0));
+    CHECK(ctx->kv_self.ckpt.qwen4exp_per_step_base_save_calls == 1);
+    CHECK(ctx->kv_self.ckpt.qwen4exp_per_step_base_save_parallel_calls == 0);
+    CHECK(!ctx->kv_self.ckpt.qwen4exp_per_step_base_save_last_parallel);
+    const std::vector<uint8_t> base_state = save_seq_state(ctx.get(), 0);
+
+    decode_tokens(ctx.get(), { continuation[0], continuation[1] },
+            (llama_pos) prompt.size(), 0, true);
+    CHECK(llama_spec_ckpt_restore_ex(
+            ctx.get(), 0, (llama_pos) prompt.size(), -1) ==
+            LLAMA_SPEC_CKPT_RESTORE_DIRECT);
+    CHECK(save_seq_state(ctx.get(), 0) == base_state);
+    llama_spec_ckpt_discard(ctx.get());
+}
+
 int main(int argc, char ** argv) {
+    check_host_copy_paths();
     check_partial_defrag_remap();
 
     const char * model_path = argc > 1 ? argv[1] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MODELFILE");
@@ -672,10 +747,10 @@ int main(int argc, char ** argv) {
     CHECK(std::strcmp(llama_model_arch_string(model.get()), "qwen4exp") == 0);
     CHECK(!llama_model_supports_ctx_shift(model.get()));
     CHECK(model->hparams.is_recurrent(0));
-    CHECK(model->hparams.is_ple(0));
-    CHECK(!model->hparams.is_recurrent(1));
+    CHECK(!model->hparams.is_ple(0));
+    CHECK(model->hparams.is_recurrent(1));
     CHECK(model->hparams.is_ple(1));
-    CHECK(model->hparams.n_embd_ple_conv(0) > 0);
+    CHECK(model->hparams.n_embd_ple_conv(0) == 0);
     CHECK(model->hparams.n_embd_ple_conv(1) > 0);
 
     const int32_t n_vocab = llama_n_vocab(model.get());
@@ -789,6 +864,7 @@ int main(int argc, char ** argv) {
             model.get(), seq_state, prompt, continuation, expected_logits, n_vocab);
     check_begin_only_base_restore(model.get(), seq_state, prompt, continuation);
     check_multi_ubatch_checkpoint_rejected(model.get());
+    check_single_thread_base_copy_fallback(model.get(), seq_state, prompt, continuation);
     check_qsa_suffix_removal(model.get(), prompt, continuation, n_vocab);
 
     context_ptr lifecycle = make_context(model.get());

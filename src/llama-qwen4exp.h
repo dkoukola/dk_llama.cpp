@@ -6,6 +6,18 @@ struct ggml_tensor;
 struct llama_batch;
 struct llama_context;
 
+struct llama_qwen4exp_host_copy {
+    const void * src;
+    void * dst;
+    size_t size;
+};
+
+bool llama_qwen4exp_host_copy_rows(
+        const llama_qwen4exp_host_copy * copies,
+        size_t n_copies,
+        uint32_t thread_limit,
+        bool * parallel);
+
 bool llama_qwen4exp_spec_ckpt_prepare(llama_context * ctx, int max_tokens);
 bool llama_qwen4exp_spec_ckpt_save(llama_context * ctx, llama_seq_id seq_id);
 bool llama_qwen4exp_spec_ckpt_begin_capture(llama_context * ctx, const llama_batch & batch);

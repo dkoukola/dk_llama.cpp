@@ -143,6 +143,15 @@ target_include_directories(llama PRIVATE ../ggml/src)
 target_compile_features   (llama PUBLIC cxx_std_17)
 
 target_link_libraries(llama PUBLIC ggml)
+if (GGML_OPENMP)
+    find_package(OpenMP)
+    if (OpenMP_CXX_FOUND)
+        # Qwen4Exp checkpoints use the same OpenMP worker pool as CPU graph
+        # compute for their large host-state snapshots. Keep the dependency
+        # transitive so static-library consumers also receive the runtime.
+        target_link_libraries(llama PUBLIC OpenMP::OpenMP_CXX)
+    endif()
+endif()
 
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)

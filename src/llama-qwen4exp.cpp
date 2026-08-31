@@ -10,14 +10,92 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+
 #if defined(__gnu_linux__)
 #include <unistd.h>
 #endif
+
+bool llama_qwen4exp_host_copy_rows(
+        const llama_qwen4exp_host_copy * copies,
+        size_t n_copies,
+        uint32_t thread_limit,
+        bool * parallel) {
+    if (parallel != nullptr) {
+        *parallel = false;
+    }
+    if (copies == nullptr || n_copies == 0) {
+        return false;
+    }
+
+#if defined(_OPENMP)
+    size_t total_bytes = 0;
+#endif
+    for (size_t i = 0; i < n_copies; ++i) {
+        if (copies[i].size > 0 && (copies[i].src == nullptr || copies[i].dst == nullptr)) {
+            return false;
+        }
+#if defined(_OPENMP)
+        total_bytes += copies[i].size;
+#endif
+    }
+
+#if defined(_OPENMP)
+    // Memory copies saturate before model compute. The 1 MiB minimum avoids
+    // spending more on the OpenMP region than on small-model snapshots. Limit
+    // the copy team to bound OpenMP and cache-coherency overhead; this is a
+    // ceiling, not a required machine topology or worker count.
+    static constexpr size_t min_parallel_bytes_per_thread = 1024 * 1024;
+    static constexpr uint32_t max_parallel_threads = 32;
+    const uint32_t size_threads = (uint32_t) std::min<size_t>(
+            max_parallel_threads,
+            total_bytes / min_parallel_bytes_per_thread);
+    const uint32_t actual_threads = std::min(thread_limit, size_threads);
+    if (actual_threads > 1) {
+        size_t team_threads = 1;
+#pragma omp parallel num_threads(actual_threads)
+        {
+            const size_t ith = (size_t) omp_get_thread_num();
+            const size_t nth = (size_t) omp_get_num_threads();
+            if (ith == 0) {
+                team_threads = nth;
+            }
+            for (size_t i = 0; i < n_copies; ++i) {
+                const size_t begin = copies[i].size * ith / nth;
+                const size_t end = copies[i].size * (ith + 1) / nth;
+                if (begin < end) {
+                    std::memcpy(
+                            (char *) copies[i].dst + begin,
+                            (const char *) copies[i].src + begin,
+                            end - begin);
+                }
+            }
+        }
+        if (parallel != nullptr) {
+            *parallel = team_threads > 1;
+        }
+        return true;
+    }
+#else
+    (void) thread_limit;
+#endif
+
+    for (size_t i = 0; i < n_copies; ++i) {
+        if (copies[i].size > 0) {
+            std::memcpy(copies[i].dst, copies[i].src, copies[i].size);
+        }
+    }
+    return true;
+}
 
 namespace {
 
@@ -250,8 +328,14 @@ static ggml_tensor qwen4exp_tensor_slice(
     return result;
 }
 
-static bool qwen4exp_copy_base(llama_context & ctx, bool restore) {
+static bool qwen4exp_copy_base(
+        llama_context & ctx,
+        bool restore,
+        bool * parallel = nullptr) {
     auto & ckpt = ctx.kv_self.ckpt;
+    if (parallel != nullptr) {
+        *parallel = false;
+    }
     if (!ckpt.qwen4exp_per_step_allocated ||
             ckpt.qwen4exp_per_step_base_rows.empty() ||
             ckpt.qwen4exp_per_step_seq_id < 0) {
@@ -274,6 +358,34 @@ static bool qwen4exp_copy_base(llama_context & ctx, bool restore) {
     // Validate every row before the first write so a malformed checkpoint cannot
     // leave only part of the live recurrent state restored.
     ggml_backend_sched_synchronize(ctx.sched);
+
+    if (!restore && ctx.cparams.n_threads_batch > 1) {
+        bool all_host = true;
+        for (const auto & item : ckpt.qwen4exp_per_step_base_rows) {
+            all_host = all_host && ggml_backend_buffer_is_host(item.state->buffer) &&
+                    ggml_backend_buffer_is_host(item.shadow->buffer);
+        }
+
+        if (all_host) {
+            const llama_seq_id seq_id = ckpt.qwen4exp_per_step_seq_id;
+            std::vector<llama_qwen4exp_host_copy> copies;
+            copies.reserve(ckpt.qwen4exp_per_step_base_rows.size());
+            for (const auto & item : ckpt.qwen4exp_per_step_base_rows) {
+                copies.push_back({
+                        (const char *) item.state->data + (size_t) seq_id * item.state->nb[1] +
+                                (size_t) item.offset * sizeof(float),
+                        item.shadow->data,
+                        (size_t) item.width * sizeof(float),
+                });
+            }
+            if (!llama_qwen4exp_host_copy_rows(
+                    copies.data(), copies.size(), ctx.cparams.n_threads_batch, parallel)) {
+                return false;
+            }
+            return true;
+        }
+    }
+
     std::unordered_set<ggml_tensor *> touched;
     for (const auto & item : ckpt.qwen4exp_per_step_base_rows) {
         ggml_tensor state = qwen4exp_tensor_slice(
@@ -469,6 +581,11 @@ void llama_kv_cache::gpu_checkpoint::release_qwen4exp_per_step() {
     qwen4exp_per_step_first_pos = -1;
     qwen4exp_per_step_base_bytes = 0;
     qwen4exp_per_step_delta_bytes = 0;
+    qwen4exp_per_step_base_save_calls = 0;
+    qwen4exp_per_step_base_save_parallel_calls = 0;
+    qwen4exp_per_step_base_save_us = 0;
+    qwen4exp_per_step_base_save_last_us = 0;
+    qwen4exp_per_step_base_save_last_parallel = false;
 }
 
 bool llama_qwen4exp_spec_ckpt_prepare(llama_context * ctx, int max_tokens) {
@@ -621,10 +738,29 @@ bool llama_qwen4exp_spec_ckpt_save(llama_context * ctx, llama_seq_id seq_id) {
         return false;
     }
     qwen4exp_numa_ensure_step_checkpoint_layout(*ctx);
-    if (!qwen4exp_copy_base(*ctx, false)) {
+    bool parallel = false;
+    const int64_t copy_begin_us = ggml_time_us();
+    if (!qwen4exp_copy_base(*ctx, false, &parallel)) {
         ckpt.qwen4exp_per_step_seq_id = -1;
         ckpt.qwen4exp_per_step_first_pos = -1;
         return false;
+    }
+    const uint64_t copy_us = (uint64_t) std::max<int64_t>(0, ggml_time_us() - copy_begin_us);
+    ++ckpt.qwen4exp_per_step_base_save_calls;
+    ckpt.qwen4exp_per_step_base_save_parallel_calls += parallel;
+    ckpt.qwen4exp_per_step_base_save_us += copy_us;
+    ckpt.qwen4exp_per_step_base_save_last_us = copy_us;
+    ckpt.qwen4exp_per_step_base_save_last_parallel = parallel;
+    static const bool log_copy_timing =
+            std::getenv("LLAMA_QWEN4EXP_CKPT_TIMING") != nullptr;
+    if (log_copy_timing) {
+        const double gib_per_second = copy_us > 0
+                ? ckpt.qwen4exp_per_step_base_bytes * 1e6 /
+                        ((double) copy_us * 1024.0 * 1024.0 * 1024.0)
+                : 0.0;
+        LLAMA_LOG_INFO("%s: Qwen4Exp base save %8.2f MiB in %6.3f ms (%6.2f GiB/s, %s)\n",
+                __func__, ckpt.qwen4exp_per_step_base_bytes / (1024.0 * 1024.0),
+                copy_us / 1000.0, gib_per_second, parallel ? "parallel" : "serial");
     }
     ckpt.qwen4exp_per_step_saved = true;
     ctx->kv_self.save_per_step_ssm = true;

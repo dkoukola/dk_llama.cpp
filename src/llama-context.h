@@ -238,6 +238,11 @@ struct llama_kv_cache {
         llama_pos qwen4exp_per_step_first_pos = -1;
         size_t qwen4exp_per_step_base_bytes = 0;
         size_t qwen4exp_per_step_delta_bytes = 0;
+        uint64_t qwen4exp_per_step_base_save_calls = 0;
+        uint64_t qwen4exp_per_step_base_save_parallel_calls = 0;
+        uint64_t qwen4exp_per_step_base_save_us = 0;
+        uint64_t qwen4exp_per_step_base_save_last_us = 0;
+        bool qwen4exp_per_step_base_save_last_parallel = false;
 
         // DSV4 per-step compressor-state base and per-row deltas.
         std::vector<ggml_tensor *> dsv4_per_step_state;
