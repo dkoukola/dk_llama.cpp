@@ -95,6 +95,7 @@ class Keys:
         EXPERT_WEIGHTS_NORM               = "{arch}.expert_weights_norm"
         EXPERT_GATING_FUNC                = "{arch}.expert_gating_func"
         NEXTN_PREDICT_LAYERS              = "{arch}.nextn_predict_layers"
+        NEXTN_SHARED_TARGET_TENSORS       = "{arch}.nextn_shared_target_tensors"
         POOLING_TYPE                      = "{arch}.pooling_type"
         LOGIT_SCALE                       = "{arch}.logit_scale"
         DECODER_START_TOKEN_ID            = "{arch}.decoder_start_token_id"
@@ -427,6 +428,9 @@ class MODEL_TENSOR(IntEnum):
     NEXTN_HC_NORM        = auto()   # qwen4exp MTP final HC mixer
     NEXTN_HC_DOWN        = auto()
     NEXTN_HC_UP          = auto()
+    NEXTN_HC_HEAD_NORM   = auto()   # qwen4exp fused MTP HC head
+    NEXTN_HC_HEAD_DOWN   = auto()
+    NEXTN_HC_HEAD_UP     = auto()
     INDEXER_K_NORM       = auto()
     INDEXER_PROJ         = auto()
     INDEXER_ATTN_K       = auto()
@@ -714,6 +718,9 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.NEXTN_HC_NORM:             "blk.{bid}.nextn.hc_norm",
     MODEL_TENSOR.NEXTN_HC_DOWN:             "blk.{bid}.nextn.hc_down",
     MODEL_TENSOR.NEXTN_HC_UP:               "blk.{bid}.nextn.hc_up",
+    MODEL_TENSOR.NEXTN_HC_HEAD_NORM:        "blk.{bid}.nextn.hc_head_norm",
+    MODEL_TENSOR.NEXTN_HC_HEAD_DOWN:        "blk.{bid}.nextn.hc_head_down",
+    MODEL_TENSOR.NEXTN_HC_HEAD_UP:          "blk.{bid}.nextn.hc_head_up",
     MODEL_TENSOR.INDEXER_K_NORM:            "blk.{bid}.indexer.k_norm",
     MODEL_TENSOR.INDEXER_PROJ:              "blk.{bid}.indexer.proj",
     MODEL_TENSOR.INDEXER_ATTN_K:            "blk.{bid}.indexer.attn_k",
@@ -1120,6 +1127,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.PLE_NORM_QUERY,
         MODEL_TENSOR.PLE_NORM_CONV,
         MODEL_TENSOR.PLE_CONV1D,
+        MODEL_TENSOR.NEXTN_EH_PROJ,
         MODEL_TENSOR.NEXTN_E_PROJ,
         MODEL_TENSOR.NEXTN_H_PROJ,
         MODEL_TENSOR.NEXTN_ENORM,
@@ -1127,6 +1135,9 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
         MODEL_TENSOR.NEXTN_HC_NORM,
         MODEL_TENSOR.NEXTN_HC_DOWN,
         MODEL_TENSOR.NEXTN_HC_UP,
+        MODEL_TENSOR.NEXTN_HC_HEAD_NORM,
+        MODEL_TENSOR.NEXTN_HC_HEAD_DOWN,
+        MODEL_TENSOR.NEXTN_HC_HEAD_UP,
     ],
     MODEL_ARCH.MELLUM: [
         MODEL_TENSOR.TOKEN_EMBD,

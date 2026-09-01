@@ -104,6 +104,8 @@ enum llama_dflash_io_mode {
 int32_t llama_model_dflash_io_mode(const struct llama_model * draft_model, const struct llama_model * target_model);
 bool llama_model_dflash_io_tensors_match(const struct llama_model * draft_model, int32_t n_embd, int32_t n_vocab);
 bool llama_model_share_dflash_io_tensors(struct llama_model * draft_model, const struct llama_model * target_model);
+int32_t llama_model_speculative_io_mode(const struct llama_model * draft_model, const struct llama_model * target_model);
+bool llama_model_share_speculative_io_tensors(struct llama_model * draft_model, const struct llama_model * target_model);
 
 bool llama_set_dflash_target_features_copy(
         struct llama_context * ctx,

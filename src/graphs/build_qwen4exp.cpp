@@ -546,21 +546,33 @@ ggml_cgraph * llm_build_context::build_qwen4exp() {
         ggml_tensor * hidden = build_inp_mtp_states(hc_dim);
         hidden = llm_build_norm(ctx0, hidden, hparams,
                 layer.nextn.hnorm, nullptr, LLM_NORM_RMS, cb, il);
+        cb(hidden, "mtp_hidden_norm", il);
         hidden = ggml_reshape_3d(ctx0, hidden, n_embd, hc, n_tokens);
-        hidden = ggml_reshape_2d(ctx0, hidden, n_embd, hc*n_tokens);
-        hidden = llm_build_lora_mm(lctx, ctx0, layer.nextn.h_proj, hidden);
-        hidden = ggml_reshape_3d(ctx0, hidden, n_embd, hc, n_tokens);
-        cb(hidden, "mtp_hidden_proj", il);
 
         ggml_tensor * token_emb = build_inp_embd_mtp(model.tok_embd);
         token_emb = llm_build_norm(ctx0, token_emb, hparams,
                 layer.nextn.enorm, nullptr, LLM_NORM_RMS, cb, il);
-        token_emb = llm_build_lora_mm(lctx, ctx0, layer.nextn.e_proj, token_emb);
-        token_emb = ggml_repeat_4d(ctx0,
-                ggml_reshape_3d(ctx0, token_emb, n_embd, 1, n_tokens),
-                n_embd, hc, n_tokens, 1);
 
-        ggml_tensor * res_hc = ggml_add(ctx0, hidden, token_emb);
+        ggml_tensor * res_hc;
+        if (layer.nextn.eh_proj != nullptr) {
+            token_emb = ggml_repeat_4d(ctx0,
+                    ggml_reshape_3d(ctx0, token_emb, n_embd, 1, n_tokens),
+                    n_embd, hc, n_tokens, 1);
+            ggml_tensor * combined = ggml_concat(ctx0, token_emb, hidden, 0);
+            cb(combined, "mtp_eh_concat", il);
+            res_hc = llm_build_lora_mm(lctx, ctx0, layer.nextn.eh_proj, combined);
+        } else {
+            hidden = ggml_reshape_2d(ctx0, hidden, n_embd, hc*n_tokens);
+            hidden = llm_build_lora_mm(lctx, ctx0, layer.nextn.h_proj, hidden);
+            hidden = ggml_reshape_3d(ctx0, hidden, n_embd, hc, n_tokens);
+            cb(hidden, "mtp_hidden_proj", il);
+
+            token_emb = llm_build_lora_mm(lctx, ctx0, layer.nextn.e_proj, token_emb);
+            token_emb = ggml_repeat_4d(ctx0,
+                    ggml_reshape_3d(ctx0, token_emb, n_embd, 1, n_tokens),
+                    n_embd, hc, n_tokens, 1);
+            res_hc = ggml_add(ctx0, hidden, token_emb);
+        }
         cb(res_hc, "mtp_fused", il);
 
         ggml_tensor * inject = nullptr;

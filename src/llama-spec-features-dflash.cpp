@@ -151,17 +151,43 @@ static const ggml_tensor * llama_dflash_output_tensor(
     return model->tok_embd;
 }
 
-int32_t llama_model_dflash_io_mode(
-        const struct llama_model * draft_model,
-        const struct llama_model * target_model) {
-    if (draft_model == nullptr || target_model == nullptr || !llm_arch_is_dflash_family(draft_model->arch)) {
-        return LLAMA_DFLASH_IO_MODE_INVALID;
-    }
+static bool llama_qwen4exp_uses_shared_target_tensors(const llama_model * model) {
+    return model != nullptr &&
+           model->arch == LLM_ARCH_QWEN4EXP &&
+           model->hparams.nextn_shared_target_tensors;
+}
 
-    const bool dflash2 = draft_model->arch == LLM_ARCH_DFLASH2;
-    const ggml_tensor * draft_output = llama_dflash_output_tensor(draft_model, dflash2);
-    const ggml_tensor * target_output = llama_dflash_output_tensor(target_model, dflash2);
-    if (draft_model->tok_embd == nullptr || draft_output == nullptr || target_model->tok_embd == nullptr || target_output == nullptr) {
+static const ggml_tensor * llama_speculative_output_tensor(
+        const struct llama_model * model,
+        bool qwen4exp_shared,
+        bool dflash2) {
+    if (qwen4exp_shared) {
+        if (model == nullptr) {
+            return nullptr;
+        }
+        if (model->output_mtp != nullptr) {
+            return model->output_mtp;
+        }
+        if (model->output != nullptr) {
+            return model->output;
+        }
+        return model->tok_embd;
+    }
+    return llama_dflash_output_tensor(model, dflash2);
+}
+
+static int32_t llama_model_speculative_io_mode_impl(
+        const struct llama_model * draft_model,
+        const struct llama_model * target_model,
+        bool qwen4exp_shared,
+        bool dflash2) {
+    const ggml_tensor * draft_output = llama_speculative_output_tensor(
+            draft_model, qwen4exp_shared, dflash2);
+    const ggml_tensor * target_output = llama_speculative_output_tensor(
+            target_model, qwen4exp_shared, dflash2);
+    if (draft_model == nullptr || target_model == nullptr ||
+            draft_model->tok_embd == nullptr || draft_output == nullptr ||
+            target_model->tok_embd == nullptr || target_output == nullptr) {
         return LLAMA_DFLASH_IO_MODE_INVALID;
     }
 
@@ -170,12 +196,41 @@ int32_t llama_model_dflash_io_mode(
     if (shared_tok && shared_output) {
         return LLAMA_DFLASH_IO_MODE_SHARED;
     }
-
     if (!shared_tok && !shared_output) {
         return LLAMA_DFLASH_IO_MODE_SELF_CONTAINED;
     }
-
     return LLAMA_DFLASH_IO_MODE_MIXED;
+}
+
+int32_t llama_model_dflash_io_mode(
+        const struct llama_model * draft_model,
+        const struct llama_model * target_model) {
+    if (draft_model == nullptr || target_model == nullptr || !llm_arch_is_dflash_family(draft_model->arch)) {
+        return LLAMA_DFLASH_IO_MODE_INVALID;
+    }
+
+    const bool dflash2 = draft_model->arch == LLM_ARCH_DFLASH2;
+    return llama_model_speculative_io_mode_impl(
+            draft_model, target_model, false, dflash2);
+}
+
+int32_t llama_model_speculative_io_mode(
+        const struct llama_model * draft_model,
+        const struct llama_model * target_model) {
+    if (draft_model == nullptr || target_model == nullptr) {
+        return LLAMA_DFLASH_IO_MODE_INVALID;
+    }
+    if (llm_arch_is_dflash_family(draft_model->arch)) {
+        return llama_model_speculative_io_mode_impl(
+                draft_model, target_model, false,
+                draft_model->arch == LLM_ARCH_DFLASH2);
+    }
+    if (draft_model->arch == LLM_ARCH_QWEN4EXP) {
+        return llama_model_speculative_io_mode_impl(
+                draft_model, target_model,
+                llama_qwen4exp_uses_shared_target_tensors(draft_model), false);
+    }
+    return LLAMA_DFLASH_IO_MODE_INVALID;
 }
 
 struct llama_dflash_io_clone {
@@ -264,20 +319,32 @@ bool llama_model_dflash_io_tensors_match(
            (int32_t) output->ne[1] == n_vocab;
 }
 
-bool llama_model_share_dflash_io_tensors(
+bool llama_model_share_speculative_io_tensors(
         struct llama_model * draft_model,
         const struct llama_model * target_model) {
     if (draft_model == nullptr || target_model == nullptr) {
         return false;
     }
 
-    if (!llm_arch_is_dflash_family(draft_model->arch)) {
+    const bool dflash_family = llm_arch_is_dflash_family(draft_model->arch);
+    const bool qwen4exp_shared = llama_qwen4exp_uses_shared_target_tensors(draft_model);
+    if (!dflash_family && !qwen4exp_shared) {
         return true;
     }
+    if (qwen4exp_shared && target_model->arch != LLM_ARCH_QWEN4EXP) {
+        return false;
+    }
 
-    const bool dflash2 = draft_model->arch == LLM_ARCH_DFLASH2;
-    const ggml_tensor * target_output_const = llama_dflash_output_tensor(target_model, dflash2);
+    const bool dflash2 = dflash_family && draft_model->arch == LLM_ARCH_DFLASH2;
+    const ggml_tensor * target_output_const = llama_speculative_output_tensor(
+            target_model, qwen4exp_shared, dflash2);
     ggml_tensor * target_output = const_cast<ggml_tensor *>(target_output_const);
+
+    if (qwen4exp_shared &&
+            (draft_model->hparams.n_embd != target_model->hparams.n_embd ||
+             draft_model->hparams.n_vocab != target_model->hparams.n_vocab)) {
+        return false;
+    }
 
     if (dflash2 && target_output != nullptr) {
         const bool uses_requantized_primary =
@@ -430,7 +497,20 @@ bool llama_model_share_dflash_io_tensors(
         draft_model->dflash_io_target_output = target_model->output;
         draft_model->dflash_io_target_output_mtp = target_model->output_mtp;
     }
-    return llama_dflash_output_tensor(draft_model, dflash2) != nullptr;
+    return llama_speculative_output_tensor(
+            draft_model, qwen4exp_shared, dflash2) != nullptr;
+}
+
+bool llama_model_share_dflash_io_tensors(
+        struct llama_model * draft_model,
+        const struct llama_model * target_model) {
+    if (draft_model == nullptr || target_model == nullptr) {
+        return false;
+    }
+    if (!llm_arch_is_dflash_family(draft_model->arch)) {
+        return true;
+    }
+    return llama_model_share_speculative_io_tensors(draft_model, target_model);
 }
 
 static bool llama_set_dflash_target_features_impl(

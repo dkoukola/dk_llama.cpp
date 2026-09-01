@@ -1699,22 +1699,58 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
         has_tensor(LLM_TENSOR_HC_HEAD_NORM) ||
         has_tensor(LLM_TENSOR_HC_HEAD_DOWN) ||
         has_tensor(LLM_TENSOR_HC_HEAD_UP);
-    const bool has_complete_predictor = hparams.nextn_predict_layers == 1 &&
-        has_tensor(LLM_TENSOR_NEXTN_E_PROJ,  n_transformer_layers) &&
-        has_tensor(LLM_TENSOR_NEXTN_H_PROJ,  n_transformer_layers) &&
-        has_tensor(LLM_TENSOR_NEXTN_ENORM,   n_transformer_layers) &&
-        has_tensor(LLM_TENSOR_NEXTN_HNORM,   n_transformer_layers) &&
+    const bool has_split_entry =
+        has_tensor(LLM_TENSOR_NEXTN_E_PROJ, n_transformer_layers) ||
+        has_tensor(LLM_TENSOR_NEXTN_H_PROJ, n_transformer_layers);
+    const bool has_fused_entry =
+        has_tensor(LLM_TENSOR_NEXTN_EH_PROJ, n_transformer_layers);
+    const bool has_split_mixer =
+        has_tensor(LLM_TENSOR_NEXTN_HC_NORM, n_transformer_layers) ||
+        has_tensor(LLM_TENSOR_NEXTN_HC_DOWN, n_transformer_layers) ||
+        has_tensor(LLM_TENSOR_NEXTN_HC_UP, n_transformer_layers);
+    const bool has_fused_mixer =
+        has_tensor(LLM_TENSOR_NEXTN_HC_HEAD_NORM, n_transformer_layers) ||
+        has_tensor(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, n_transformer_layers) ||
+        has_tensor(LLM_TENSOR_NEXTN_HC_HEAD_UP, n_transformer_layers);
+    const bool has_any_split_layout = has_split_entry || has_split_mixer;
+    const bool has_any_fused_layout = has_fused_entry || has_fused_mixer;
+    if (model.mtp && has_any_split_layout && has_any_fused_layout) {
+        throw std::runtime_error("qwen4exp: NextN predictor mixes split and fused tensor layouts");
+    }
+
+    const bool has_complete_split_layout =
+        has_tensor(LLM_TENSOR_NEXTN_E_PROJ, n_transformer_layers) &&
+        has_tensor(LLM_TENSOR_NEXTN_H_PROJ, n_transformer_layers) &&
         has_tensor(LLM_TENSOR_NEXTN_HC_NORM, n_transformer_layers) &&
         has_tensor(LLM_TENSOR_NEXTN_HC_DOWN, n_transformer_layers) &&
-        has_tensor(LLM_TENSOR_NEXTN_HC_UP,   n_transformer_layers) &&
+        has_tensor(LLM_TENSOR_NEXTN_HC_UP, n_transformer_layers);
+    const bool has_complete_fused_layout =
+        has_tensor(LLM_TENSOR_NEXTN_EH_PROJ, n_transformer_layers) &&
+        has_tensor(LLM_TENSOR_NEXTN_HC_HEAD_NORM, n_transformer_layers) &&
+        has_tensor(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, n_transformer_layers) &&
+        has_tensor(LLM_TENSOR_NEXTN_HC_HEAD_UP, n_transformer_layers);
+    const bool has_complete_predictor = hparams.nextn_predict_layers == 1 &&
+        (has_complete_split_layout || has_complete_fused_layout) &&
+        has_tensor(LLM_TENSOR_NEXTN_ENORM,   n_transformer_layers) &&
+        has_tensor(LLM_TENSOR_NEXTN_HNORM,   n_transformer_layers) &&
         has_tensor(LLM_TENSOR_HC_ATTN_NORM,  n_transformer_layers) &&
         has_tensor(LLM_TENSOR_HC_FFN_NORM,   n_transformer_layers) &&
         has_tensor(LLM_TENSOR_FFN_GATE_INP,  n_transformer_layers);
+    if (model.mtp && hparams.nextn_predict_layers > 0 && !has_complete_predictor) {
+        throw std::runtime_error("qwen4exp: MTP requested but the NextN predictor layout is incomplete");
+    }
     const bool mtp_only = has_complete_predictor && !has_trunk && !has_target_head;
+    const bool shared_target_tensors = hparams.nextn_shared_target_tensors;
+    if (shared_target_tensors && !mtp_only) {
+        throw std::runtime_error("qwen4exp: shared target tensors require a predictor-only MTP companion");
+    }
     const int trunk_flags = mtp_only
         ? llama_model_loader::TENSOR_SKIP | llama_model_loader::TENSOR_NOT_REQUIRED : 0;
 
-    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab});
+    const int io_flags = shared_target_tensors
+        ? llama_model_loader::TENSOR_NOT_REQUIRED : 0;
+    model.tok_embd = create_tensor(ctx_input, tn(LLM_TENSOR_TOKEN_EMBD, "weight"),
+            {n_embd, n_vocab}, io_flags);
 
     // The wide residual is normalised and collapsed by a hyper-connection mix rather
     // than by an output_norm, so this architecture carries none.
@@ -1724,8 +1760,11 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
     model.hc_head_down = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), {hc_dim, hc_rank}, head_flags);
     model.hc_head_up   = create_tensor(ctx_output, tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), {hc_rank, hc_dim}, head_flags);
     model.output       = create_tensor(ctx_output, tn(LLM_TENSOR_OUTPUT,       "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_NOT_REQUIRED);
-    if (model.output == NULL) {
+    if (model.output == NULL && !shared_target_tensors) {
         model.output = create_tensor(ctx_output, tn(LLM_TENSOR_TOKEN_EMBD, "weight"), {n_embd, n_vocab}, llama_model_loader::TENSOR_DUPLICATED);
+    }
+    if (shared_target_tensors && (model.tok_embd != nullptr || model.output != nullptr)) {
+        throw std::runtime_error("qwen4exp: shared-target MTP companion must omit token_embd.weight and output.weight");
     }
     model.output_mtp = model.output;
 
@@ -1795,13 +1834,38 @@ bool create_tensors_helper::create_qwen4exp_tensors(const LLM_TN & tn) {
         layer.hc_ffn_inject  = create_tensor(ctx_split, tn(LLM_TENSOR_HC_FFN_INJECT,  "weight", i), {hc_dim, hc}, flags);
 
         if (is_mtp_layer) {
-            layer.nextn.e_proj  = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_E_PROJ,  "weight", i), {n_embd, n_embd}, flags);
-            layer.nextn.h_proj  = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_H_PROJ,  "weight", i), {n_embd, n_embd}, flags);
+            if (has_complete_fused_layout) {
+                layer.nextn.eh_proj = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_EH_PROJ, "weight", i),
+                        {2*n_embd, n_embd}, flags);
+                layer.nextn.hc_norm = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", i),
+                        {hc_dim}, flags);
+                layer.nextn.hc_down = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", i),
+                        {hc_dim, hc_rank}, flags);
+                layer.nextn.hc_up = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_HC_HEAD_UP, "weight", i),
+                        {hc_rank, hc_dim}, flags);
+            } else {
+                layer.nextn.e_proj = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_E_PROJ, "weight", i),
+                        {n_embd, n_embd}, flags);
+                layer.nextn.h_proj = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_H_PROJ, "weight", i),
+                        {n_embd, n_embd}, flags);
+                layer.nextn.hc_norm = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_HC_NORM, "weight", i),
+                        {hc_dim}, flags);
+                layer.nextn.hc_down = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_HC_DOWN, "weight", i),
+                        {hc_dim, hc_rank}, flags);
+                layer.nextn.hc_up = create_tensor(ctx_split,
+                        tn(LLM_TENSOR_NEXTN_HC_UP, "weight", i),
+                        {hc_rank, hc_dim}, flags);
+            }
             layer.nextn.enorm   = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_ENORM,   "weight", i), {n_embd}, flags);
             layer.nextn.hnorm   = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_HNORM,   "weight", i), {hc_dim}, flags);
-            layer.nextn.hc_norm = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_HC_NORM, "weight", i), {hc_dim}, flags);
-            layer.nextn.hc_down = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_HC_DOWN, "weight", i), {hc_dim, hc_rank}, flags);
-            layer.nextn.hc_up   = create_tensor(ctx_split, tn(LLM_TENSOR_NEXTN_HC_UP,   "weight", i), {hc_rank, hc_dim}, flags);
         }
 
         if (hparams.is_ple(i)) {

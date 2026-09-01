@@ -1416,8 +1416,8 @@ done:
 // initialization of the speculative decoding system
 //
 enum class common_speculative_model_preparation {
-    SHARE_DFLASH_IO,
-    ALREADY_SHARED_DFLASH_IO,
+    SHARE_AUXILIARY_IO,
+    ALREADY_SHARED_AUXILIARY_IO,
 };
 
 static common_speculative * common_speculative_init_internal(
@@ -1461,14 +1461,13 @@ static common_speculative * common_speculative_init_internal(
         }
 
         llama_context_params cparams_dft = params.cparams_dft;
+        if (model_preparation == common_speculative_model_preparation::SHARE_AUXILIARY_IO &&
+                !llama_model_share_speculative_io_tensors(params.model_dft, target_model)) {
+            LOG_ERR("%s: failed to establish target IO tensors for the draft model\n", __func__);
+            return nullptr;
+        }
 
         if (has_dflash_stage) {
-            if (model_preparation == common_speculative_model_preparation::SHARE_DFLASH_IO &&
-                    !llama_model_share_dflash_io_tensors(params.model_dft, llama_get_model(ctx_tgt))) {
-                LOG_ERR("%s: failed to share target IO tensors with DFlash draft model\n", __func__);
-                return nullptr;
-            }
-
             const int32_t io_mode = llama_model_dflash_io_mode(params.model_dft, llama_get_model(ctx_tgt));
             if (io_mode == LLAMA_DFLASH_IO_MODE_INVALID || io_mode == LLAMA_DFLASH_IO_MODE_MIXED) {
                 LOG_ERR("%s: DFlash IO tensors are not fully shared or fully self-contained\n", __func__);
@@ -1742,14 +1741,14 @@ common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt) {
     return common_speculative_init_internal(
-            params, ctx_tgt, common_speculative_model_preparation::SHARE_DFLASH_IO);
+            params, ctx_tgt, common_speculative_model_preparation::SHARE_AUXILIARY_IO);
 }
 
 common_speculative * common_speculative_init_prepared(
         common_params_speculative & params,
         llama_context             * ctx_tgt) {
     return common_speculative_init_internal(
-            params, ctx_tgt, common_speculative_model_preparation::ALREADY_SHARED_DFLASH_IO);
+            params, ctx_tgt, common_speculative_model_preparation::ALREADY_SHARED_AUXILIARY_IO);
 }
 
 void common_speculative_free(common_speculative * spec) {

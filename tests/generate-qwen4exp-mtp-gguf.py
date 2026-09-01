@@ -3,6 +3,7 @@
 
 import sys
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 
@@ -12,7 +13,19 @@ sys.path.insert(0, str(ROOT / "gguf-py"))
 import gguf  # noqa: E402
 
 
-def generate(output: Path, companion: bool = False) -> None:
+def generate(
+    output: Path,
+    *,
+    companion: bool = False,
+    fused: bool = False,
+    shared: bool = False,
+    invalid: Optional[str] = None,
+) -> None:
+    if invalid not in (None, "incomplete", "mixed", "shared-embedded", "shared-io"):
+        raise ValueError(f"unknown invalid fixture kind: {invalid}")
+    if shared and not companion and invalid != "shared-embedded":
+        raise ValueError("shared target tensors require a companion")
+
     rng = np.random.default_rng(1234)
     writer = gguf.GGUFWriter(output, "qwen4exp")
 
@@ -40,7 +53,9 @@ def generate(output: Path, companion: bool = False) -> None:
     ple_ngram = 3
     ple_kernel = 4
 
-    writer.add_name("synthetic-qwen4exp-mtp-companion" if companion else "synthetic-qwen4exp-mtp")
+    package = "companion" if companion else "embedded"
+    layout = "fused" if fused else "split"
+    writer.add_name(f"synthetic-qwen4exp-mtp-{package}-{layout}")
     writer.add_block_count(layers)
     writer.add_context_length(64)
     writer.add_embedding_length(hidden)
@@ -64,6 +79,8 @@ def generate(output: Path, companion: bool = False) -> None:
     writer.add_ssm_inner_size(ssm_inner)
     writer.add_full_attention_interval(2)
     writer.add_nextn_predict_layers(1)
+    if shared:
+        writer.add_nextn_shared_target_tensors(True)
     writer.add_hyper_connection_count(hc_count)
     writer.add_hyper_connection_low_rank(hc_rank)
     writer.add_attention_indexer_head_count(indexer_heads)
@@ -102,6 +119,8 @@ def generate(output: Path, companion: bool = False) -> None:
         return (rng.standard_normal(shape) * 0.05).astype(np.float32)
 
     def should_emit(name: str) -> bool:
+        if invalid == "incomplete" and name == "blk.2.nextn.hc_head_up.weight":
+            return False
         if not companion:
             return True
         return name in {"token_embd.weight", "output.weight"} or name.startswith(f"blk.{layers - 1}.")
@@ -112,8 +131,9 @@ def generate(output: Path, companion: bool = False) -> None:
             writer.add_tensor(name, tensor)
 
     token_embd = rand((vocab, hidden))
-    writer.add_tensor("token_embd.weight", token_embd)
-    writer.add_tensor("output.weight", token_embd.copy())
+    if not shared or invalid == "shared-io":
+        writer.add_tensor("token_embd.weight", token_embd)
+        writer.add_tensor("output.weight", token_embd.copy())
     ple_table = rand(((ple_ngram - 1) * vocab, ple_head_dim))
     if not companion:
         writer.add_tensor(
@@ -175,14 +195,27 @@ def generate(output: Path, companion: bool = False) -> None:
         add(f"{prefix}.ffn_up_shexp.weight", (ff, hidden))
         add(f"{prefix}.ffn_down_shexp.weight", (hidden, ff))
 
-    add("blk.2.nextn.e_proj.weight", (hidden, hidden))
-    if should_emit("blk.2.nextn.h_proj.weight"):
-        writer.add_tensor("blk.2.nextn.h_proj.weight", np.eye(hidden, dtype=np.float32))
+    e_proj = rand((hidden, hidden))
+    h_proj = np.eye(hidden, dtype=np.float32)
+    if fused:
+        if should_emit("blk.2.nextn.eh_proj.weight"):
+            writer.add_tensor(
+                "blk.2.nextn.eh_proj.weight",
+                np.concatenate((e_proj, h_proj), axis=1),
+            )
+        if invalid == "mixed":
+            writer.add_tensor("blk.2.nextn.e_proj.weight", e_proj)
+    else:
+        if should_emit("blk.2.nextn.e_proj.weight"):
+            writer.add_tensor("blk.2.nextn.e_proj.weight", e_proj)
+        if should_emit("blk.2.nextn.h_proj.weight"):
+            writer.add_tensor("blk.2.nextn.h_proj.weight", h_proj)
     add("blk.2.nextn.enorm.weight", (hidden,), norm=True)
     add("blk.2.nextn.hnorm.weight", (hc_width,), norm=True)
-    add("blk.2.nextn.hc_norm.weight", (hc_width,), norm=True)
-    add("blk.2.nextn.hc_down.weight", (hc_rank, hc_width))
-    add("blk.2.nextn.hc_up.weight", (hc_width, hc_rank))
+    head_prefix = "hc_head" if fused else "hc"
+    add(f"blk.2.nextn.{head_prefix}_norm.weight", (hc_width,), norm=True)
+    add(f"blk.2.nextn.{head_prefix}_down.weight", (hc_rank, hc_width))
+    add(f"blk.2.nextn.{head_prefix}_up.weight", (hc_width, hc_rank))
 
     writer.write_header_to_file()
     writer.write_kv_data_to_file()
@@ -191,8 +224,25 @@ def generate(output: Path, companion: bool = False) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) not in (2, 3):
-        raise SystemExit(f"usage: {Path(sys.argv[0]).name} EMBEDDED.gguf [COMPANION.gguf]")
+    if len(sys.argv) not in (2, 3, 4, 5, 6, 7, 8, 9):
+        raise SystemExit(
+            f"usage: {Path(sys.argv[0]).name} EMBEDDED.gguf [SPLIT-COMPANION.gguf "
+            "[FUSED-COMPANION.gguf [SHARED-COMPANION.gguf "
+            "[INCOMPLETE.gguf [MIXED.gguf [SHARED-EMBEDDED.gguf "
+            "[SHARED-IO.gguf]]]]]]]"
+        )
     generate(Path(sys.argv[1]))
-    if len(sys.argv) == 3:
+    if len(sys.argv) >= 3:
         generate(Path(sys.argv[2]), companion=True)
+    if len(sys.argv) >= 4:
+        generate(Path(sys.argv[3]), companion=True, fused=True)
+    if len(sys.argv) >= 5:
+        generate(Path(sys.argv[4]), companion=True, fused=True, shared=True)
+    if len(sys.argv) >= 6:
+        generate(Path(sys.argv[5]), companion=True, fused=True, invalid="incomplete")
+    if len(sys.argv) >= 7:
+        generate(Path(sys.argv[6]), companion=True, fused=True, invalid="mixed")
+    if len(sys.argv) >= 8:
+        generate(Path(sys.argv[7]), fused=True, shared=True, invalid="shared-embedded")
+    if len(sys.argv) >= 9:
+        generate(Path(sys.argv[8]), companion=True, fused=True, shared=True, invalid="shared-io")

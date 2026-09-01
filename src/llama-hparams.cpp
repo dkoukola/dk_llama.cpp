@@ -684,6 +684,8 @@ void llm_load_hparams(
                 ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
 
                 ml.get_key(LLM_KV_NEXTN_PREDICT_LAYERS, hparams.nextn_predict_layers, false);
+                ml.get_key(LLM_KV_NEXTN_SHARED_TARGET_TENSORS,
+                        hparams.nextn_shared_target_tensors, false);
                 if (hparams.nextn_predict_layers > hparams.n_layer) {
                     throw std::runtime_error("qwen4exp: NextN layer count exceeds the total block count");
                 }

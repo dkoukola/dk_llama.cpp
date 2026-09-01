@@ -1810,17 +1810,23 @@ llama_speculative_status llama_speculative_engine_create(
             }
             draft_reserved = true;
         }
-        if (engine->stage.type == bridge_stage_type::DSPARK) {
-            if (!llama_model_share_dflash_io_tensors(engine->draft_model, engine->target_model)) {
+        if (engine->stage.type == bridge_stage_type::DSPARK ||
+                engine->stage.type == bridge_stage_type::MTP) {
+            if (!llama_model_share_speculative_io_tensors(
+                        engine->draft_model, engine->target_model)) {
                 release_draft_model(engine->draft_model);
                 draft_reserved = false;
-                return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "could not establish DSpark target IO sharing");
+                return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE,
+                        "could not establish speculative target IO tensors");
             }
-            if (llama_model_dflash_io_mode(engine->draft_model, engine->target_model) == LLAMA_DFLASH_IO_MODE_INVALID ||
-                    llama_model_dflash_io_mode(engine->draft_model, engine->target_model) == LLAMA_DFLASH_IO_MODE_MIXED) {
+            const int32_t io_mode = llama_model_speculative_io_mode(
+                    engine->draft_model, engine->target_model);
+            if (io_mode == LLAMA_DFLASH_IO_MODE_INVALID ||
+                    io_mode == LLAMA_DFLASH_IO_MODE_MIXED) {
                 release_draft_model(engine->draft_model);
                 draft_reserved = false;
-                return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE, "DSpark target IO sharing is incomplete");
+                return fail(error, LLAMA_SPECULATIVE_MODEL_INCOMPATIBLE,
+                        "speculative target IO tensors are incomplete");
             }
         }
 

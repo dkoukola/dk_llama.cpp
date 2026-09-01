@@ -282,8 +282,64 @@ if (TARGET llama::speculative)
     target_link_libraries(test-qwen4exp-mtp PRIVATE llama::speculative)
     target_compile_definitions(test-qwen4exp-mtp PRIVATE LLAMA_TEST_SPECULATIVE_BRIDGE)
 endif()
-add_test(NAME test-qwen4exp-mtp COMMAND test-qwen4exp-mtp)
-set_property(TEST test-qwen4exp-mtp PROPERTY LABELS model)
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+set(QWEN4EXP_MTP_NUMPY_RESULT 1)
+if (Python3_Interpreter_FOUND)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+        RESULT_VARIABLE QWEN4EXP_MTP_NUMPY_RESULT
+        OUTPUT_QUIET
+        ERROR_QUIET)
+endif()
+
+if (Python3_Interpreter_FOUND AND QWEN4EXP_MTP_NUMPY_RESULT EQUAL 0)
+    set(QWEN4EXP_MTP_FIXTURE_DIR ${CMAKE_CURRENT_BINARY_DIR}/qwen4exp-mtp-fixtures)
+    set(QWEN4EXP_MTP_EMBEDDED ${QWEN4EXP_MTP_FIXTURE_DIR}/embedded.gguf)
+    set(QWEN4EXP_MTP_SPLIT ${QWEN4EXP_MTP_FIXTURE_DIR}/split.gguf)
+    set(QWEN4EXP_MTP_FUSED ${QWEN4EXP_MTP_FIXTURE_DIR}/fused.gguf)
+    set(QWEN4EXP_MTP_SHARED ${QWEN4EXP_MTP_FIXTURE_DIR}/shared.gguf)
+    set(QWEN4EXP_MTP_INCOMPLETE ${QWEN4EXP_MTP_FIXTURE_DIR}/incomplete.gguf)
+    set(QWEN4EXP_MTP_MIXED ${QWEN4EXP_MTP_FIXTURE_DIR}/mixed.gguf)
+    set(QWEN4EXP_MTP_SHARED_EMBEDDED ${QWEN4EXP_MTP_FIXTURE_DIR}/shared-embedded.gguf)
+    set(QWEN4EXP_MTP_SHARED_IO ${QWEN4EXP_MTP_FIXTURE_DIR}/shared-io.gguf)
+    file(MAKE_DIRECTORY ${QWEN4EXP_MTP_FIXTURE_DIR})
+
+    add_test(
+        NAME generate-qwen4exp-mtp-fixtures
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/generate-qwen4exp-mtp-gguf.py
+            ${QWEN4EXP_MTP_EMBEDDED}
+            ${QWEN4EXP_MTP_SPLIT}
+            ${QWEN4EXP_MTP_FUSED}
+            ${QWEN4EXP_MTP_SHARED}
+            ${QWEN4EXP_MTP_INCOMPLETE}
+            ${QWEN4EXP_MTP_MIXED}
+            ${QWEN4EXP_MTP_SHARED_EMBEDDED}
+            ${QWEN4EXP_MTP_SHARED_IO})
+    set_property(
+        TEST generate-qwen4exp-mtp-fixtures
+        PROPERTY FIXTURES_SETUP qwen4exp-mtp-fixtures)
+
+    add_test(
+        NAME test-qwen4exp-mtp
+        COMMAND test-qwen4exp-mtp
+            ${QWEN4EXP_MTP_EMBEDDED}
+            ${QWEN4EXP_MTP_SPLIT}
+            ${QWEN4EXP_MTP_FUSED}
+            ${QWEN4EXP_MTP_SHARED}
+            --reject-load ${QWEN4EXP_MTP_INCOMPLETE}
+            --reject-load ${QWEN4EXP_MTP_MIXED}
+            --reject-load ${QWEN4EXP_MTP_SHARED_EMBEDDED}
+            --reject-load ${QWEN4EXP_MTP_SHARED_IO})
+    set_tests_properties(
+        test-qwen4exp-mtp
+        PROPERTIES
+            FIXTURES_REQUIRED qwen4exp-mtp-fixtures
+            LABELS model)
+else()
+    message(STATUS "test-qwen4exp-mtp is not registered: Python 3 with NumPy is required")
+endif()
 
 if (TARGET llama::speculative)
     add_executable(test-speculative-api test-speculative-api.c)

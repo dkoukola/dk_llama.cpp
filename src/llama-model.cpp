@@ -532,6 +532,7 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_FFN_GATE_SHEXP,       "blk.%d.ffn_gate_shexp" },
             { LLM_TENSOR_FFN_DOWN_SHEXP,       "blk.%d.ffn_down_shexp" },
             { LLM_TENSOR_FFN_UP_SHEXP,         "blk.%d.ffn_up_shexp" },
+            { LLM_TENSOR_NEXTN_EH_PROJ,        "blk.%d.nextn.eh_proj" },
             { LLM_TENSOR_NEXTN_E_PROJ,         "blk.%d.nextn.e_proj" },
             { LLM_TENSOR_NEXTN_H_PROJ,         "blk.%d.nextn.h_proj" },
             { LLM_TENSOR_NEXTN_ENORM,          "blk.%d.nextn.enorm" },
@@ -539,6 +540,9 @@ static const std::map<llm_arch, std::map<llm_tensor, std::string>> LLM_TENSOR_NA
             { LLM_TENSOR_NEXTN_HC_NORM,        "blk.%d.nextn.hc_norm" },
             { LLM_TENSOR_NEXTN_HC_DOWN,        "blk.%d.nextn.hc_down" },
             { LLM_TENSOR_NEXTN_HC_UP,          "blk.%d.nextn.hc_up" },
+            { LLM_TENSOR_NEXTN_HC_HEAD_NORM,   "blk.%d.nextn.hc_head_norm" },
+            { LLM_TENSOR_NEXTN_HC_HEAD_DOWN,   "blk.%d.nextn.hc_head_down" },
+            { LLM_TENSOR_NEXTN_HC_HEAD_UP,     "blk.%d.nextn.hc_head_up" },
         },
     },
     {

@@ -104,7 +104,7 @@ common_speculative * common_speculative_init(
         common_params_speculative & params,
         llama_context             * ctx_tgt);
 
-// Initializes a session after its DFlash model IO tensors have already been
+// Initializes a session after any auxiliary model IO tensors have already been
 // transactionally shared and validated by the owning engine.
 common_speculative * common_speculative_init_prepared(
         common_params_speculative & params,

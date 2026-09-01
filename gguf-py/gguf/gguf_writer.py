@@ -797,6 +797,9 @@ class GGUFWriter:
     def add_nextn_predict_layers(self, count: int) -> None:
         self.add_uint32(Keys.LLM.NEXTN_PREDICT_LAYERS.format(arch=self.arch), count)
 
+    def add_nextn_shared_target_tensors(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.NEXTN_SHARED_TARGET_TENSORS.format(arch=self.arch), value)
+
     def add_attention_indexer_head_count(self, count: int) -> None:
         self.add_uint32(Keys.Attention.INDEXER_HEAD_COUNT.format(arch=self.arch), count)
 

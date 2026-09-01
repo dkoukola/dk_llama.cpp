@@ -9386,6 +9386,14 @@ struct llama_context * llama_init_from_model(
         return nullptr;
     }
 
+    if (model->arch == LLM_ARCH_QWEN4EXP &&
+            model->hparams.nextn_shared_target_tensors &&
+            (model->tok_embd == nullptr || model->output_mtp == nullptr)) {
+        LLAMA_LOG_ERROR("%s: Qwen3.8 shared-target MTP companion is not attached to a target model\n",
+                __func__);
+        return nullptr;
+    }
+
     if (params.n_batch == 0 && params.n_ubatch == 0) {
         LLAMA_LOG_ERROR("%s: n_batch and n_ubatch cannot both be zero\n", __func__);
         return nullptr;

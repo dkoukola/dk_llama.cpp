@@ -63,6 +63,7 @@ struct llama_hparams {
     uint32_t expert_gating_func   = LLM_EXPERT_GATING_FUNC_SOFTMAX;
     uint32_t moe_every_n_layers   = 0;
     uint32_t nextn_predict_layers = 0;
+    bool     nextn_shared_target_tensors = false;
 
     float f_norm_eps;
     float f_norm_rms_eps;

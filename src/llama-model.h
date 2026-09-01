@@ -550,11 +550,12 @@ struct llama_model {
 
     std::unique_ptr<ggml_tensor> output_mtp_ptr;
 
-    // Device-local DFlash IO copies for cross-buffer sharing.
+    // Device-local speculative-model IO copies for cross-buffer sharing. The legacy
+    // dflash names are retained because DFlash and shared Qwen MTP use one ownership path.
     std::unique_ptr<ggml_tensor> dflash_tok_embd_ptr;
     std::unique_ptr<ggml_tensor> dflash_output_ptr;
     std::unique_ptr<ggml_tensor> dflash_output_mtp_ptr;
-    // Borrowed or cloned target IO binds a reusable draft model to that target's lifetime.
+    // Borrowed or cloned target IO binds a reusable auxiliary model to that target's lifetime.
     const llama_model * dflash_io_target_model = nullptr;
     const ggml_tensor * dflash_io_target_tok_embd = nullptr;
     const ggml_tensor * dflash_io_target_output = nullptr;

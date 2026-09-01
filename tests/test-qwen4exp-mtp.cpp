@@ -6,6 +6,7 @@
 
 #include "llama-context.h"
 #include "llama-spec-features.h"
+#include "llama-spec-features-dflash.h"
 
 #include <algorithm>
 #include <array>
@@ -40,8 +41,8 @@ struct selection_capture {
     std::vector<float> mask;
 };
 
-static int capture_hidden_projection(ggml_tensor * tensor, bool ask, void * user_data) {
-    static constexpr const char * name = "mtp_hidden_proj";
+static int capture_hidden_norm(ggml_tensor * tensor, bool ask, void * user_data) {
+    static constexpr const char * name = "mtp_hidden_norm";
     if (std::strncmp(tensor->name, name, std::strlen(name)) != 0) {
         return 0;
     }
@@ -199,6 +200,51 @@ static void seed_draft_step(
     CHECK(llama_set_draft_input_hidden_state_copy(ctx, hidden.data(), hidden.size()));
     llama_set_mtp_step_idx(ctx, step);
     decode_one(ctx, token, pos);
+}
+
+static void check_close(
+        const std::vector<float> & actual,
+        const std::vector<float> & expected,
+        float absolute_tolerance = 1e-4f,
+        float relative_tolerance = 1e-4f) {
+    CHECK(actual.size() == expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+        const float limit = absolute_tolerance +
+                relative_tolerance*std::max(std::fabs(actual[i]), std::fabs(expected[i]));
+        if (std::fabs(actual[i] - expected[i]) > limit) {
+            std::fprintf(stderr,
+                    "vectors differ at %zu: actual=%g expected=%g limit=%g\n",
+                    i, actual[i], expected[i], limit);
+            std::abort();
+        }
+    }
+}
+
+static void check_joint_hidden_norm(llama_model * model, int32_t width) {
+    hidden_capture capture;
+    context_ptr ctx = make_context(
+            model, MTP_OP_DRAFT_GEN, capture_hidden_norm, &capture);
+    CHECK(ctx != nullptr);
+
+    std::vector<float> input(width);
+    for (int32_t i = 0; i < width/2; ++i) {
+        input[i] = (float) (i + 1);
+        input[width/2 + i] = (float) (i + 20);
+    }
+    seed_draft_step(ctx.get(), input, 3, 0, 0);
+    CHECK(capture.values.size() == input.size());
+
+    float sum_sq = 0.0f;
+    for (float value : input) {
+        sum_sq += value*value;
+    }
+    const float scale = 1.0f/std::sqrt(sum_sq/(float) width + 1e-6f);
+    float max_norm_error = 0.0f;
+    for (size_t i = 0; i < input.size(); ++i) {
+        max_norm_error = std::max(max_norm_error,
+                std::fabs(capture.values[i] - input[i]*scale));
+    }
+    CHECK(max_norm_error < 1e-3f);
 }
 
 static void check_qsa_reuse_row(
@@ -929,9 +975,34 @@ static void check_mtp_bridge(
 #endif
 
 int main(int argc, char ** argv) {
-    const char * model_path = argc > 1 ? argv[1] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MTP_MODELFILE");
-    const char * companion_path = argc > 2 ? argv[2] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MTP_COMPANION");
-    const bool bridge_only = argc > 3 && std::strcmp(argv[3], "--bridge-only") == 0;
+    std::array<const char *, 4> paths = { nullptr, nullptr, nullptr, nullptr };
+    std::vector<const char *> rejected_paths;
+    size_t n_paths = 0;
+    bool bridge_only = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--bridge-only") == 0) {
+            bridge_only = true;
+        } else if (std::strcmp(argv[i], "--reject-load") == 0 && i + 1 < argc) {
+            rejected_paths.push_back(argv[++i]);
+        } else if (n_paths < paths.size()) {
+            paths[n_paths++] = argv[i];
+        } else {
+            std::fprintf(stderr,
+                    "usage: %s [EMBEDDED [SPLIT-COMPANION [FUSED-COMPANION "
+                    "[SHARED-COMPANION]]]] [--reject-load PATH]... [--bridge-only]\n",
+                    argv[0]);
+            return 1;
+        }
+    }
+
+    const char * model_path = paths[0] != nullptr
+            ? paths[0] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MTP_MODELFILE");
+    const char * companion_path = paths[1] != nullptr
+            ? paths[1] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MTP_COMPANION");
+    const char * fused_path = paths[2] != nullptr
+            ? paths[2] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MTP_FUSED_COMPANION");
+    const char * shared_path = paths[3] != nullptr
+            ? paths[3] : std::getenv("LLAMACPP_TEST_QWEN4EXP_MTP_SHARED_COMPANION");
     if (model_path == nullptr || model_path[0] == '\0') {
         std::fprintf(stderr,
                 "test-qwen4exp-mtp: skipped (generate a tiny model with "
@@ -939,6 +1010,10 @@ int main(int argc, char ** argv) {
         return 0;
     }
     llama_backend_init();
+
+    for (const char * rejected_path : rejected_paths) {
+        CHECK(load_model(rejected_path, true) == nullptr);
+    }
 
     {
         model_ptr target_only = load_model(model_path, false);
@@ -969,15 +1044,26 @@ int main(int argc, char ** argv) {
     CHECK(width == 512);
     CHECK(n_vocab == 16);
 
-    model_ptr companion(nullptr, llama_free_model);
-    if (companion_path != nullptr && companion_path[0] != '\0') {
-        companion = load_model(companion_path, true);
-        CHECK(companion != nullptr);
-        CHECK(llama_model_mtp_package(companion.get()) == LLAMA_MTP_PACKAGE_COMPANION);
-        CHECK(llama_model_n_nextn_layer(companion.get()) == 1);
-        CHECK((int32_t) llama_model_mtp_feature_width(companion.get()) == width);
-        CHECK(llama_n_vocab(companion.get()) == n_vocab);
+    const auto load_companion = [width, n_vocab](const char * path) {
+        model_ptr result(nullptr, llama_free_model);
+        if (path == nullptr || path[0] == '\0') {
+            return result;
+        }
+        result = load_model(path, true);
+        CHECK(result != nullptr);
+        CHECK(llama_model_mtp_package(result.get()) == LLAMA_MTP_PACKAGE_COMPANION);
+        CHECK(llama_model_n_nextn_layer(result.get()) == 1);
+        CHECK((int32_t) llama_model_mtp_feature_width(result.get()) == width);
+        CHECK(llama_n_vocab(result.get()) == n_vocab);
+        return result;
+    };
 
+    model_ptr companion = load_companion(companion_path);
+    model_ptr fused = load_companion(fused_path);
+    model_ptr shared_target(nullptr, llama_free_model);
+    model_ptr shared = load_companion(shared_path);
+
+    if (companion) {
         context_ptr companion_checkpoint = make_context(companion.get(), MTP_OP_UPDATE_ACCEPTED);
         CHECK(companion_checkpoint != nullptr);
         CHECK(llama_spec_ckpt_init(
@@ -985,14 +1071,49 @@ int main(int argc, char ** argv) {
                 LLAMA_SPEC_CKPT_NONE);
     }
 
+    if (fused) {
+        CHECK(llama_model_speculative_io_mode(fused.get(), model.get()) ==
+                LLAMA_DFLASH_IO_MODE_SELF_CONTAINED);
+        CHECK(llama_model_share_speculative_io_tensors(fused.get(), model.get()));
+    }
+
+    if (shared) {
+        CHECK(llama_model_speculative_io_mode(shared.get(), model.get()) ==
+                LLAMA_DFLASH_IO_MODE_INVALID);
+        CHECK(make_context(shared.get(), MTP_OP_DRAFT_GEN) == nullptr);
+        shared_target = load_model(model_path, false);
+        CHECK(shared_target != nullptr);
+        CHECK(llama_model_share_speculative_io_tensors(
+                shared.get(), shared_target.get()));
+        CHECK(llama_model_speculative_io_mode(shared.get(), shared_target.get()) ==
+                LLAMA_DFLASH_IO_MODE_SHARED);
+        model_ptr different_target = load_model(model_path, false);
+        CHECK(different_target != nullptr);
+        CHECK(!llama_model_share_speculative_io_tensors(
+                shared.get(), different_target.get()));
+    }
+
 #if defined(LLAMA_TEST_SPECULATIVE_BRIDGE)
     if (bridge_only) {
-        CHECK(companion != nullptr);
         model_ptr bridge_target = load_model(model_path, false);
         CHECK(bridge_target != nullptr);
-        check_mtp_bridge(bridge_target.get(), companion.get(), 1);
-        check_mtp_bridge(bridge_target.get(), companion.get(), 2);
-        check_mtp_bridge(bridge_target.get(), companion.get(), 4);
+        CHECK(companion != nullptr || fused != nullptr || shared != nullptr);
+        for (llama_model * draft : { companion.get(), fused.get() }) {
+            if (draft == nullptr) {
+                continue;
+            }
+            check_mtp_bridge(bridge_target.get(), draft, 1);
+            check_mtp_bridge(bridge_target.get(), draft, 2);
+            check_mtp_bridge(bridge_target.get(), draft, 4);
+        }
+        if (shared) {
+            check_mtp_bridge(shared_target.get(), shared.get(), 1);
+            check_mtp_bridge(shared_target.get(), shared.get(), 2);
+            check_mtp_bridge(shared_target.get(), shared.get(), 4);
+        }
+        shared.reset();
+        shared_target.reset();
+        fused.reset();
         companion.reset();
         model.reset();
         llama_backend_free();
@@ -1003,29 +1124,19 @@ int main(int argc, char ** argv) {
     CHECK(!bridge_only);
 #endif
 
-    hidden_capture capture;
-    context_ptr norm_check = make_context(
-            model.get(), MTP_OP_DRAFT_GEN, capture_hidden_projection, &capture);
-    CHECK(norm_check != nullptr);
+    check_joint_hidden_norm(model.get(), width);
+    if (fused) {
+        check_joint_hidden_norm(fused.get(), width);
+    }
+    if (shared) {
+        check_joint_hidden_norm(shared.get(), width);
+    }
+
     std::vector<float> norm_input(width);
     for (int32_t i = 0; i < width/2; ++i) {
         norm_input[i] = (float) (i + 1);
         norm_input[width/2 + i] = (float) (i + 20);
     }
-    seed_draft_step(norm_check.get(), norm_input, 3, 0, 0);
-    CHECK(capture.values.size() == norm_input.size());
-    float sum_sq = 0.0f;
-    for (float value : norm_input) {
-        sum_sq += value*value;
-    }
-    const float scale = 1.0f/std::sqrt(sum_sq/(float) width + 1e-6f);
-    float max_norm_error = 0.0f;
-    for (size_t i = 0; i < norm_input.size(); ++i) {
-        max_norm_error = std::max(max_norm_error,
-                std::fabs(capture.values[i] - norm_input[i]*scale));
-    }
-    CHECK(max_norm_error < 1e-3f);
-    norm_check.reset();
 
     for (const int32_t top_k : { 0, 1, 3 }) {
         CHECK(make_context(model.get(), MTP_OP_DRAFT_GEN, nullptr, nullptr, top_k) == nullptr);
@@ -1083,12 +1194,15 @@ int main(int argc, char ** argv) {
     CHECK(next_hidden == next_hidden_recompute);
     const std::vector<float> first_logits = copy_logits(recompute.get(), n_vocab);
 
-    if (companion) {
-        context_ptr external = make_context(companion.get(), MTP_OP_DRAFT_GEN);
+    for (llama_model * candidate : { companion.get(), fused.get(), shared.get() }) {
+        if (candidate == nullptr) {
+            continue;
+        }
+        context_ptr external = make_context(candidate, MTP_OP_DRAFT_GEN);
         CHECK(external != nullptr);
         seed_draft_step(external.get(), target_hidden, 3, 0, 0);
-        CHECK(copy_embedding(external.get(), width) == next_hidden_recompute);
-        CHECK(copy_logits(external.get(), n_vocab) == first_logits);
+        check_close(copy_embedding(external.get(), width), next_hidden_recompute);
+        check_close(copy_logits(external.get(), n_vocab), first_logits);
     }
 
     seed_draft_step(reuse.get(), next_hidden, 4, 1, 1);
@@ -1105,14 +1219,27 @@ int main(int argc, char ** argv) {
     carried.reset();
     top_k_check.reset();
 #if defined(LLAMA_TEST_SPECULATIVE_BRIDGE)
-    if (companion) {
+    if (companion || fused) {
         model_ptr bridge_target = load_model(model_path, false);
         CHECK(bridge_target != nullptr);
-        check_mtp_bridge(bridge_target.get(), companion.get(), 1);
-        check_mtp_bridge(bridge_target.get(), companion.get(), 2);
-        check_mtp_bridge(bridge_target.get(), companion.get(), 4);
+        for (llama_model * draft : { companion.get(), fused.get() }) {
+            if (draft == nullptr) {
+                continue;
+            }
+            check_mtp_bridge(bridge_target.get(), draft, 1);
+            check_mtp_bridge(bridge_target.get(), draft, 2);
+            check_mtp_bridge(bridge_target.get(), draft, 4);
+        }
+    }
+    if (shared) {
+        check_mtp_bridge(shared_target.get(), shared.get(), 1);
+        check_mtp_bridge(shared_target.get(), shared.get(), 2);
+        check_mtp_bridge(shared_target.get(), shared.get(), 4);
     }
 #endif
+    shared.reset();
+    shared_target.reset();
+    fused.reset();
     companion.reset();
     model.reset();
     llama_backend_free();
